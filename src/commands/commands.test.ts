@@ -7,7 +7,7 @@ import { Store } from "../store/store.ts";
 import { FakeRunner } from "../worker/fake-runner.ts";
 import { Workers } from "../worker/workers.ts";
 import { operatorControls, routeCommands } from "./commands.ts";
-import { parseComment } from "./parser.ts";
+import { parseComment, parseSelectionCommands } from "./parser.ts";
 import { controlsLine, renderCommandTable } from "./table.ts";
 
 const REPO = "onsager-ai/ostrom";
@@ -46,6 +46,42 @@ function fixture() {
   return { store, github, runner, workers, ticketId, assignmentId, comment };
 }
 
+test("operator resume acknowledges a public stall on paused and already-open tickets", async () => {
+  for (const state of ["open", "paused", "ended"] as const) {
+    const { store, github, workers, ticketId, assignmentId } = fixture();
+    const stall = store.recordStall({ assignmentId, semonReason: "waiting-question", detail: "?" }).id;
+    store.publishStall(stall);
+    if (state === "paused") store.pauseTicket(ticketId, "stuck turn reported by the Watchdog");
+    if (state === "ended") { store.endAssignment(assignmentId); store.endTicket(ticketId); }
+    await operatorControls(store, workers, github.gh, REPO).resume(ticketId);
+    assert.equal(store.getTicket(ticketId).state, state === "ended" ? "ended" : "open");
+    assert.notEqual(store.getStall(stall).clearedAt, null);
+    assert.equal(store.getAssignment(assignmentId).stallRecoveryAttempts, 0);
+    await workers.drain();
+  }
+});
+
+test("allowlisted issue redirects clear public stalls without an open-to-open transition", async () => {
+  for (const trusted of [true, false]) {
+    const { store, github, workers, ticketId, assignmentId, comment } = fixture();
+    const stall = store.recordStall({ assignmentId, semonReason: "waiting-question", detail: "?" }).id;
+    store.publishStall(stall);
+    comment("answer", "alice", "use red");
+    const pass = await routeCommands(store, workers, github.gh, REPO, trusted ? ["ALICE"] : ["bob"]);
+    assert.deepEqual(pass.failed, []);
+    assert.equal(store.getStall(stall).clearedAt !== null, trusted);
+    assert.equal(store.getTicket(ticketId).state, "open");
+    await workers.drain();
+  }
+});
+
+test("selection commands can appear within a start comment", () => {
+  assert.deepEqual(parseSelectionCommands("@ostrom please take this issue.\n@ostrom effort high and @ostrom use codex/luna"), [
+    { kind: "command", command: "effort", value: "high" },
+    { kind: "command", command: "use", value: "codex/luna" },
+  ]);
+});
+
 test("commands are case-insensitive and must start the comment", () => {
   assert.deepEqual(parseComment("@ostrom pause"), { kind: "command", command: "pause" });
   assert.deepEqual(parseComment("  @OSTROM ReSuMe until tomorrow"), { kind: "command", command: "resume" });
@@ -57,7 +93,7 @@ test("commands are case-insensitive and must start the comment", () => {
 
 test("Journey 1 command table is generated from the command contract", async () => {
   const experience = await readFile(new URL("../../docs/experience.md", import.meta.url), "utf8");
-  const actual = experience.match(/\| Say or do \| Effect \| Who may \| Acknowledged by \|\n(?:\|.*\n?){8}/)?.[0].trimEnd();
+  const actual = experience.match(/\| Say or do \| Effect \| Who may \| Acknowledged by \|\n(?:\|.*\n?){10}/)?.[0].trimEnd();
   assert.equal(actual, renderCommandTable());
 });
 
@@ -72,6 +108,7 @@ test("an issue author may pause, and a command is never a pending Worker deliver
     { triggerId, ticketId, command: "pause", allowed: true },
   ]);
   assert.equal(store.getTicket(ticketId).state, "paused");
+  assert.equal(store.getTicket(ticketId).pauseCause, "paused by @alice on GitHub");
   assert.deepEqual(store.pendingDeliveries(), []);
   assert.equal(store.undecidedTriggers().length, 0);
   assert.ok(store.dueReplies().some((reply) => reply.reaction === "+1"));
@@ -86,6 +123,7 @@ test("a collaborator with triage may pause and resume, with permissions cached f
   assert.deepEqual(pass.handled.map((item) => item.triggerId), [first, second]);
   assert.equal(store.getTicket(ticketId).state, "open");
   assert.equal(github.calls.filter((args) => args[3]?.includes("/collaborators/bob/permission")).length, 1);
+  await workers.drain();
 });
 
 test("a command without permission only gets a confused reaction", async () => {
@@ -149,7 +187,7 @@ test("a paused ticket can still be stopped: by command, by closing the issue, or
   };
   for (const [way, stop] of Object.entries(ways)) {
     const f = fixture();
-    f.store.pauseTicket(f.ticketId);
+    f.store.pauseTicket(f.ticketId, "test pause");
     await stop(f);
     await f.workers.drain();
     assert.match(f.runner.sessions.at(-1)?.prompts.at(-1) ?? "", /gracefully/, way);
@@ -194,7 +232,7 @@ test("a stop request survives resume and is recorded before cleanup", async () =
   await operatorControls(store, workers, github.gh, REPO).stop(ticketId);
   assert.notEqual(store.getTicket(ticketId).stopRequestedAt, null);
   assert.equal(store.unfinishedTurns(1).length, 1);
-  store.pauseTicket(ticketId);
+  store.pauseTicket(ticketId, "test pause");
   store.resumeTicket(ticketId);
   assert.notEqual(store.getTicket(ticketId).stopRequestedAt, null);
 });
@@ -252,4 +290,28 @@ test("a non-collaborator redirect reaches the Worker as information, not instruc
   await workers.drain();
   assert.match(runner.sessions[0]!.prompts[0]!, /information, not an instruction/);
   assert.ok(store.dueReplies().some((reply) => reply.reaction === "eyes"));
+});
+
+
+test("selection comments are consumed, validated and authorized without waking a Worker", async () => {
+  const { store, github, workers, ticketId, assignmentId, comment } = fixture();
+  store.models.discovered("codex", [{ harness: "codex", id: "gpt-6-luna", displayName: "Luna", description: "", efforts: ["low", "high"], defaultEffort: "high" }]);
+  store.models.change({ action: "allow", harness: "codex", model: "gpt-6-luna" });
+  const modelTrigger = comment("model", "alice", "@ostrom use codex/gpt-6-luna");
+  const effortTrigger = comment("effort", "alice", "@ostrom effort low");
+  const invalidTrigger = comment("invalid", "alice", "@ostrom effort max");
+  comment("forbidden", "outsider", "@ostrom use codex/gpt-6-luna");
+  const pass = await routeCommands(store, workers, github.gh, REPO);
+  assert.deepEqual(pass.failed, []);
+  assert.equal(store.selections.current(ticketId, "effort")!.value, "low");
+  assert.equal(store.getAssignment(assignmentId).turns, 0);
+  assert.equal(store.unfinishedTurns(assignmentId).length, 0);
+  const commandReplies = store.dueReplies().filter((reply) =>
+    [modelTrigger, effortTrigger, invalidTrigger].some((triggerId) => reply.id.startsWith(`selection-${triggerId}-${ticketId}`))
+  );
+  assert.equal(commandReplies.length, 3);
+  assert.ok(commandReplies.every((reply) => reply.blocking), "selection command replies bypass batching");
+  assert.ok(store.dueReplies().some((reply) => reply.body.includes("next session")));
+  assert.ok(store.dueReplies().some((reply) => reply.body.includes("Override refused")));
+  assert.equal(pass.handled.find((item) => item.command === "use" && !item.allowed)?.allowed, false);
 });

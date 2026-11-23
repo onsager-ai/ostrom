@@ -4,16 +4,19 @@
 
 import { defaultSocketPath, localApi } from "../api/server.ts";
 import { operatorControls, routeCommands } from "../commands/commands.ts";
+import { queueStatusCard } from "../github/cards.ts";
 import { renderMergeEligibilityPreview } from "../github/preview.ts";
 import { mergePass } from "../github/merge-pass.ts";
 import { GitHubApp, loadAppConfig } from "../github/app.ts";
 import { workerAuth } from "../github/worker-auth.ts";
-import { execGh, githubRunner, type GhRunner } from "../github/gh.ts";
+import { execGh, ghGet, githubRunner, type GhRunner } from "../github/gh.ts";
 import { sendDueReplies } from "../github/outbox.ts";
 import { processRunner, type ProcessRunner } from "../process.ts";
 import { pollOnce } from "../github/poller.ts";
 import { routeCandidates } from "../router/router.ts";
+import { excerptThreadBody, THREAD_BODY_EXCERPT_CHARS, type ThreadContext } from "../router/thread-context.ts";
 import { sessionConfig } from "../session/config.ts";
+import { modelDiscovery, type Discover } from "../session/model-discovery.ts";
 import { codexSessionsDir } from "../session/rollout.ts";
 import { claudeRunner, codexRunner, type Runner } from "../session/runner.ts";
 import { Store } from "../store/store.ts";
@@ -57,6 +60,8 @@ see docs/running.md. Developer passes retain their existing environment requirem
 `;
 
 export interface MainDeps {
+  discoverModels?: Discover;
+  watchdogHealth?: { lastAttemptAt: string | null; lastSuccess: boolean | null; lastSuccessAt: string | null; error: string | null };
   env: Record<string, string | undefined>;
   gh: GhRunner;
   semon: ProcessRunner;
@@ -130,7 +135,13 @@ async function tick(deps: MainDeps): Promise<number> {
   const shared = { ...deps, workers: deps.workers ?? owned!.workers, store: deps.store ?? owned!.store };
   try {
     for (const step of TICK) {
+      if (step === "watchdog" && deps.watchdogHealth !== undefined) deps.watchdogHealth.lastAttemptAt = new Date().toISOString();
       const code = await main(["dev", step], { ...shared, mergeAllowed: failed.length === 0 });
+      if (step === "watchdog" && deps.watchdogHealth !== undefined) {
+        deps.watchdogHealth.lastSuccess = code === 0;
+        if (code === 0) deps.watchdogHealth.error = null;
+        if (code === 0) deps.watchdogHealth.lastSuccessAt = deps.watchdogHealth.lastAttemptAt;
+      }
       if (code !== 0) failed.push(`${step} (exit ${code})`);
     }
   } finally {
@@ -154,27 +165,42 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
   let code = 0;
   const owned = openWorkers(deps);
   const controls = operatorControls(owned.store, owned.workers, deps.gh, config.repo);
+  const watchdogHealth = { lastAttemptAt: null as string | null, lastSuccess: null as boolean | null, lastSuccessAt: null as string | null, error: null as string | null };
+  const discovery = modelDiscovery(owned.store, deps.env, (message) => deps.stderr(`ostromd: ${message}`), deps.discoverModels);
   const api = localApi(owned.store, {
+    refreshModels: () => discovery.refresh(),
     socketPath: defaultSocketPath(deps.env),
+    watchdog: () => ({ ...watchdogHealth }),
+    tickIntervalSeconds: intervalSeconds,
     control: {
       ...controls,
-      extend: async (ticketId, increases) => { owned.store.extendTicketBudget(ticketId, increases); },
+      extend: async (ticketId, increases) => {
+        owned.store.extendTicketBudget(ticketId, increases);
+        queueStatusCard(owned.store, ticketId);
+        const assignment = owned.store.latestAssignment(ticketId);
+        if (assignment?.state === "running" && owned.store.getTicket(ticketId).state === "open") owned.workers.wake(assignment.id);
+      },
       preview: async () => renderMergeEligibilityPreview(owned.store, deps.gh, config.repo, config.mergePolicy),
     },
   });
   logRecovery(owned.workers.recover(), deps);
-  // A stop cuts off running turns rather than waiting for them; recovery resumes them on the next start.
+  // Record interruption and signal the SDK immediately; recovery resumes assignments next start.
   deps.stop.addEventListener("abort", () => owned.workers.stop(), { once: true });
   try {
     await api.start();
+    void discovery.refresh();
     while (!deps.stop.aborted) {
-      code = await tick({ ...deps, workers: owned.workers, store: owned.store });
+      code = await tick({ ...deps, workers: owned.workers, store: owned.store, watchdogHealth });
       if (deps.stop.aborted) break;
       await deps.sleep(intervalSeconds * 1000, deps.stop);
     }
   } finally {
+    await discovery.close();
     await api.close();
-    await owned.close();
+    if (!await owned.close(true)) {
+      deps.stderr("ostromd stop: SDK cancellation did not settle within 5 seconds");
+      code = 1;
+    }
   }
   return code;
 }
@@ -183,11 +209,27 @@ function makeWorkers(deps: MainDeps, store: Store): Workers {
   return new Workers({
     store,
     config: loadWorkerConfig(deps.env),
+    router: loadRouterConfig(deps.env),
     runners: deps.runners ?? realRunners(deps.env),
     codexSessions: deps.codexSessions ?? codexSessionsDir(),
     ...(deps.addWorktree === undefined ? {} : { addWorktree: deps.addWorktree }),
     gh: deps.gh,
     repo: loadConfig(deps.env).repo,
+    ...(deps.env["OSTROM_SEMON_URL"]?.trim() ? { semonUrl: deps.env["OSTROM_SEMON_URL"].trim() } : {}),
+    threadContext: async (ticketId): Promise<ThreadContext | undefined> => {
+      const thread = store.ticketContext(ticketId).thread;
+      try {
+        const item = await ghGet(deps.gh, `repos/${loadConfig(deps.env).repo}/issues/${thread.number}`) as { title?: unknown; body?: unknown } | null;
+        const body = typeof item?.body === "string" ? item.body : "";
+        const bodyExcerpt = excerptThreadBody(body);
+        return {
+          kind: thread.kind, number: thread.number, url: thread.url, title: typeof item?.title === "string" ? item.title : "",
+          bodyExcerpt: bodyExcerpt.bodyExcerpt.slice(0, THREAD_BODY_EXCERPT_CHARS), bodyTruncated: bodyExcerpt.bodyTruncated,
+        };
+      } catch {
+        return undefined;
+      }
+    },
     log: (line) => deps.stderr(`ostromd: ${line}`),
   });
 }
@@ -199,9 +241,11 @@ function openWorkers(deps: MainDeps) {
   return {
     store,
     workers,
-    close: async () => {
+    close: async (stopping = false): Promise<boolean> => {
       try {
+        if (stopping) return await workers.shutdown();
         await workers.drain();
+        return true;
       } finally {
         store.close();
       }
@@ -297,7 +341,7 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
       return pass.failed.length === 0 ? 0 : 1;
     }
     if (command === "commands") {
-      const pass = await routeCommands(store, workers(), deps.gh, config.repo);
+      const pass = await routeCommands(store, workers(), deps.gh, config.repo, config.allowlist);
       for (const handled of pass.handled) deps.stdout(JSON.stringify(handled));
       for (const failure of pass.failed) {
         deps.stderr(`ostromd commands: trigger ${failure.triggerId} for ticket ${failure.ticketId} failed: ${failure.error}`);
@@ -306,7 +350,7 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
       return pass.failed.length === 0 ? 0 : 1;
     }
     if (command === "route") {
-      const pass = routeFollowUps(store, workers());
+      const pass = routeFollowUps(store, workers(), config.allowlist);
       for (const queued of pass.queued) deps.stdout(JSON.stringify(queued));
       for (const failure of pass.failed) {
         deps.stderr(
@@ -318,7 +362,14 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
     }
     if (command === "watchdog") {
       const { idleMinutes } = loadWatchdogConfig(deps.env);
-      const pass = await watchdog({ store, semon: deps.semon, idleMinutes });
+      const pass = await watchdog({
+        store, semon: deps.semon, idleMinutes,
+        onBudgetPause: (assignmentId) => {
+          workers().deliver(assignmentId, `budget-pause-${assignmentId}-${Date.now()}`,
+            "The ticket budget has been reached. Push your work in progress, then stop and wait for Ostrom to resume you.", () => {});
+        },
+      });
+      if (deps.watchdogHealth !== undefined && pass.failed.length > 0) deps.watchdogHealth.error = pass.failed[0]!.error.slice(0, 240);
       const ladder = await advanceStuckLadder(store, workers());
       for (const checked of pass.checked) deps.stdout(JSON.stringify(checked));
       for (const failure of pass.failed) deps.stderr(`ostromd watchdog: ${failure.what} failed: ${failure.error}`);
@@ -333,11 +384,13 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
     if (command === "merge") {
       const pass = await mergePass({ store, workers: workers(), gh: deps.gh, repo: config.repo, policy: config.mergePolicy,
         base: loadWorkerConfig(deps.env).base, allowSend: deps.mergeAllowed ?? true,
+        log: (line) => deps.stderr(`ostromd merge: ${line}`),
         ...(deps.appBotId === undefined ? {} : { appBotId: deps.appBotId }),
         refreshBeforeSend: async () => {
           // The final evidence read follows fresh intake and controls. Any failure suppresses HTTP.
-          await pollOnce({ store: openStore, gh: deps.gh, repo: config.repo, allowlist: config.allowlist });
-          const controls = await routeCommands(openStore, workers(), deps.gh, config.repo);
+          await pollOnce({ store: openStore, gh: deps.gh, repo: config.repo, allowlist: config.allowlist,
+            approvalRouter: { router: loadRouterConfig(deps.env), runners: deps.runners ?? realRunners(deps.env) } });
+          const controls = await routeCommands(openStore, workers(), deps.gh, config.repo, config.allowlist);
           if (controls.failed.length > 0) throw new Error("final controls failed");
         },
       });
@@ -372,7 +425,8 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
       return pass.failed.length === 0 ? 0 : 1;
     }
     if (command === "poll") {
-      const result = await pollOnce({ store, gh: deps.gh, repo: config.repo, allowlist: config.allowlist });
+      const result = await pollOnce({ store, gh: deps.gh, repo: config.repo, allowlist: config.allowlist,
+        approvalRouter: { router: loadRouterConfig(deps.env), runners: deps.runners ?? realRunners(deps.env) } });
       for (const candidate of result.candidates) deps.stdout(JSON.stringify(candidate));
       deps.stderr(
         `ostromd poll: ${result.candidates.length} new, ${result.duplicates} already stored, ` +
@@ -401,9 +455,19 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
 
 if (import.meta.main) {
   const stop = new AbortController();
-  // Only `run` finishes its current tick on a signal; a second signal, or any other command, stops as usual.
+  // Bound the whole shutdown, including a tick or SDK subprocess that does not settle.
+  let deadline: ReturnType<typeof setTimeout> | undefined;
   if (process.argv[2] === "run") {
-    for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => stop.abort());
+    for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => {
+      if (stop.signal.aborted) return;
+      deadline = setTimeout(() => {
+        console.error("ostromd stop: shutdown exceeded 10 seconds");
+        process.exit(1);
+      }, 10_000);
+      stop.abort();
+    });
   }
   process.exitCode = await main(process.argv.slice(2), { ...defaults, stop: stop.signal });
+  clearTimeout(deadline);
+  if (stop.signal.aborted) process.exit(process.exitCode);
 }

@@ -3,7 +3,7 @@
 `ostromd` is a user service. Install the two commands from a checkout with `npm link`
 (they run their TypeScript directly on Node 24). Put the runtime configuration in
 `~/.config/ostrom/env` (including `OSTROM_REPO`, `OSTROM_ALLOWLIST`, `OSTROM_DB`,
-worker, router, and Watchdog variables). It must also set `PATH`: systemd starts user services
+worker, router, Watchdog, and optional `OSTROM_SEMON_URL` variables). Set `OSTROM_SEMON_URL` to the Semon viewer base URL to add links to Worker sessions in the GitHub status card and `ostrom show`; a new session can return 404 for a few seconds while Semon indexes it. It must also set `PATH`: systemd starts user services
 with a minimal one, and the daemon and its Workers need `node`, `ostromd`, `git`, `gh`, `semon`,
 `codex` and `claude`. Copy your shell's value, for example with
 `echo "PATH=$PATH" >> ~/.config/ostrom/env`. Then install the checked-in unit:
@@ -16,7 +16,27 @@ systemctl --user enable --now ostromd
 ```
 
 The daemon runs `ostromd run --interval 60`, restarts after failures, and writes
-logs to the user journal. Inspect it with `journalctl --user -u ostromd`.
+logs to the user journal. Inspect it with `journalctl --user -u ostromd`. Each ticket Worker gets a
+worktree in the configured repository clone. Ostrom fetches `origin/<OSTROM_WORKER_BASE>` before
+creating the ticket branch from that fetched ref; if the fetch fails, dispatch fails instead of using
+the clone's potentially stale local base branch. The Worker's pull request still targets
+`OSTROM_WORKER_BASE`.
+
+On SIGTERM or SIGINT, the daemon stops scheduling turns, records active turns as interrupted at
+the stop time, and aborts them through the SDK cancellation signal. It allows five seconds for
+Worker cancellation to settle, with a ten-second deadline for the whole shutdown; a timeout exits
+nonzero. The next start resumes interrupted assignments by session ID. Claude 0.3.319 accepts an
+`abortController`; Codex 0.170.0 accepts a turn `signal` which terminates its `codex exec` process.
+That Codex SDK exposes no thread interrupt API that guarantees a `turn_aborted` session record,
+so native session readers may still report an unterminated turn even though Ostrom records its
+interruption.
+
+The per-ticket time budget counts time spent in Worker turns, including completed turns and any
+currently running turn. Time waiting between turns, such as for review or an operator answer, does
+not consume it; the idle budget applies only while a turn is running. After a crash, a recovered
+turn ends at its last recorded session activity (or its start if no later activity was observed),
+so daemon downtime does not consume the time budget. Reaching a budget pauses new work and queues
+a WIP prompt after the current turn finishes; it does not cancel that turn.
 
 Set `OSTROM_CODEX_PROVIDER` to override the operator's Codex `model_provider` for both new
 sessions and resumed turns. Ostrom passes it as the pinned SDK's `config.model_provider`
@@ -27,11 +47,55 @@ Changing this variable does not migrate existing sessions. CI probes start and r
 resolution offline against a different file default, before any session or model call.
 
 The operator uses `ostrom status`, `tickets`, `show`, `pause`, `resume`, `stop`,
-`extend`, and `preview`. They use the daemon's Unix socket at
+`extend`, and `preview`. Run `ostrom dashboard` to open the read-only local dashboard while
+ostromd is running; it prints a private loopback URL and stays attached until interrupted. The local operator API also serves `GET /v1/intake?limit=50` with recent
+observed events, Router decisions and excluded newly opened issues. The CLI and dashboard clients use
+the daemon's Unix socket at
 `$XDG_RUNTIME_DIR/ostrom/ostromd.sock`, or
 `~/.local/state/ostrom/ostromd.sock` when `XDG_RUNTIME_DIR` is not set. The
 read-only commands can inspect `OSTROM_DB` directly while the daemon is down;
 mutating controls require the daemon.
+
+## Model discovery and selections
+
+`ostrom models` lists the cached Claude and Codex catalogs, allowed selections, efforts,
+custom settings and discovery errors. Add `--json` for structured output. Discovery runs in the
+background at daemon startup using the same harness environment as Workers; `ostrom models
+refresh` refreshes it on demand. A failed refresh exits nonzero and retains the last good catalog.
+New models start disallowed; retired allowed models are flagged in the list.
+
+```sh
+ostrom models allow codex/gpt-6.2-sol
+ostrom models set codex/gpt-6.2-sol --efforts low,high --approval on --cost 2 --note "Rust changes"
+ostrom models remove codex/gpt-6.2-sol
+ostrom models objective cost
+ostrom models export > models.json
+ostrom models import models.json
+```
+
+Use the IDs and efforts shown by discovery. Settings require an allowed model; efforts must be a
+subset of its discovered efforts and cost must be a positive relative weight. Import replaces the
+objective and all selections atomically after validating them against the local cached catalogs.
+An unavailable model cannot be added or edited, but an existing retired selection can be removed.
+Listing and export work from `OSTROM_DB` while the daemon is down; changes and refresh require it.
+The Router chooses a model at acceptance using the allowed list, objective, cost and notes. Each
+Worker turn gets a separate small Router call choosing an allowed effort from its prompt and recent
+history. Invalid model answers fall back to the cheapest allowed model without approval; invalid
+effort answers use medium (or an allowed default). Decisions and inputs appear in `ostrom show
+<ticket> --json`; the status card and dashboard show the current turn and reasons. With no selected
+models, `OSTROM_WORKER_MODEL` remains the session model and effort is still chosen per turn.
+
+`ostrom model <ticket> <harness/model>` and `ostrom effort <ticket> <level>` set durable overrides
+through the daemon. On the issue or PR, use `@ostrom use <harness/model>` and `@ostrom effort
+<level>`; issue authors and collaborators with triage or higher may do this. Later effort overrides
+apply at the next turn; an override in the comment that starts a ticket applies on its first turn and
+is shown on the status card without a separate reply. A session keeps its model: a model override after session start applies only to the next
+session. Overrides persist until replaced and must remain in the allowed list.
+
+The existing merge approval mechanism does not cover starting a model. An automatic choice that
+requires approval is recorded and falls back to the cheapest allowed model without approval. If
+none exists, dispatch waits. An explicit model override approves that model for this ticket. This
+approval does not grant permission to merge. Outcome history and escalation are later phases.
 
 Developer-only one-shot passes remain available as `ostromd dev <pass>`:
 `poll`, `send`, `dispatch <ticket>`, `observe`, `commands`, `route`, `watchdog`,
@@ -73,6 +137,8 @@ The sandbox matrix in `merging.md` remains a separate, unperformed verification 
 
 Set `OSTROM_WORKER_RULES_FILE` to a file of the machine's house rules (for example its heat
 limits, and that tests run in CI rather than locally). Its text closes every Worker's brief.
+When those rules forbid local generation, the brief tells Workers to open the pull request first
+and commit generated output taken from that pull request's CI.
 
 ## GitHub App identity
 

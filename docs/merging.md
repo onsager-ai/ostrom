@@ -55,10 +55,11 @@ not establish ownership. Human policy skips merge requests entirely. Otherwise a
 2. The Worker has no running or queued turn, undelivered follow-up, unhandled command, recovery or
    stop cleanup. Check durable work as well as the runner queue. Reserve that assignment while
    sending the merge request, so no local turn can start concurrently.
-3. The PR is open, not draft, and still has the captured head and base SHAs. GitHub reports
-   `mergeable=true` and GraphQL `mergeStateStatus=CLEAN`. Null/UNKNOWN waits for another tick;
-   conflicts, BEHIND, BLOCKED, UNSTABLE and HAS_HOOKS block this first implementation. CLEAN alone
-   is insufficient evidence of CI or protection compliance. [1][2]
+3. The Worker opens the PR ready for review, not as a draft. The PR must remain open and retain the
+   captured head and base SHAs. GitHub reports `mergeable=true` and GraphQL
+   `mergeStateStatus=CLEAN`. Null/UNKNOWN waits for another tick; conflicts, BEHIND, BLOCKED,
+   UNSTABLE and HAS_HOOKS block this first implementation and the refusal names the observed field
+   value or moved SHA. CLEAN alone is insufficient evidence of CI or protection compliance. [1][2]
 4. CI evidence comes primarily from the head commit's `statusCheckRollup`, in the same GraphQL
    query as merge/review state and threads. Require `commit.oid` to equal the captured head,
    `state=SUCCESS`, and read every page of `contexts` (CheckRun or StatusContext). Every required
@@ -87,10 +88,23 @@ not establish ownership. Human policy skips merge requests entirely. Otherwise a
 7. The ready reply has actually been posted, and ten quiet minutes have passed. The timer starts
    at the latest of that post, PR discovery, any head/base change, any completed Worker turn, and
    the latest observed human activity on the issue or PR. Activity includes comments/edits,
-   submitted/dismissed reviews, thread replies/resolutions, pushes, PR edits and controls. Refresh
+   submitted/dismissed reviews, thread replies/resolutions, pushes, PR edits and controls. An APPROVED
+   review with zero inline comments and a trimmed body that is empty or exactly `lgtm`, `approved`,
+   or `looks good` (case-insensitive, optionally followed by one `.` or `!`) is excluded from
+   activity and Worker follow-ups, but still counts toward approval policy. For any other APPROVED
+   body with zero inline comments, intake asks the configured Router whether the commentary asks
+   the Worker for anything. A judgement of `ignore` records the same excluded receipt and leaves
+   the Worker and quiet timer alone; `accept`, invalid output or a failed Router call preserves
+   normal delivery. Inline feedback and CHANGES_REQUESTED reviews bypass this judgement. The direct
+   merge evidence read honors approval receipts only while the review is APPROVED with no inline
+   comments. The empty/short approval path needs no Router call. Refresh
    these directly before merging; the intake cursor alone is insufficient. Newly observed changes
    with no reliable timestamp restart the timer at observation. Treat unmarked actor activity as
-   human conservatively; Ostrom's marked cards/replies and CI updates do not restart it. Pending
+   human conservatively; comments carrying Ostrom's hidden reply marker, status cards, and CI
+   updates do not restart it. A nonempty APPROVED review with no inline comments is excluded from
+   the fingerprint while it awaits Router judgment, and is held with `approval commentary not yet
+   judged` until its receipt or trigger exists. A receipt keeps a no-feedback approval excluded; a
+   trigger makes commentary activity count normally. Pending
    review drafts are not visible reliably, so this window cannot promise time for an unseen review.
 
 Ten minutes is a fixed milestone-2 default, not another policy knob. A new head/base or changed
@@ -112,6 +126,10 @@ The existing `pr_opened` reply becomes the ready reply and says whether Ostrom i
 automatically after the quiet window or is waiting for a human. It keeps the stable opened-outcome
 ID. Ordinary batching remains; the timer starts at confirmed delivery, never at enqueue time.
 Later revisions update the card rather than posting repeated ready comments.
+When an owned open PR conflicts with its base, an idle Worker on an open, unblocked ticket receives
+one turn per assignment/head/base SHA to merge the base into its existing branch, preserve both
+sides' intent (including every append-only entry), and push without opening another PR; a persisting
+conflict stays on the card and is not retried unless the head or base moves.
 
 On confirmed merge, both human and Ostrom merges yield the same `pr_merged` outcome and **Done**
 card. Keep `outcome-a<assignment>-pr<number>-merged` and one done reply on the originating thread.
@@ -159,7 +177,8 @@ come from it. Match logins case-insensitively; record stable user IDs when read.
 non-dismissed APPROVED reviews on this head from people with repository write/maintain/admin
 permission, excluding bots and the PR author. A later COMMENTED review does not cancel an approval;
 a later decisive request for changes blocks. A new head needs fresh approvals even if the repository
-does not dismiss stale reviews. GitHub's own stricter approval requirements always apply. [2][7][8]
+does not dismiss stale reviews; when only eligible approvals on older heads remain, the merge reason
+names their short SHAs and says to approve again. GitHub's own stricter approval requirements always apply. [2][7][8]
 
 Reject unknown strategies, inconsistent fields, invalid counts and duplicate/empty allowlist entries
 at startup, with non-zero exit. Human policy ignores CI readiness for performing merges because
@@ -277,6 +296,12 @@ workflow run/attempt URLs, review URLs and merge SHA. Add an evidence document o
 | Push/re-run/protection race | Force-push after green rejects old evidence; a queued re-run and missing/wrong-app required check block; conflict/draft/required review also block |
 | Restart/failure/racing human | Crash after accepted merge with lost response reconciles once; a concurrent human merge completes once with honest attribution; denied API returns non-zero |
 | Stop at send boundary | Pause before reservation prevents HTTP; pause after send reports possible in-flight merge and reconciles without a false promise |
+
+When a tracked Worker PR advances to a new head while its assignment is idle, the merge pass
+re-requests review from each human reviewer whose latest submitted review is `CHANGES_REQUESTED`
+on a different head. It skips the PR author and bot accounts. Each `(repository, PR, head, reviewer)`
+request is recorded before the POST, so a restart or an ambiguous/failed HTTP response will not send
+it again. A failed request is logged and does not fail the Worker turn.
 
 ## Implementation PRs
 

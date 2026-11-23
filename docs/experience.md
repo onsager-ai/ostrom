@@ -32,10 +32,17 @@ drivers. A dedicated "promote to foreground" feature is deferred (operator, 2026
 
 An issue author or reviewer, who never sees Ostrom's internals.
 
-1. Opens an issue that mentions Ostrom, or mentions Ostrom in a comment.
+1. Opens an issue that mentions Ostrom, or mentions Ostrom in a comment on a thread without an active ticket. On a thread Ostrom already works on, comments after that ticket's start comment continue to reach the Worker without a mention.
 2. Within minutes Ostrom replies with "taking this" or "not for me, because …".
-3. A PR appears, linked to the issue.
+3. A PR appears, linked to the issue. Ostrom checks its description and, for tickets started from an issue, fixes literal `\n` sequences and ensures exactly one `Closes #<issue>` line.
+   If the Worker finishes its first turn or a follow-up without a PR for its branch or a new push
+   during that turn, Ostrom posts the Worker's final message right away and shows **Blocked** on
+   the status card. A reply starts a new turn with the same Worker and clears the blocked state.
 4. Their later comments and reviews reach the **same** Worker, through thread subscription.
+   A Worker that starts an on-demand GitHub Actions run reports it as pending while it runs.
+   Ostrom wakes the same Worker when the run succeeds or fails, with a link to the results
+   and the failed job names when applicable. If the ticket is paused, Ostrom keeps the result
+   for delivery after resume.
 5. The Worker revises; Ostrom merges unattended by default, or waits for a human under the
    repository's policy. The proposed milestone-2 conditions and policy options are in
    [`merging.md`](merging.md); milestone 1 used human merges.
@@ -52,11 +59,14 @@ Ostrom edits silently and posts a new comment only when someone needs to act.
   command or steer gets a reaction, not a reply.
 - **New comments only at "needs you" moments:** taken or declined, a question, ready for review,
   stuck, and done or stopped.
-- **The outbox batches, in code.** It gathers events per thread over a window (10 minutes to start)
-  and sends them as one comment. A thread gets at most one new comment per 30 minutes. A blocking
-  question goes out at once.
+- **The outbox batches, in code.** It gathers ordinary events per thread over a window (10 minutes
+  to start) and sends them as one comment. A thread gets at most one new ordinary comment per 30
+  minutes. Blocking questions, control-command replies, and Worker turn results go out at once, so
+  an earlier turn's result cannot arrive after a later turn has started.
 - **One reply per review**, never one per review comment. Ostrom replies inline only where it
-  disagrees or asks a question.
+  disagrees or asks a question. Worker final messages are public replies for PR reviewers; the
+  outbox rewrites host paths to repository-relative text or links at the known PR head, and Ostrom
+  reports CI and merge state, including conflicts with the base, on the status card.
 
 ### Stop and redirect
 
@@ -71,6 +81,8 @@ reaction, and the status card shows the result.
 | `@ostrom stop` | Graceful stop: push work in progress, turn the PR into a draft, post one summary of where it stopped. The ticket ends. | Issue author, or repo triage or higher | 👍 and one closing comment |
 | Close the issue | Same as stop. The branch is kept; reopening the issue asks the Router again. | Whoever can close it | Card **Stopped: issue closed** |
 | Close the PR | Ends that attempt only; the issue stays open for a new decision | Whoever can close it | Card updated, no new comment |
+| `@ostrom use <model>` | Overrides the ticket model; an existing session keeps its model until the next session | Issue author, or repo triage or higher | Reply with the effective session boundary |
+| `@ostrom effort <level>` | Overrides effort from the next turn until changed; in the comment that starts a ticket, applies from its first turn | Issue author, or repo triage or higher | Reply confirming the effort, except the start comment uses the status card |
 | A command from someone without permission | Ignored | | 😕 only; no comment, so no noise and no argument |
 
 One table in code defines the commands, permissions and reactions. The parser, the help line on the
@@ -115,7 +127,7 @@ Decided by the operator on 2026-11-09:
 - The operator gets a 30-minute grace window before the public stuck reply. This comes in
   milestone 2; until then, the stuck reply goes out when the operator step is reached.
 - Batching defaults: a 10-minute gathering window, and at most one new comment per thread per 30
-  minutes. A blocking question skips the wait.
+  minutes. Blocking questions, control-command replies, and Worker turn results skip the wait.
 
 ## Journey 2: the operator
 
@@ -147,15 +159,24 @@ attention list: stuck tickets, near-budget tickets, and machines that are offlin
 no log or transcript viewer of its own: sessions are read with Semon (`semon sessions --watch` or
 `--serve`, `semon query read_transcript <id>`), and the daemon's own logs go to journald.
 
+Semon also groups sessions by ticket. Ostrom writes that link to `$XDG_STATE_HOME/ostrom/semon-annotations.jsonl`
+(`~/.local/state` when unset or relative), one JSON line per event: when a Worker's session id first
+appears, and again when its PR number or issue title changes. Each line names the system, repository,
+ticket, issue, PR and the title. Semon only reads this file. Ostrom appends to it and never rewrites it.
+A Claude Worker is also renamed to the title, so Claude's own session list shows it. A failed write is
+logged once and does not fail the Worker's turn. The format is in
+onsager-ai/semon `docs/design/session-annotations.md`.
+
 ### Budgets per ticket
 
 Every ticket runs under a budget with several limits: wall-clock time, idle time, turns, tokens,
-estimated cost, and tier escalations. Defaults come per tier and can be overridden per repository
-or per label.
+estimated cost, and model escalations. Ostrom chooses each ticket's model and each turn's effort
+within the operator's limits ([model-selection.md](model-selection.md)).
 
 - At 80% of any limit, the status card and dashboard show a warning.
-- At a limit, the Worker **pauses**. It is not killed: it pushes its work in progress, and the stuck
-  ladder starts with the cause "budget reached". The operator can `ostrom extend` it or stop it.
+- At a limit, the Worker **pauses** with the cause `budget reached: <limit>` and pushes its work in
+  progress. Budget exhaustion never starts the stuck ladder. `ostrom extend` resumes a ticket paused
+  only for the raised budget once all limits clear; an operator pause stays paused.
 - Subscription plans have no per-call price, so Ostrom always enforces tokens and time, and treats
   cost as an estimate.
 

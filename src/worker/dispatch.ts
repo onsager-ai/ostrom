@@ -2,9 +2,14 @@
 // `workers.ts`; here a running Worker is followed through GitHub until its PR exists. Everything
 // here is deterministic; no model call is made by Ostrom itself.
 
+import { renameSession } from "@anthropic-ai/claude-agent-sdk";
+
 import { queueStatusCard } from "../github/cards.ts";
+import { appendSessionAnnotationIfChanged, rememberedAnnotation, truncateTitle } from "../session/annotations.ts";
 import { ghGet, type GhRunner } from "../github/gh.ts";
 import type { AssignmentOutcome, Store, TicketContext } from "../store/store.ts";
+
+export const PUBLIC_FINAL_MESSAGE = "Ostrom may post your final message publicly on the issue or pull request. Write for readers there: use repository-relative paths, describe the resulting changes and relevant validation, or explain what prevented delivery, and do not narrate your own process or what you did or did not post. Do not claim CI or merge state; Ostrom reports those.";
 
 /**
  * The Worker's first message: a summary plus pointers ("Inline & Spill"). It quotes no comment
@@ -24,13 +29,25 @@ export function workerBrief(context: TicketContext, branch: string, base: string
     "Read that thread and those comments with `gh` for the full request; this message does not copy them.",
     `Do the work in this worktree on branch ${branch}. Commit, push the branch, and open a pull request`,
     `on ${source.name} against ${base} whose description says "Refs #${thread.number}".`,
+    rules === undefined ? "Open it ready for review." : "Open it ready for review unless the generated-file instructions below apply.",
     "Do not comment on GitHub yourself: Ostrom replies to people. After the quiet window Ostrom may",
     "squash-merge your pull request, so do not merge it, enable auto-merge, dismiss reviews, or resolve",
     "human review threads yourself. Review comments on your pull request will reach you in this session as follow-up messages.",
     "You run unattended: never stop to ask an interactive question. Decide, state your assumption in",
     "the pull request description, and carry on.",
     "If a normal commit fails, report the failure; do not create or push commit objects with Git plumbing.",
-    ...(rules === undefined ? [] : ["", "House rules for this machine, which you must follow:", rules]),
+    "If you manually dispatch a workflow run on your branch, say it is pending in your reply while it runs.",
+    "Do not claim results you have not seen. Ostrom wakes you when a manually dispatched run finishes.",
+    PUBLIC_FINAL_MESSAGE,
+    ...(rules === undefined ? [] : [
+      "",
+      "House rules for this machine, which you must follow:",
+      rules,
+      "If the work needs a change a repository or house rule forbids, say so in the pull request description when you push it: name the rule, the files, and why the change is needed, so the reviewer can decide.",
+      "If a file can only be produced by a build or generator these rules don't allow here, ensure CI uploads the output or shows the diff, then open the pull request as a draft.",
+      "In the same turn, follow the pull request CI run for the draft's head commit until it finishes. Download the generated artifact or apply the diff shown by the check.",
+      "Commit the generated files and push to the same branch before marking the pull request ready for review.",
+    ]),
   ].join("\n");
 }
 
@@ -40,6 +57,25 @@ export interface BranchPullRequest {
   number: number;
   url: string;
   state: PullRequestState;
+  draft: boolean;
+  headSha?: string;
+  body?: string;
+}
+
+/** Normalize only the ticket's closing line; unrelated body content is preserved. */
+export function workerPullRequestBody(body: string, issueNumber: number): string {
+  const closeLine = `Closes #${issueNumber}`;
+  const normalized = body.replaceAll("\\n", "\n");
+  const lines = normalized.split("\n");
+  let found = false;
+  const result = lines.filter((line) => {
+    if (line.trim() !== closeLine) return true;
+    if (found) return false;
+    found = true;
+    return true;
+  });
+  if (!found) result.push(closeLine);
+  return result.join("\n");
 }
 
 /** The pull requests on `repo` whose head is `branch`, in any state, by number. */
@@ -53,7 +89,12 @@ export async function pullRequestsForBranch(gh: GhRunner, repo: string, branch: 
         throw new Error(`gh pulls for ${branch}: unexpected item ${JSON.stringify(item)}`);
       }
       const state: PullRequestState = item["merged_at"] != null ? "merged" : item["state"] === "closed" ? "closed" : "open";
-      return { number: item["number"], url: item["html_url"], state };
+      const head = item["head"] as { sha?: unknown } | null | undefined;
+      return {
+        number: item["number"], url: item["html_url"], state, draft: item["draft"] === true,
+        ...(typeof head?.sha === "string" && head.sha !== "" ? { headSha: head.sha } : {}),
+        ...(typeof item["body"] === "string" ? { body: item["body"] } : item["body"] === null ? { body: "" } : {}),
+      };
     })
     .sort((a, b) => a.number - b.number);
 }
@@ -72,6 +113,12 @@ export interface Observed {
 export interface ObservePass {
   observed: Observed[];
   failed: { assignmentId: number; error: string }[];
+}
+
+async function issueTitle(gh: GhRunner, repo: string, number: number): Promise<string | null> {
+  const issue = await ghGet(gh, `repos/${repo}/issues/${number}`);
+  const value = issue !== null && typeof issue === "object" ? (issue as Record<string, unknown>)["title"] : undefined;
+  return typeof value === "string" ? value : null;
 }
 
 /**
@@ -95,9 +142,60 @@ export async function observe(store: Store, gh: GhRunner, repo: string): Promise
       continue;
     }
     const newlySubscribed: number[] = [];
+    const ticketThread = store.ticketContext(assignment.ticketId).thread;
     for (const pr of pullRequests) {
+      if (ticketThread.kind === "issue" && pr.body !== undefined) {
+        const body = workerPullRequestBody(pr.body, ticketThread.number);
+        if (body !== pr.body) {
+          try {
+            await gh(["api", "--method", "PATCH", `repos/${repo}/pulls/${pr.number}`, "-f", `body=${body}`]);
+          } catch (error) {
+            pass.failed.push({ assignmentId: assignment.id, error: `PR #${pr.number} body: ${error instanceof Error ? error.message : String(error)}` });
+            continue;
+          }
+        }
+      }
       const threadId = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: pr.number, url: pr.url });
       if (!store.subscribe(assignment.ticketId, threadId).duplicate) newlySubscribed.push(pr.number);
+    }
+    // The annotation names one PR, the lowest-numbered. Naming each PR in turn would write a line on every pass.
+    const first = pullRequests[0];
+    if (first !== undefined) {
+      const context = store.ticketContext(assignment.ticketId);
+      const harness = assignment.harness!;
+      // The title is fetched once per session and PR number. A repeat pass with the same PR makes no lookup.
+      const remembered = rememberedAnnotation(harness, assignment.sessionId);
+      let title: string | null | undefined;
+      if (remembered !== undefined && remembered.pr === first.number) {
+        title = remembered.title;
+      } else {
+        try {
+          title = await issueTitle(gh, repo, context.thread.number);
+        } catch (error) {
+          // No title, no line: the next pass retries the lookup.
+          pass.failed.push({ assignmentId: assignment.id, error: `title lookup: ${error instanceof Error ? error.message : String(error)}` });
+        }
+      }
+      if (title !== undefined) {
+        let written = false;
+        try {
+          written = appendSessionAnnotationIfChanged({
+            harness, native_id: assignment.sessionId, system: "ostrom", repository: context.source.name,
+            ticket: String(context.ticket.id), issue: context.thread.kind === "issue" ? context.thread.number : null,
+            pr: first.number, title, updated_at: new Date().toISOString(),
+          });
+        } catch (error) {
+          pass.failed.push({ assignmentId: assignment.id, error: `annotation: ${error instanceof Error ? error.message : String(error)}` });
+        }
+        const label = truncateTitle(title);
+        if (written && harness === "claude" && label !== null) {
+          try {
+            await renameSession(assignment.sessionId, label);
+          } catch (error) {
+            pass.failed.push({ assignmentId: assignment.id, error: `rename: ${error instanceof Error ? error.message : String(error)}` });
+          }
+        }
+      }
     }
     // The card links the PR, so a new one refreshes it.
     if (newlySubscribed.length > 0) queueStatusCard(store, assignment.ticketId);

@@ -548,6 +548,213 @@ export const migrations: readonly string[] = [
   ALTER TABLE queued_turn_v28 RENAME TO queued_turn;
   CREATE INDEX queued_turn_unfinished ON queued_turn (assignment_id, state) WHERE state IN ('queued', 'running');
   `,
+
+  // 29: Minimal audit of newly opened issues excluded from intake.
+  `
+  CREATE TABLE intake_receipt (
+    source_id       INTEGER NOT NULL REFERENCES source (id),
+    source_event_id TEXT NOT NULL,
+    url             TEXT NOT NULL,
+    observed_at     TEXT NOT NULL,
+    reason          TEXT NOT NULL CHECK (reason IN ('missing @ostrom mention', 'unauthorized author')),
+    PRIMARY KEY (source_id, source_event_id)
+  ) STRICT, WITHOUT ROWID;
+  CREATE INDEX intake_receipt_recent ON intake_receipt (observed_at DESC);
+  `,
+
+  // 30: Per-turn requests, observations and usage; assignment totals remain budget authority.
+  `
+  CREATE TABLE turn (
+    id INTEGER PRIMARY KEY,
+    assignment_id INTEGER NOT NULL REFERENCES assignment(id),
+    ticket_id INTEGER NOT NULL REFERENCES ticket(id),
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    harness TEXT NOT NULL CHECK (harness IN ('claude', 'codex')),
+    requested_model TEXT NOT NULL,
+    requested_effort TEXT,
+    observed_model TEXT,
+    observed_effort TEXT,
+    kind TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
+    cached_input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cached_input_tokens >= 0),
+    output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
+    status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'cancelled', 'failed', 'interrupted')),
+    result TEXT,
+    CHECK ((status = 'running') = (ended_at IS NULL))
+  ) STRICT;
+  CREATE INDEX turn_by_ticket ON turn(ticket_id, id);
+  CREATE UNIQUE INDEX turn_running ON turn(assignment_id) WHERE status = 'running';
+  `,
+
+  // 31: Harness discovery cache and operator model selections (not consumed by dispatch yet).
+  `
+  CREATE TABLE model_discovery (
+    harness TEXT PRIMARY KEY CHECK (harness IN ('claude', 'codex')),
+    models TEXT NOT NULL DEFAULT '[]',
+    discovered_at TEXT,
+    last_error TEXT
+  ) STRICT;
+  INSERT INTO model_discovery (harness) VALUES ('claude'), ('codex');
+  CREATE TABLE model_selection (
+    harness TEXT NOT NULL CHECK (harness IN ('claude', 'codex')),
+    model TEXT NOT NULL,
+    allowed INTEGER NOT NULL CHECK (allowed IN (0, 1)),
+    efforts TEXT NOT NULL,
+    approval INTEGER NOT NULL CHECK (approval IN (0, 1)),
+    cost REAL NOT NULL CHECK (cost > 0),
+    note TEXT NOT NULL,
+    PRIMARY KEY (harness, model)
+  ) STRICT, WITHOUT ROWID;
+  CREATE TABLE model_objective (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    objective TEXT NOT NULL CHECK (objective IN ('cost', 'balanced', 'quality'))
+  ) STRICT;
+  INSERT INTO model_objective VALUES (1, 'cost');
+  `,
+
+  // 32: Record approval-only reviews without turning them into Worker follow-ups.
+  `
+  CREATE TABLE intake_receipt_v32 (
+    source_id       INTEGER NOT NULL REFERENCES source (id),
+    source_event_id TEXT NOT NULL,
+    url             TEXT NOT NULL,
+    observed_at     TEXT NOT NULL,
+    reason          TEXT NOT NULL CHECK (reason IN ('missing @ostrom mention', 'unauthorized author', 'approval without feedback')),
+    PRIMARY KEY (source_id, source_event_id)
+  ) STRICT, WITHOUT ROWID;
+  INSERT INTO intake_receipt_v32 SELECT * FROM intake_receipt;
+  DROP TABLE intake_receipt;
+  ALTER TABLE intake_receipt_v32 RENAME TO intake_receipt;
+  CREATE INDEX intake_receipt_recent ON intake_receipt (observed_at DESC);
+  `,
+
+  // 33: Conflict resolution is a durable Worker turn, deduplicated across daemon restarts.
+  `
+  CREATE TABLE queued_turn_v33 (
+    assignment_id INTEGER NOT NULL REFERENCES assignment (id),
+    delivery_key TEXT NOT NULL CHECK (delivery_key <> ''),
+    kind TEXT NOT NULL CHECK (kind IN ('follow_up', 'review', 'control', 'budget_pause', 'stuck', 'recovery', 'conflict')),
+    source_pointer TEXT,
+    prompt TEXT NOT NULL CHECK (prompt <> ''),
+    state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'finished', 'cancelled')),
+    turn_id TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    PRIMARY KEY (assignment_id, delivery_key),
+    CHECK (
+      (state = 'queued' AND started_at IS NULL AND finished_at IS NULL AND turn_id IS NULL) OR
+      (state = 'running' AND started_at IS NOT NULL AND finished_at IS NULL) OR
+      (state = 'finished' AND started_at IS NOT NULL AND finished_at IS NOT NULL) OR
+      (state = 'cancelled' AND started_at IS NULL AND finished_at IS NOT NULL AND turn_id IS NULL)
+    )
+  ) STRICT, WITHOUT ROWID;
+  INSERT INTO queued_turn_v33 SELECT * FROM queued_turn;
+  DROP TABLE queued_turn;
+  ALTER TABLE queued_turn_v33 RENAME TO queued_turn;
+  CREATE INDEX queued_turn_unfinished ON queued_turn (assignment_id, state) WHERE state IN ('queued', 'running');
+  `,
+  // 34: Persist model/effort choices and widen the public command receipt vocabulary.
+  `
+  ALTER TABLE turn ADD COLUMN reason TEXT;
+  CREATE TABLE selection_decision (
+    id INTEGER PRIMARY KEY,
+    ticket_id INTEGER NOT NULL REFERENCES ticket (id),
+    kind TEXT NOT NULL CHECK (kind IN ('model', 'effort')),
+    value TEXT,
+    reason TEXT NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('router', 'override')),
+    input TEXT NOT NULL,
+    at TEXT NOT NULL
+  ) STRICT;
+  CREATE INDEX selection_decision_ticket ON selection_decision (ticket_id, id);
+  CREATE TABLE command_receipt_v34 (
+    trigger_id INTEGER NOT NULL REFERENCES "trigger" (id),
+    ticket_id INTEGER NOT NULL REFERENCES ticket (id),
+    command TEXT NOT NULL CHECK (command IN ('redirect', 'pause', 'resume', 'stop', 'forbidden', 'close_issue', 'close_pull_request', 'ignore_issue_state', 'use', 'effort')),
+    instruction INTEGER NOT NULL CHECK (instruction IN (0, 1)),
+    handled_at TEXT NOT NULL,
+    PRIMARY KEY (trigger_id, ticket_id)
+  ) STRICT, WITHOUT ROWID;
+  INSERT INTO command_receipt_v34 SELECT * FROM command_receipt;
+  DROP TABLE command_receipt;
+  ALTER TABLE command_receipt_v34 RENAME TO command_receipt;
+  CREATE INDEX command_receipt_by_ticket ON command_receipt (ticket_id, trigger_id);
+  `,
+  // 35: CI fixes are durable Worker turns, deduplicated by PR head.
+  `
+  CREATE TABLE queued_turn_v35 (
+    assignment_id INTEGER NOT NULL REFERENCES assignment (id),
+    delivery_key TEXT NOT NULL CHECK (delivery_key <> ''),
+    kind TEXT NOT NULL CHECK (kind IN ('follow_up', 'review', 'control', 'budget_pause', 'stuck', 'recovery', 'conflict', 'ci_fix')),
+    source_pointer TEXT,
+    prompt TEXT NOT NULL CHECK (prompt <> ''),
+    state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'finished', 'cancelled')),
+    turn_id TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    PRIMARY KEY (assignment_id, delivery_key),
+    CHECK (
+      (state = 'queued' AND started_at IS NULL AND finished_at IS NULL AND turn_id IS NULL) OR
+      (state = 'running' AND started_at IS NOT NULL AND finished_at IS NULL) OR
+      (state = 'finished' AND started_at IS NOT NULL AND finished_at IS NOT NULL) OR
+      (state = 'cancelled' AND started_at IS NULL AND finished_at IS NOT NULL AND turn_id IS NULL)
+    )
+  ) STRICT, WITHOUT ROWID;
+  INSERT INTO queued_turn_v35 SELECT * FROM queued_turn;
+  DROP TABLE queued_turn;
+  ALTER TABLE queued_turn_v35 RENAME TO queued_turn;
+  CREATE INDEX queued_turn_unfinished ON queued_turn (assignment_id, state) WHERE state IN ('queued', 'running');
+  `,
+  // 36: Workflow completions are durable Worker turns, deduplicated by run ID.
+  `
+  CREATE TABLE queued_turn_v36 (
+    assignment_id INTEGER NOT NULL REFERENCES assignment (id),
+    delivery_key TEXT NOT NULL CHECK (delivery_key <> ''),
+    kind TEXT NOT NULL CHECK (kind IN ('follow_up', 'review', 'control', 'budget_pause', 'stuck', 'recovery', 'conflict', 'ci_fix', 'dispatched_run')),
+    source_pointer TEXT,
+    prompt TEXT NOT NULL CHECK (prompt <> ''),
+    state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'finished', 'cancelled')),
+    turn_id TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    PRIMARY KEY (assignment_id, delivery_key),
+    CHECK (
+      (state = 'queued' AND started_at IS NULL AND finished_at IS NULL AND turn_id IS NULL) OR
+      (state = 'running' AND started_at IS NOT NULL AND finished_at IS NULL) OR
+      (state = 'finished' AND started_at IS NOT NULL AND finished_at IS NOT NULL) OR
+      (state = 'cancelled' AND started_at IS NULL AND finished_at IS NOT NULL AND turn_id IS NULL)
+    )
+  ) STRICT, WITHOUT ROWID;
+  INSERT INTO queued_turn_v36 SELECT * FROM queued_turn;
+  DROP TABLE queued_turn;
+  ALTER TABLE queued_turn_v36 RENAME TO queued_turn;
+  CREATE INDEX queued_turn_unfinished ON queued_turn (assignment_id, state) WHERE state IN ('queued', 'running');
+  `,
+
+  // 37: A review request is attempted at most once for each changed PR head and human reviewer.
+  `
+  CREATE TABLE review_request (
+    repository TEXT NOT NULL CHECK (repository <> ''),
+    pr_number INTEGER NOT NULL CHECK (pr_number > 0),
+    head_sha TEXT NOT NULL CHECK (head_sha <> ''),
+    reviewer TEXT NOT NULL CHECK (reviewer <> ''),
+    requested_at TEXT NOT NULL,
+    PRIMARY KEY (repository, pr_number, head_sha, reviewer)
+  ) STRICT, WITHOUT ROWID;
+  `,
+  // 38: Remember the branch head pushed by a completed Worker turn for review re-requests.
+  `ALTER TABLE turn ADD COLUMN pushed_head_sha TEXT CHECK (pushed_head_sha <> '');`,
+  // 39: Track pause requests across resumes and discard old reflog-based head evidence.
+  `
+  ALTER TABLE ticket ADD COLUMN pause_count INTEGER NOT NULL DEFAULT 0;
+  UPDATE turn SET pushed_head_sha = NULL WHERE pushed_head_sha IS NOT NULL;
+  `,
+  // 40: Review requests require evidence for the same PR as well as the same head.
+  `ALTER TABLE turn ADD COLUMN pushed_pr_number INTEGER CHECK (pushed_pr_number > 0);`,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

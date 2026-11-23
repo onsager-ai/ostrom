@@ -5,10 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+import { FakeGitHub } from "./fake-github.ts";
 import { Store } from "../store/store.ts";
+import { watchdog } from "../watchdog/watchdog.ts";
+import { advanceStuckLadder } from "../watchdog/stuck.ts";
 import { routeCandidates, type Batch } from "../router/router.ts";
 import { FakeRunner } from "../worker/fake-runner.ts";
-import type { Workers } from "../worker/workers.ts";
+import { Workers } from "../worker/workers.ts";
 import { ghHttpStatus, mergePass, type MergePassOptions } from "./merge-pass.ts";
 import type { MergePolicy } from "./merge-policy.ts";
 import type { GhRunner } from "./gh.ts";
@@ -17,14 +20,15 @@ import { sendDueReplies } from "./outbox.ts";
 const MINUTE = 60_000;
 const pageInfo = { hasNextPage: false, endCursor: null };
 const connection = (nodes: unknown[]) => ({ nodes, pageInfo });
-function review(overrides: { login?: string; type?: string; head?: string; at?: string; state?: string; id?: string } = {}) {
+function review(overrides: { login?: string; type?: string; head?: string; at?: string; state?: string; id?: string; body?: string; inlineComments?: number } = {}) {
   return {
     id: overrides.id ?? "R1", state: overrides.state ?? "APPROVED", submittedAt: overrides.at ?? "2026-11-10T12:00:00.000Z",
+    body: overrides.body ?? "", comments: { totalCount: overrides.inlineComments ?? 0 },
     author: { __typename: overrides.type ?? "User", id: "U1", login: overrides.login ?? "reviewer" }, commit: { oid: overrides.head ?? "head" },
   };
 }
 
-function fixture(policy: MergePolicy = { strategy: "unattended" }) {
+function fixture(policy: MergePolicy = { strategy: "unattended" }, subscribeToPr = true) {
   let now = new Date("2026-11-10T12:00:00.000Z");
   const store = Store.open(":memory:", { now: () => now });
   const source = store.ensureSource("github", "o/r");
@@ -36,9 +40,9 @@ function fixture(policy: MergePolicy = { strategy: "unattended" }) {
   store.configureNativeAssignment(assignment, { harness: "claude", model: "m", worktree: "/w", branch: "b", machine: "h" });
   store.startNativeAssignment(assignment, "s");
   const pr = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: 2, url: "https://github.com/o/r/pull/2" });
-  store.subscribe(ticket, pr);
+  if (subscribeToPr) store.subscribe(ticket, pr);
   const remote = {
-    merged: false, head: "head", issueState: "open", permission: "write", reviews: [review()], comments: [] as unknown[],
+    merged: false, head: "head", baseSha: "base", mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", base: "main", issueState: "open", permission: "write", reviews: [review()], comments: [] as unknown[],
     putError: null as string | null, mergeBeforeError: false, mergedBy: { id: 42, login: "marvin" },
     refuse: false, failConfirmation: false, rules: [] as unknown[], protection: {} as Record<string, unknown>,
     openPulls: [2], onFinalRead: null as (() => void) | null,
@@ -64,8 +68,8 @@ function fixture(policy: MergePolicy = { strategy: "unattended" }) {
       const check = { __typename: "CheckRun", databaseId: 10, name: "check", status: "COMPLETED", conclusion: "SUCCESS",
         checkSuite: { databaseId: 1, app: { databaseId: 15368 } } };
       return JSON.stringify({ data: { repository: { pullRequest: {
-        number: 2, state: remote.merged ? "MERGED" : "OPEN", isDraft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN",
-        reviewDecision: "APPROVED", author: { login: "author" }, headRefName: "b", headRefOid: remote.head, baseRefName: "main", baseRefOid: "base",
+        number: 2, state: remote.merged ? "MERGED" : "OPEN", isDraft: false, mergeable: remote.mergeable, mergeStateStatus: remote.mergeStateStatus,
+        reviewDecision: "APPROVED", author: { login: "author" }, headRefName: "b", headRefOid: remote.head, baseRefName: remote.base, baseRefOid: remote.baseSha,
         reviewThreads: connection([]), reviews: connection(remote.reviews), commits: { nodes: [{ commit: {
           oid: remote.head, associatedPullRequests: connection([{ number: 2 }]), statusCheckRollup: { state: "SUCCESS", contexts: connection([check]) },
           checkSuites: connection([{ databaseId: 1, status: "COMPLETED", conclusion: "SUCCESS", repository: { nameWithOwner: "o/r" }, matchingPullRequests: connection([{ number: 2 }]),
@@ -73,6 +77,7 @@ function fixture(policy: MergePolicy = { strategy: "unattended" }) {
         } }] },
       } } } });
     }
+    if (path.startsWith("repos/o/r/actions/runs?")) return JSON.stringify({ workflow_runs: [] });
     if (path === "user") return JSON.stringify({ id: 42, login: "marvin" });
     if (path.endsWith("/permission")) return JSON.stringify({ permission: remote.permission });
     if (path === "repos/o/r") return JSON.stringify({ allow_squash_merge: true });
@@ -87,7 +92,7 @@ function fixture(policy: MergePolicy = { strategy: "unattended" }) {
     if (path.includes("/pulls?")) return JSON.stringify(remote.openPulls.map((number) => ({ number, html_url: `https://github.com/o/r/pull/${number}`,
       state: remote.merged ? "closed" : "open", merged_at: remote.merged ? now.toISOString() : null })));
     if (path === "repos/o/r/pulls/2") return JSON.stringify({
-      head: { ref: "b", sha: remote.head, repo: { full_name: "o/r" } }, base: { ref: "main", sha: "base", repo: { full_name: "o/r" } },
+      head: { ref: "b", sha: remote.head, repo: { full_name: "o/r" } }, base: { ref: remote.base, sha: remote.baseSha, repo: { full_name: "o/r" } },
       merge_commit_sha: remote.merged ? "merge" : null, merged_by: remote.merged ? remote.mergedBy : null,
       merged_at: remote.merged ? "2026-11-10T12:11:00.000Z" : null,
     });
@@ -95,7 +100,14 @@ function fixture(policy: MergePolicy = { strategy: "unattended" }) {
   };
   const released: number[] = [];
   const cancelled: number[] = [];
-  const workers = { release(id: number) { released.push(id); store.releaseAssignmentReservation(id); },
+  const deliveries: { key: string; prompt: string }[] = [];
+  const workers = { deliver(id: number, key: string, prompt: string) {
+      const added = store.enqueueTurn({ assignmentId: id, deliveryKey: key, prompt, kind: key.startsWith("ci-fix-") ? "ci_fix" : "conflict" });
+      if (!added.duplicate) deliveries.push({ key, prompt });
+      return !added.duplicate;
+    }, wakeDispatchedRun(id: number, key: string, allowed: () => boolean) {
+      if (allowed()) deliveries.push({ key, prompt: store.queuedTurn(id, key)!.prompt });
+    }, release(id: number) { released.push(id); store.releaseAssignmentReservation(id); },
     cancel(id: number) { cancelled.push(id); return false; }, wake() {} } as unknown as Workers;
   const options = (): MergePassOptions => ({ store, workers, gh, repo: "o/r", policy, now: () => now });
   const runner = new FakeRunner();
@@ -113,7 +125,7 @@ function fixture(policy: MergePolicy = { strategy: "unattended" }) {
   const send = () => sendDueReplies({ store, gh, repo: "o/r", now: () => now, batchWindowMs: 0, commentGapMs: 0 });
   const attempts = () => store.mergeAttempts("o/r", 2);
   const replies = () => store.pendingReplies().filter((reply) => !reply.id.startsWith("card-"));
-  return { store, assignment, ticket, issue, pr, source, remote, puts, calls, options, route, send, attempts, replies, runner, released, cancelled,
+  return { store, assignment, ticket, issue, pr, source, remote, puts, calls, options, route, send, attempts, replies, runner, released, cancelled, deliveries,
     now: () => now, advance(ms: number) { now = new Date(now.getTime() + ms); }, reads: () => graphqlReads };
 }
 type Fixture = ReturnType<typeof fixture>;
@@ -149,6 +161,282 @@ function done(f: Fixture, origin: "ostrom" | "external" | "unknown") {
   else assert.doesNotMatch(body, /Ostrom .* merged/);
   if (origin === "unknown") assert.match(body, /whether Ostrom caused this merge is unknown/);
 }
+
+test("existing merge evidence reports conflicts on the card and clears them on the next clean read", async () => {
+  for (const strategy of ["unattended", "human"] as const) {
+    for (const conflict of ["DIRTY", "CONFLICTING"]) {
+      const f = fixture({ strategy });
+      try {
+        f.remote.base = "release";
+        if (conflict === "DIRTY") f.remote.mergeStateStatus = conflict;
+        else f.remote.mergeable = conflict;
+        const result = await mergePass({ ...f.options(), base: "release" });
+        assert.deepEqual(result.failed, []);
+        assert.equal(result.waiting[0]?.reason, "Conflicts with release; the Worker needs to merge release.");
+        assert.match(f.store.statusCardBody(f.issue)!, /Conflicts with release; the Worker needs to merge release\./);
+        assert.equal(f.reads(), 1, "the conflict uses the existing evidence read");
+        assert.equal(f.puts.length, 0);
+        f.remote.mergeStateStatus = "CLEAN";
+        f.remote.mergeable = "MERGEABLE";
+        await mergePass({ ...f.options(), base: "release" });
+        assert.doesNotMatch(f.store.statusCardBody(f.issue)!, /Conflicts with/);
+      } finally { f.store.close(); }
+    }
+  }
+});
+
+test("conflicts deliver once per head and base, retain the wait after completion, and retry after base moves", async () => {
+  for (const conflict of ["DIRTY", "CONFLICTING"]) {
+    const f = fixture({ strategy: "approvals", approvals: 1, approvers: [] });
+    try {
+      if (conflict === "DIRTY") f.remote.mergeStateStatus = conflict;
+      else f.remote.mergeable = conflict;
+      assert.deepEqual((await mergePass(f.options())).failed, []);
+      assert.equal(f.deliveries.length, 1);
+      const { key, prompt } = f.deliveries[0]!;
+      assert.equal(key, `conflict-a${f.assignment}-head-base`);
+      assert.match(prompt, /Fetch origin\/main, then merge the latest origin\/main into the existing PR branch b using git merge/);
+      assert.match(prompt, /both sides' intent/);
+      assert.match(prompt, /keep every entry.*CHANGELOG\.md/);
+      assert.match(prompt, /push.*do not open a new PR/);
+      await mergePass(f.options());
+      assert.equal(f.deliveries.length, 1, "queued conflict is not delivered again");
+      f.store.beginQueuedTurn(f.assignment, key, "s:1");
+      f.store.finishQueuedTurn(f.assignment, key);
+      assert.equal(f.store.assignmentWorkIdle(f.assignment), true);
+      await mergePass(f.options());
+      assert.equal(f.deliveries.length, 1, "finished conflict key remains deduplicated");
+      assert.match(f.store.statusCardBody(f.issue)!, /Conflicts with main; the Worker needs to merge main\./);
+      f.remote.baseSha = "base-next";
+      await mergePass(f.options());
+      assert.equal(f.deliveries.length, 2);
+      assert.equal(f.deliveries[1]!.key, `conflict-a${f.assignment}-head-base-next`);
+      f.store.beginQueuedTurn(f.assignment, f.deliveries[1]!.key, "s:2");
+      f.store.finishQueuedTurn(f.assignment, f.deliveries[1]!.key);
+      f.remote.head = "head-next";
+      await mergePass(f.options());
+      assert.equal(f.deliveries.length, 3);
+      assert.equal(f.puts.length, 0);
+    } finally { f.store.close(); }
+  }
+});
+
+test("conflict recovery respects ticket state, durable idle work, budgets, stalls and prerequisite failures", async () => {
+  const blockers: Record<string, (f: Fixture) => void> = {
+    paused: (f) => f.store.pauseTicket(f.ticket, "operator"),
+    stopping: (f) => f.store.requestStop(f.ticket),
+    ended: (f) => f.store.endTicket(f.ticket),
+    busy: (f) => { f.store.beginTurn(f.assignment); },
+    queued: (f) => { f.store.enqueueTurn({ assignmentId: f.assignment, deliveryKey: "other", kind: "follow_up", prompt: "work" }); },
+    budget: (f) => {
+      f.store.setTicketBudget(f.ticket, { timeMinutes: 1, idleMinutes: 30, turns: 20, tokens: 1000, escalations: 0 });
+      f.store.beginTurn(f.assignment);
+      f.store.startWorkerTurn(f.assignment, "dispatch");
+      f.advance(2 * MINUTE);
+      f.store.finishWorkerTurn(f.assignment, "completed", null);
+      f.store.endTurn(f.assignment, null);
+    },
+    stalled: (f) => { f.store.recordStall({ assignmentId: f.assignment, semonReason: "idle", detail: null }); },
+    closedIssue: (f) => { f.remote.issueState = "closed"; },
+    ambiguousOwnership: (f) => { f.remote.openPulls = [2, 3]; },
+    clean: (f) => { f.remote.mergeStateStatus = "CLEAN"; },
+  };
+  for (const [name, block] of Object.entries(blockers)) {
+    const f = fixture();
+    try {
+      f.remote.mergeStateStatus = "DIRTY";
+      block(f);
+      assert.deepEqual((await mergePass(f.options())).failed, [], name);
+      assert.equal(f.deliveries.length, 0, name);
+    } finally { f.store.close(); }
+  }
+  const f = fixture();
+  try {
+    f.remote.mergeStateStatus = "DIRTY";
+    await mergePass({ ...f.options(), allowSend: false });
+    assert.equal(f.deliveries.length, 0);
+  } finally { f.store.close(); }
+});
+
+async function ciFixture(policy: MergePolicy = { strategy: "human" }) {
+  const f = fixture(policy);
+  const github = new FakeGitHub(f.now, "o/r");
+  github.issue(1);
+  github.issue(2, true);
+  github.pulls.push({ branch: "b", number: 2, state: "open" });
+  const pull = JSON.parse(await f.options().gh(["api", "--method", "GET", "repos/o/r/pulls/2"]));
+  const evidence = JSON.parse(await f.options().gh(["api", "graphql"])).data.repository.pullRequest;
+  github.mergePulls.set(2, { pull, evidence });
+  const commit = evidence.commits.nodes[0].commit;
+  const check = commit.statusCheckRollup.contexts.nodes[0];
+  Object.assign(check, { conclusion: "FAILURE", detailsUrl: "https://github.com/o/r/actions/runs/3/job/4" });
+  const options = () => ({ ...f.options(), gh: github.gh });
+  return { ...f, github, pull, evidence, commit, check, options };
+}
+
+function completedRun(id: number, overrides: Record<string, unknown> = {}) {
+  return { id, name: "Fixtures", status: "completed", event: "workflow_dispatch", conclusion: "success",
+    updated_at: "2026-11-10T12:01:00Z", head_branch: "b", head_sha: "run-head", html_url: `https://github.com/o/r/actions/runs/${id}`,
+    ...overrides };
+}
+
+const dispatchedRunsPath = "repos/o/r/actions/runs?branch=b&status=completed&per_page=20";
+
+test("a failed dispatched run wakes once with failed jobs, including on a later pass", async () => {
+  const f = await ciFixture();
+  try {
+    f.advance(MINUTE);
+    f.check.conclusion = "SUCCESS";
+    f.github.workflowRuns.push(completedRun(10, { conclusion: "failure" }));
+    f.github.workflowJobs.set(10, [{ name: "linux fixtures", conclusion: "failure" }, { name: "upload", conclusion: "success" }]);
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.equal(f.deliveries.length, 1);
+    const { key, prompt } = f.deliveries[0]!;
+    assert.equal(key, `dispatched-run-a${f.assignment}-10`);
+    assert.match(prompt, /Fixtures completed with conclusion failure at head run-head/);
+    assert.match(prompt, /https:\/\/github.com\/o\/r\/actions\/runs\/10/);
+    assert.match(prompt, /Failed jobs:\n- linux fixtures/);
+    assert.doesNotMatch(prompt, /upload/);
+    assert.equal(f.store.queuedTurn(f.assignment, key)?.kind, "dispatched_run");
+    assert.ok(f.store.beginQueuedTurn(f.assignment, key, "s:1"));
+    f.store.finishQueuedTurn(f.assignment, key);
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.equal(f.deliveries.length, 1);
+    assert.equal(f.github.calls.filter((args) => args.includes(dispatchedRunsPath)).length, 2);
+    assert.equal(f.github.calls.filter((args) => args.includes("repos/o/r/actions/runs/10/jobs?per_page=100")).length, 1);
+  } finally { f.store.close(); }
+});
+
+test("a successful dispatched run wakes before a PR, with no jobs call or wake for old or pull_request runs", async () => {
+  const f = fixture({ strategy: "human" }, false);
+  const github = new FakeGitHub(f.now, "o/r");
+  try {
+    f.advance(MINUTE);
+    github.workflowRuns.push(completedRun(10),
+      completedRun(11, { event: "pull_request", conclusion: "failure" }),
+      completedRun(12, { updated_at: "2026-11-10T11:59:59Z", conclusion: "failure" }));
+    assert.deepEqual((await mergePass({ ...f.options(), gh: github.gh })).failed, []);
+    assert.deepEqual(f.store.unfinishedTurns(f.assignment).map((turn) => turn.deliveryKey), [`dispatched-run-a${f.assignment}-10`]);
+    assert.equal(f.deliveries.length, 1);
+    assert.match(f.deliveries[0]!.prompt, /Fixtures completed with conclusion success at head run-head/);
+    assert.deepEqual(github.calls.map((args) => args.at(-1)), [dispatchedRunsPath]);
+  } finally { f.store.close(); }
+});
+
+test("a recorded workflow result survives pause, a busy turn, and eviction from the runs list", async () => {
+  const f = await ciFixture();
+  try {
+    f.advance(MINUTE);
+    f.check.conclusion = "SUCCESS";
+    f.github.workflowRuns.push(completedRun(10));
+    f.store.pauseTicket(f.ticket, "operator");
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.equal(f.deliveries.length, 0);
+    const key = `dispatched-run-a${f.assignment}-10`;
+    assert.equal(f.store.queuedTurn(f.assignment, key)?.state, "queued");
+    f.github.workflowRuns.length = 0;
+    f.store.resumeTicket(f.ticket);
+    f.store.beginTurn(f.assignment);
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.equal(f.deliveries.length, 0);
+    f.store.endTurn(f.assignment, null);
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.deliveries.map((delivery) => delivery.key), [key]);
+  } finally { f.store.close(); }
+});
+
+test("failed CI wakes once per head, including after completion; passing CI never wakes", async () => {
+  const f = await ciFixture();
+  try {
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.equal(f.deliveries.length, 1);
+    const { key, prompt } = f.deliveries[0]!;
+    assert.equal(key, `ci-fix-a${f.assignment}-head`);
+    assert.match(prompt, /check: https:\/\/github.com\/o\/r\/actions\/runs\/3\/job\/4/);
+    assert.match(prompt, /Fetch origin\/main and compare these failures with the current origin\/main head/);
+    assert.equal(f.store.queuedTurn(f.assignment, key)?.kind, "ci_fix");
+    await mergePass(f.options());
+    assert.equal(f.deliveries.length, 1);
+    f.store.beginQueuedTurn(f.assignment, key, "s:1");
+    f.store.finishQueuedTurn(f.assignment, key);
+    await mergePass(f.options());
+    assert.equal(f.deliveries.length, 1);
+    f.evidence.headRefOid = f.commit.oid = "next-head";
+    await mergePass(f.options());
+    assert.equal(f.deliveries.length, 2);
+    assert.equal(f.deliveries[1]!.key, `ci-fix-a${f.assignment}-next-head`);
+    f.store.beginQueuedTurn(f.assignment, f.deliveries[1]!.key, "s:2");
+    f.store.finishQueuedTurn(f.assignment, f.deliveries[1]!.key);
+    f.evidence.headRefOid = f.commit.oid = "passing-head";
+    f.check.conclusion = "SUCCESS";
+    await mergePass(f.options());
+    assert.equal(f.deliveries.length, 2);
+  } finally { f.store.close(); }
+});
+
+test("CI wakes respect controls, idle work, ownership, and current failures", async () => {
+  const blockers: Record<string, (f: Awaited<ReturnType<typeof ciFixture>>) => void> = {
+    paused: (f) => f.store.pauseTicket(f.ticket, "operator"),
+    ended: (f) => f.store.endTicket(f.ticket),
+    stopping: (f) => f.store.requestStop(f.ticket),
+    running: (f) => { f.store.beginTurn(f.assignment); },
+    queued: (f) => { f.store.enqueueTurn({ assignmentId: f.assignment, deliveryKey: "other", kind: "review", prompt: "work" }); },
+    stalled: (f) => { f.store.recordStall({ assignmentId: f.assignment, semonReason: "idle", detail: null }); },
+    closed: (f) => f.github.close(1, f.now()),
+    ownership: (f) => { f.evidence.headRefName = "other"; },
+    pending: (f) => { f.check.status = "IN_PROGRESS"; },
+    staleHead: (f) => { f.commit.oid = "old-head"; },
+  };
+  for (const [name, block] of Object.entries(blockers)) {
+    const f = await ciFixture();
+    try {
+      block(f);
+      assert.deepEqual((await mergePass(f.options())).failed, [], name);
+      assert.equal(f.deliveries.length, 0, name);
+    } finally { f.store.close(); }
+  }
+  const f = await ciFixture();
+  try {
+    await mergePass({ ...f.options(), allowSend: false });
+    assert.equal(f.deliveries.length, 0);
+  } finally { f.store.close(); }
+});
+
+test("failed legacy statuses carry their log link", async () => {
+  const f = await ciFixture();
+  try {
+    f.commit.statusCheckRollup.contexts.nodes = [{ __typename: "StatusContext", context: "external", state: "ERROR", targetUrl: "https://ci.example/run/7" }];
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.match(f.deliveries[0]!.prompt, /external: https:\/\/ci.example\/run\/7/);
+  } finally { f.store.close(); }
+});
+
+test("review wait reaches time budget, extension resumes, and merge needs no human comment", async () => {
+  const f = fixture();
+  f.store.setTicketBudget(f.ticket, { timeMinutes: 60, idleMinutes: 30, turns: 20, tokens: 1_000_000, escalations: 0 });
+  await ready(f);
+  f.store.beginTurn(f.assignment);
+  f.store.startWorkerTurn(f.assignment, "follow_up");
+  f.advance(60 * MINUTE);
+  f.store.finishWorkerTurn(f.assignment, "completed", null);
+  f.store.endTurn(f.assignment, null);
+  await watchdog({ store: f.store, idleMinutes: 20, now: f.now,
+    semon: async () => ({ code: 0, stdout: JSON.stringify({ idle_minutes: 20, stalls: [] }), stderr: "" }) });
+  assert.equal(f.store.getTicket(f.ticket).pauseCause, "budget reached: time");
+  assert.deepEqual(await advanceStuckLadder(f.store, f.options().workers), { recovered: [], published: [] });
+  assert.deepEqual(f.store.unansweredStalls(), []);
+  assert.match(f.store.statusCardBody(f.issue)!, /Ostrom: Paused/);
+  await mergePass(f.options());
+  assert.equal(f.puts.length, 0);
+  f.store.extendTicketBudget(f.ticket, { timeMinutes: 60 });
+  assert.equal(f.store.getTicket(f.ticket).state, "open");
+  // The follow-up turn reset the quiet window; waiting it out spends no time budget.
+  f.advance(11 * MINUTE);
+  const result = await mergePass(f.options());
+  assert.deepEqual(result.failed, []);
+  assert.equal(f.puts.length, 1);
+  done(f, "ostrom");
+});
 
 test("one SHA-guarded squash PUT confirms an Ostrom merge and ends the ticket once", async () => {
   const f = fixture();
@@ -194,18 +482,105 @@ test("current-head approval by a write-permission person satisfies approval poli
   done(f, "ostrom");
 });
 
-for (const [name, change] of [
-  ["read-only reviewer", (f: Fixture) => { f.remote.permission = "read"; }],
-  ["bot reviewer", (f: Fixture) => { f.remote.reviews = [review({ type: "Bot" })]; }],
-  ["PR author", (f: Fixture) => { f.remote.reviews = [review({ login: "author" })]; }],
-  ["old-head approval", (f: Fixture) => { f.remote.reviews = [review({ head: "old" })]; }],
+for (const [name, change, reason] of [
+  ["read-only reviewer", (f: Fixture) => { f.remote.permission = "read"; }, undefined],
+  ["bot reviewer", (f: Fixture) => { f.remote.reviews = [review({ type: "Bot" })]; }, undefined],
+  ["PR author", (f: Fixture) => { f.remote.reviews = [review({ login: "author" })]; }, undefined],
+  ["old-head approval", (f: Fixture) => { f.remote.reviews = [review({ head: "old" })]; },
+    "Approved on old; the head is now head. Approve again to merge."],
 ] as const) test(`${name} does not satisfy approval policy`, async () => {
   const f = fixture({ strategy: "approvals", approvals: 1, approvers: [] });
   change(f);
   await ready(f);
   await mergePass(f.options());
   assert.equal(f.puts.length, 0);
-  assert.equal(f.store.mergeCandidateForAssignment(f.assignment)!.blockingReason, "policy approvals are not satisfied");
+  assert.equal(f.store.mergeCandidateForAssignment(f.assignment)!.blockingReason, reason ?? "policy approvals are not satisfied");
+  unmerged(f);
+});
+
+for (const body of ["", "LGTM!", " looks good. "]) test(`approval without feedback counts without restarting quiet: ${body}`, async () => {
+  const f = fixture({ strategy: "approvals", approvals: 1, approvers: [] });
+  f.remote.reviews = [];
+  await ready(f);
+  const deadline = f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline;
+  f.remote.reviews.push(review({ body, at: f.now().toISOString() }));
+  const result = await mergePass(f.options());
+  assert.deepEqual(result.failed, []);
+  assert.equal(f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline, deadline);
+  assert.equal(f.puts.length, 1);
+  done(f, "ostrom");
+});
+
+test("Router-excluded approval commentary does not restart quiet and still satisfies approval policy", async () => {
+  const f = fixture({ strategy: "approvals", approvals: 1, approvers: [] });
+  f.remote.reviews = [];
+  await ready(f);
+  const deadline = f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline;
+  f.remote.reviews.push(review({ id: "R2", body: "The requested check is clean. CI is green.", at: f.now().toISOString() }));
+  const source = f.store.ensureSource("github", "o/r");
+  f.store.recordIntakeReceipt({ sourceId: source.id, sourceEventId: "R2", url: "https://github.com/o/r/pull/2#pullrequestreview-2", reason: "approval without feedback" });
+  const result = await mergePass(f.options());
+  assert.deepEqual(result.failed, []);
+  assert.equal(f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline, deadline);
+  assert.equal(f.puts.length, 1);
+  done(f, "ostrom");
+});
+
+for (const feedback of [{ inlineComments: 1 }, { state: "CHANGES_REQUESTED" }]) test(`a receipt cannot hide new review feedback: ${JSON.stringify(feedback)}`, async () => {
+  const f = fixture();
+  await ready(f);
+  const previous = f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline!;
+  const source = f.store.ensureSource("github", "o/r");
+  f.store.recordIntakeReceipt({ sourceId: source.id, sourceEventId: "R2", url: "https://github.com/o/r/pull/2#pullrequestreview-2", reason: "approval without feedback" });
+  f.remote.reviews.push(review({ id: "R2", body: "Checked everything", at: f.now().toISOString(), ...feedback }));
+  const result = await mergePass(f.options());
+  assert.deepEqual(result.failed, []);
+  assert.ok(f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline! > previous);
+  assert.equal(f.puts.length, 0);
+});
+
+for (const feedback of [{ body: "Please rename this" }, { inlineComments: 1 }]) test(`approval with feedback restarts quiet: ${JSON.stringify(feedback)}`, async () => {
+  const f = fixture();
+  await ready(f);
+  const previous = f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline!;
+  f.remote.reviews.push(review({ id: "R2", at: f.now().toISOString(), ...feedback }));
+  if (feedback.body !== undefined) f.store.insertTrigger({ sourceId: f.source.id, sourceEventId: "R2", threadId: f.pr,
+    kind: "pull_request_review", actor: "reviewer", url: "https://github.com/o/r/pull/2#pullrequestreview-2", occurredAt: f.now() });
+  const result = await mergePass(f.options());
+  assert.deepEqual(result.failed, []);
+  assert.ok(f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline! > previous);
+  assert.equal(f.puts.length, 0);
+});
+
+test("unjudged approval commentary holds the merge without restarting quiet when judged no-feedback", async () => {
+  const f = fixture();
+  await ready(f);
+  f.remote.reviews.push(review({ id: "R2", body: "Checked both headers", at: f.now().toISOString() }));
+  const before = f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline;
+  await mergePass(f.options());
+  const waiting = f.store.mergeCandidateForAssignment(f.assignment)!;
+  assert.equal(waiting.blockingReason, "approval commentary not yet judged");
+  assert.equal(waiting.quietDeadline, before);
+  assert.equal(f.puts.length, 0);
+  f.advance(MINUTE);
+  f.store.recordIntakeReceipt({ sourceId: f.source.id, sourceEventId: "R2", url: "https://github.com/o/r/pull/2#pullrequestreview-2", reason: "approval without feedback" });
+  await mergePass(f.options());
+  const after = f.store.mergeCandidateForAssignment(f.assignment)!;
+  assert.equal(after.quietDeadline, before);
+  assert.equal(f.puts.length, 1);
+  done(f, "ostrom");
+});
+
+test("a human comment after the last head restarts the quiet window", async () => {
+  const f = fixture();
+  await ready(f);
+  const previous = f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline!;
+  f.remote.comments.push({ id: 100, body: "Please take another look", updated_at: f.now().toISOString() });
+  await mergePass(f.options());
+  const deadline = f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline!;
+  assert.ok(deadline > previous);
+  assert.equal(deadline, new Date(f.now().getTime() + 10 * MINUTE).toISOString());
+  assert.equal(f.puts.length, 0);
   unmerged(f);
 });
 
@@ -395,6 +770,214 @@ test("first enable posts a distinct notice after an opened reply was sent before
   done(f, "ostrom");
 });
 
+async function reviewFixture(policy?: MergePolicy) {
+  const f = await ciFixture(policy);
+  f.check.conclusion = "SUCCESS";
+  const setHead = (head: string) => {
+    f.evidence.headRefOid = f.commit.oid = f.pull.head.sha = head;
+    f.evidence.reviews.nodes = [review({ state: "CHANGES_REQUESTED", head: "head" })];
+  };
+  const workerPush = (head: string, prNumber = 2) => {
+    f.store.startWorkerTurn(f.assignment, "review");
+    setHead(head);
+    f.store.finishWorkerTurn(f.assignment, "completed", null, undefined, null, undefined, { prNumber, sha: head });
+  };
+  const posts = () => f.github.calls.filter((args) => args.includes("POST") && args.some((arg) => arg.endsWith("/requested_reviewers")));
+  const runTurn = async (key: string, duringTurn: () => void) => {
+    const runner = new FakeRunner();
+    const workers = new Workers({ store: f.store, gh: f.github.gh, repo: "o/r", runners: { claude: runner, codex: runner },
+      config: { repo: "/repo", base: "main", worktrees: "/wt", harness: "claude", model: "m", machine: "h" } });
+    const resume = runner.resume.bind(runner);
+    runner.resume = (options) => {
+      const session = resume(options);
+      session.reply = () => { duringTurn(); return "Done."; };
+      return session;
+    };
+    assert.equal(workers.deliver(f.assignment, key, "Please address the review", () => {}), true);
+    await workers.drain();
+    assert.equal(f.store.ticketTurns(f.ticket).at(-1)?.status, "completed");
+  };
+  return { ...f, setHead, workerPush, posts, runTurn };
+}
+
+test("a GitHub PR head that moves across a Worker turn re-requests review", async () => {
+  const f = await reviewFixture();
+  try {
+    await f.runTurn("review-1", () => f.setHead("worker-head"));
+    assert.equal(f.store.workerTurnPushedHead(f.assignment, 2, "worker-head"), true);
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.github.requestedReviewers.get(2), ["reviewer"]);
+  } finally { f.store.close(); }
+});
+
+test("a GitHub PR head unchanged across a Worker turn does not re-request review", async () => {
+  const f = await reviewFixture();
+  try {
+    f.setHead("already-pushed");
+    await f.runTurn("review-1", () => {});
+    assert.equal(f.store.workerTurnPushedHead(f.assignment, 2, "already-pushed"), false);
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.posts(), []);
+  } finally { f.store.close(); }
+});
+
+test("a pause turn that pushes work in progress does not re-request review after resume", async () => {
+  const f = await reviewFixture();
+  try {
+    f.store.pauseTicket(f.ticket, "operator");
+    f.store.resumeTicket(f.ticket); // A queued pause turn can run after its ticket is resumed.
+    await f.runTurn("operator-pause-1", () => f.setHead("wip"));
+    assert.equal(f.store.workerTurnPushedHead(f.assignment, 2, "wip"), false);
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.posts(), []);
+  } finally { f.store.close(); }
+});
+
+for (const control of ["pause and resume", "stop"]) {
+  test(`a ${control} request during a Worker turn prevents recording the changed head`, async () => {
+    const f = await reviewFixture();
+    try {
+      await f.runTurn("review-1", () => {
+        if (control === "stop") f.store.requestStop(f.ticket);
+        else {
+          f.store.pauseTicket(f.ticket, "operator");
+          f.store.resumeTicket(f.ticket);
+        }
+        f.setHead("wip");
+      });
+      assert.equal(f.store.workerTurnPushedHead(f.assignment, 2, "wip"), false);
+    } finally { f.store.close(); }
+  });
+}
+
+test("a paused ticket with a recorded head cannot re-request review until it resumes", async () => {
+  const f = await reviewFixture();
+  try {
+    f.workerPush("worker-head");
+    f.store.pauseTicket(f.ticket, "operator");
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.posts(), []);
+    f.store.resumeTicket(f.ticket);
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.github.requestedReviewers.get(2), ["reviewer"]);
+  } finally { f.store.close(); }
+});
+
+test("a head advance and a completed dispatched run in the same pass both get handled", async () => {
+  const f = await reviewFixture();
+  try {
+    await mergePass(f.options());
+    f.workerPush("new-head");
+    f.advance(MINUTE);
+    f.github.workflowRuns.push(completedRun(10, { head_sha: "new-head" }));
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.deliveries.map((delivery) => delivery.key), [`dispatched-run-a${f.assignment}-10`]);
+    assert.deepEqual(f.github.requestedReviewers.get(2), ["reviewer"]);
+  } finally { f.store.close(); }
+});
+
+test("a Worker push before the first candidate still re-requests review", async () => {
+  const f = await reviewFixture();
+  try {
+    assert.equal(f.store.mergeCandidateForAssignment(f.assignment), null);
+    f.workerPush("first-worker-head");
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.github.requestedReviewers.get(2), ["reviewer"]);
+  } finally { f.store.close(); }
+});
+
+test("a Worker push first observed during the final evidence refresh re-requests review", async () => {
+  const f = await reviewFixture({ strategy: "unattended" });
+  try {
+    await ready(f);
+    let refreshed = false;
+    const result = await mergePass({ ...f.options(), appBotId: 42, refreshBeforeSend: async () => {
+      refreshed = true;
+      f.workerPush("refreshed-head");
+    } });
+    assert.deepEqual(result.failed, []);
+    assert.equal(refreshed, true);
+    assert.equal(f.store.mergeCandidateForAssignment(f.assignment)?.headSha, "refreshed-head");
+    assert.deepEqual(f.github.requestedReviewers.get(2), ["reviewer"]);
+    unmerged(f);
+  } finally { f.store.close(); }
+});
+
+test("a push outside a Worker turn does not re-request review", async () => {
+  const f = await reviewFixture();
+  try {
+    await mergePass(f.options());
+    f.workerPush("worker-head");
+    f.setHead("outside-head");
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.equal(f.store.mergeCandidateForAssignment(f.assignment)?.headSha, "outside-head");
+    assert.deepEqual(f.posts(), []);
+  } finally { f.store.close(); }
+});
+
+test("a replacement PR at the same SHA cannot use the previous PR's head evidence", async () => {
+  const f = await reviewFixture();
+  try {
+    f.workerPush("same-head", 3);
+    assert.equal(f.store.workerTurnPushedHead(f.assignment, 3, "same-head"), true);
+    assert.equal(f.store.ticketPullRequest(f.ticket)?.number, 2);
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.posts(), []);
+  } finally { f.store.close(); }
+});
+
+test("a suppressed or unowned review request can be sent in a later eligible pass", async () => {
+  const f = await reviewFixture();
+  try {
+    f.workerPush("new-head");
+    assert.deepEqual((await mergePass({ ...f.options(), allowSend: false })).failed, []);
+    assert.deepEqual(f.posts(), []);
+    f.github.pulls.push({ branch: "b", number: 3, state: "open" });
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.posts(), []);
+    f.github.pulls.pop();
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.github.requestedReviewers.get(2), ["reviewer"]);
+  } finally { f.store.close(); }
+});
+
+test("a draft PR keeps its review request eligible until it is ready", async () => {
+  const f = await reviewFixture();
+  try {
+    f.workerPush("new-head");
+    f.evidence.isDraft = true;
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.posts(), []);
+    f.evidence.isDraft = false;
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.github.requestedReviewers.get(2), ["reviewer"]);
+  } finally { f.store.close(); }
+});
+
+test("an already persisted request for the same head and reviewer prevents a replayed POST", async () => {
+  const f = await reviewFixture();
+  try {
+    f.workerPush("same-head");
+    assert.equal(f.store.recordReviewRequest("o/r", 2, "same-head", "reviewer"), true);
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.posts(), []);
+  } finally { f.store.close(); }
+});
+
+test("a refused review re-request is logged and its attempt is deduplicated", async () => {
+  const f = await reviewFixture();
+  const logs: string[] = [];
+  try {
+    f.workerPush("new-head");
+    f.github.failWhen = (args) => args.includes("POST") && args.some((arg) => arg.endsWith("/requested_reviewers")) ? new Error("request refused") : undefined;
+    assert.deepEqual((await mergePass({ ...f.options(), log: (line) => logs.push(line) })).failed, []);
+    assert.match(logs[0]!, /could not re-request review from reviewer: request refused/);
+    f.github.failWhen = undefined;
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.equal(f.posts().length, 1);
+  } finally { f.store.close(); }
+});
+
 test("merge-enabled migration refreshes previously tracked, delivered opened replies", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ostrom-merge-upgrade-"));
   const path = join(dir, "store.db");
@@ -416,6 +999,7 @@ test("merge-enabled migration refreshes previously tracked, delivered opened rep
   assert.notEqual(store.readyReplySentAt(assignment), null);
   store.close();
   const upgrade = new DatabaseSync(path);
+  upgrade.exec("ALTER TABLE ticket DROP COLUMN pause_count; DROP TABLE review_request; DROP TABLE selection_decision; DROP TABLE model_objective; DROP TABLE model_selection; DROP TABLE model_discovery; DROP TABLE turn; DROP INDEX intake_receipt_recent; DROP TABLE intake_receipt;");
   upgrade.prepare("DELETE FROM schema_version WHERE version >= 27").run();
   upgrade.close();
   store = Store.open(path, { now: () => now });
@@ -514,7 +1098,7 @@ for (const reason of ["closed issue", "failed prerequisite", "ambiguous branch o
   if (reason === "closed issue") f.remote.issueState = "closed";
   if (reason === "failed prerequisite") options.allowSend = false;
   if (reason === "ambiguous branch ownership") f.remote.openPulls = [2, 3];
-  if (reason === "local pause at final refresh") options.refreshBeforeSend = async () => { f.store.pauseTicket(f.ticket); };
+  if (reason === "local pause at final refresh") options.refreshBeforeSend = async () => { f.store.pauseTicket(f.ticket, "test pause"); };
   if (reason === "activity at final refresh") options.refreshBeforeSend = async () => { f.remote.comments.push({ id: 4, body: "wait", updated_at: f.now().toISOString() }); };
   await mergePass(options);
   assert.equal(f.puts.length, 0);
@@ -528,7 +1112,7 @@ test("pause accepted while final reviewer permission read is pending prevents PU
   const options = f.options();
   const gh = options.gh;
   options.gh = async (args) => {
-    if (args.some((arg) => arg.endsWith("/permission")) && ++permissionReads === 2) f.store.pauseTicket(f.ticket);
+    if (args.some((arg) => arg.endsWith("/permission")) && ++permissionReads === 2) f.store.pauseTicket(f.ticket, "test pause");
     return gh(args);
   };
   await mergePass(options);

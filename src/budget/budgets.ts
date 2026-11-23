@@ -41,6 +41,12 @@ export function budgetReached(budget: TicketBudget, now: Date): BudgetLimit | nu
   return BUDGET_LIMITS.find((limit) => budgetLimit(budget, limit) > 0 && budgetUsage(budget, limit, now) >= budgetLimit(budget, limit)) ?? null;
 }
 
+/** The limits the Watchdog enforces while a turn runs. Turns, tokens and escalations are counted
+ * when a turn starts or ends, so they pause the ticket after the turn completes instead. */
+export function watchdogBudgetReached(budget: TicketBudget, now: Date): "time" | "idle" | null {
+  return (["time", "idle"] as const).find((limit) => budgetUsage(budget, limit, now) >= budgetLimit(budget, limit)) ?? null;
+}
+
 /** Limits that can change only when a Worker has completed a native turn. Time and idle are Watchdog signals. */
 export function turnBudgetReached(budget: TicketBudget, now: Date): BudgetLimit | null {
   return (["turns", "tokens", "escalations"] as const).find(
@@ -51,7 +57,8 @@ export function turnBudgetReached(budget: TicketBudget, now: Date): BudgetLimit 
 export function budgetUsage(budget: TicketBudget, limit: BudgetLimit, now: Date): number {
   switch (limit) {
     case "time":
-      return Math.max(0, Math.floor((now.getTime() - Date.parse(budget.openedAt)) / 60_000));
+      return Math.floor((budget.completedTurnSeconds + (budget.turnStartedAt === null ? 0 :
+        Math.max(0, (now.getTime() - Date.parse(budget.turnStartedAt)) / 1000))) / 60);
     // Idle time is how long the running turn has gone without finishing. Between turns the Worker
     // waits on people (a review, an answer), which is not idle; Semon's verdicts follow the same rule.
     case "idle":

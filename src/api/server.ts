@@ -1,10 +1,13 @@
 // The daemon's local operator API. It is deliberately Unix-socket-only: Ostrom has no network
 // listener and the CLI/dashboard are clients on the same machine.
 
-import { chmod, mkdir, readFile, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { chmod, mkdir, rm } from "node:fs/promises";
 import { availableParallelism } from "node:os";
 import { createServer, type Server } from "node:http";
 import { dirname, join } from "node:path";
+import { overrideSelection } from "../router/selection.ts";
+import { queueStatusCard } from "../github/cards.ts";
 import type { Store } from "../store/store.ts";
 
 export interface LocalApi {
@@ -24,6 +27,9 @@ export interface LocalApiOptions {
   socketPath?: string;
   control: ApiControl;
   temperature?: () => Promise<number | null>;
+  watchdog?: () => { lastAttemptAt: string | null; lastSuccess: boolean | null; lastSuccessAt: string | null; error: string | null };
+  tickIntervalSeconds?: number;
+  refreshModels?: () => Promise<unknown>;
 }
 
 export function defaultSocketPath(env: Record<string, string | undefined> = process.env): string {
@@ -40,15 +46,39 @@ export function localApi(store: Store, options: LocalApiOptions): LocalApi {
     const url = new URL(request.url ?? "/", "http://localhost");
     try {
       if (request.method === "GET" && url.pathname === "/v1/status") {
-        return reply(response, 200, { ...store.operatorStatus(), machine: {
-          slots: { total: availableParallelism(), used: store.runningAssignments().length },
+        return reply(response, 200, { ...store.operatorStatus(options.watchdog?.()), watchdogTickIntervalSeconds: options.tickIntervalSeconds ?? null, machine: {
+          slots: { total: availableParallelism(), used: store.runningAssignments().length, meaning: "CPU parallelism" },
           temperature: await (options.temperature ?? latestTemperature)(),
         } });
       }
+      if (request.method === "GET" && url.pathname === "/v1/models") return reply(response, 200, store.models.view());
+      if (request.method === "GET" && url.pathname === "/v1/models/export") return reply(response, 200, store.models.export());
+      if (request.method === "POST" && url.pathname === "/v1/models/refresh") {
+        if (!options.refreshModels) throw new Error("model discovery is unavailable");
+        const view = await options.refreshModels();
+        if (store.models.view().discoveries.some((item) => item.lastError !== null)) throw new Error("model discovery failed; inspect ostrom models for per-harness errors (last good catalogs retained)");
+        return reply(response, 200, view);
+      }
+      if (request.method === "POST" && url.pathname === "/v1/models") return reply(response, 200, store.models.change(await bodyJson(request)));
       if (request.method === "GET" && url.pathname === "/v1/tickets") return reply(response, 200, store.operatorTickets());
+      if (request.method === "GET" && url.pathname === "/v1/intake") {
+        const raw = url.searchParams.get("limit");
+        const limit = raw === null ? 50 : Number(raw);
+        if (!Number.isInteger(limit) || limit < 1 || limit > 200) return reply(response, 400, { error: "limit must be a whole number from 1 to 200" });
+        return reply(response, 200, store.operatorIntake(limit));
+      }
       const ticket = /^\/v1\/tickets\/([1-9]\d*)$/.exec(url.pathname);
       if (request.method === "GET" && ticket !== null) return reply(response, 200, store.operatorTicket(Number(ticket[1])));
       if (request.method === "GET" && url.pathname === "/v1/preview") return reply(response, 200, { markdown: await options.control.preview() });
+      const selection = /^\/v1\/tickets\/([1-9]\d*)\/(model|effort)$/.exec(url.pathname);
+      if (request.method === "POST" && selection !== null) {
+        const value = await bodyJson(request) as { value?: unknown } | null;
+        if (typeof value?.value !== "string") throw new Error("value must be text");
+        const ticketId = Number(selection[1]);
+        const message = overrideSelection(store, ticketId, selection[2] as "model" | "effort", value.value);
+        queueStatusCard(store, ticketId);
+        return reply(response, 200, { message, ticket: store.operatorTicket(ticketId) });
+      }
       const action = /^\/v1\/tickets\/([1-9]\d*)\/(pause|resume|stop|extend)$/.exec(url.pathname);
       if (request.method === "POST" && action !== null) {
         const ticketId = Number(action[1]);
@@ -67,10 +97,14 @@ export function localApi(store: Store, options: LocalApiOptions): LocalApi {
   return { start: () => listen(server, socketPath), close: () => close(server, socketPath) };
 }
 
-async function json(request: import("node:http").IncomingMessage): Promise<{ timeMinutes?: number; turns?: number; tokens?: number }> {
+async function bodyJson(request: import("node:http").IncomingMessage): Promise<unknown> {
   let body = "";
   for await (const chunk of request) body += chunk;
-  const parsed: unknown = JSON.parse(body);
+  return JSON.parse(body) as unknown;
+}
+
+async function json(request: import("node:http").IncomingMessage): Promise<{ timeMinutes?: number; turns?: number; tokens?: number }> {
+  const parsed = await bodyJson(request);
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("expected a JSON object");
   const value = parsed as Record<string, unknown>;
   for (const key of ["timeMinutes", "turns", "tokens"]) {
@@ -81,14 +115,15 @@ async function json(request: import("node:http").IncomingMessage): Promise<{ tim
   return value as { timeMinutes?: number; turns?: number; tokens?: number };
 }
 
-async function latestTemperature(): Promise<number | null> {
-  try {
-    const log = await readFile("/home/marvin/.cache/thermal-watch/temps.log", "utf8");
-    const readings = [...log.matchAll(/pkg=(\d+(?:\.\d+)?)C/g)];
-    return readings.length === 0 ? null : Number(readings.at(-1)![1]);
-  } catch {
-    return null;
-  }
+// The operator's `thermal now` prints e.g. "30C sensor=/sys/...". It exits non-zero when the host
+// has no supported sensor or no `thermal` command, which the dashboard shows as unavailable.
+function latestTemperature(): Promise<number | null> {
+  return new Promise((resolve) => {
+    execFile("thermal", ["now"], { timeout: 2_000 }, (error, stdout) => {
+      const reading = error === null ? /^(\d+(?:\.\d+)?)C\b/.exec(stdout.trim()) : null;
+      resolve(reading === null ? null : Number(reading[1]));
+    });
+  });
 }
 
 function reply(response: import("node:http").ServerResponse, status: number, body: unknown): void {

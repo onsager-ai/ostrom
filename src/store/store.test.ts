@@ -65,6 +65,64 @@ test("migrations apply once and record their version", () => {
   );
 });
 
+test("migration 39 clears obsolete schema-38 head evidence and preserves review request deduplication", () => {
+  const db = database({ enableForeignKeyConstraints: false });
+  db.exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL) STRICT");
+  for (const [index, sql] of migrations.slice(0, 38).entries()) {
+    db.exec(sql);
+    db.prepare("INSERT INTO schema_version VALUES (?, ?)").run(index + 1, "2026-11-23T00:00:00Z");
+  }
+  db.exec(`
+    INSERT INTO source (id, kind, name) VALUES (1, 'github', 'o/r');
+    INSERT INTO thread (id, source_id, kind, number, url) VALUES (1, 1, 'issue', 1, 'https://github.com/o/r/issues/1');
+    INSERT INTO decision (id, thread_id, verdict, reason, decided_at) VALUES (1, 1, 'accept', 'work', '2026-11-23T00:00:00Z');
+    INSERT INTO ticket (id, decision_id, state, opened_at) VALUES (1, 1, 'open', '2026-11-23T00:00:00Z');
+    INSERT INTO assignment (id, ticket_id, state, created_at) VALUES (1, 1, 'pending', '2026-11-23T00:00:00Z');
+    INSERT INTO turn (id, assignment_id, ticket_id, started_at, ended_at, harness, requested_model, kind, status, pushed_head_sha)
+      VALUES (1, 1, 1, '2026-11-23T00:00:00Z', '2026-11-23T00:01:00Z', 'claude', 'm', 'review', 'completed', 'old-head');
+    INSERT INTO review_request VALUES ('o/r', 2, 'old-head', 'reviewer', '2026-11-23T00:02:00Z');
+    PRAGMA foreign_keys = ON;
+  `);
+  const attempt = db.prepare("SELECT * FROM review_request").get();
+
+  assert.equal(migrate(db), migrations.length);
+  assert.equal(db.prepare("SELECT pushed_head_sha FROM turn WHERE id = 1").get()?.["pushed_head_sha"], null);
+  assert.deepEqual(db.prepare("SELECT * FROM review_request").get(), attempt);
+  assert.equal(new Store(db).recordReviewRequest("o/r", 2, "old-head", "reviewer"), false);
+});
+
+test("approval receipt migration preserves existing version-31 receipts and widens the reason constraint", () => {
+  const db = database({ enableForeignKeyConstraints: false });
+  db.exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL) STRICT");
+  for (const [index, sql] of migrations.slice(0, 31).entries()) {
+    db.exec(sql);
+    db.prepare("INSERT INTO schema_version VALUES (?, ?)").run(index + 1, "2026-11-17T00:00:00Z");
+  }
+  db.exec("PRAGMA foreign_keys = ON");
+  db.exec("INSERT INTO source (id, kind, name) VALUES (1, 'github', 'o/r')");
+  const insert = db.prepare("INSERT INTO intake_receipt VALUES (1, ?, ?, ?, ?)");
+  insert.run("missing", "https://github.com/o/r/issues/1", "2026-11-17T00:01:00Z", "missing @ostrom mention");
+  insert.run("unauthorized", "https://github.com/o/r/issues/2", "2026-11-17T00:02:00Z", "unauthorized author");
+  const before = db.prepare("SELECT * FROM intake_receipt ORDER BY source_event_id").all();
+  const indexBefore = db.prepare("SELECT sql FROM sqlite_schema WHERE name = 'intake_receipt_recent'").get();
+  const columnsBefore = db.prepare("PRAGMA table_info(intake_receipt)").all();
+  assert.throws(() => insert.run("approval", "https://github.com/o/r/pull/3", "2026-11-17T00:03:00Z", "approval without feedback"), /CHECK constraint/);
+
+  assert.equal(migrate(db), migrations.length);
+  assert.deepEqual(db.prepare("SELECT * FROM intake_receipt ORDER BY source_event_id").all(), before);
+  assert.deepEqual(db.prepare("PRAGMA table_info(intake_receipt)").all(), columnsBefore);
+  assert.deepEqual(db.prepare("SELECT sql FROM sqlite_schema WHERE name = 'intake_receipt_recent'").get(), indexBefore);
+  const table = db.prepare("PRAGMA table_list('intake_receipt')").get()!;
+  assert.equal(table["strict"], 1);
+  assert.equal(table["wr"], 1);
+  const store = new Store(db);
+  store.recordIntakeReceipt({ sourceId: 1, sourceEventId: "approval", url: "https://github.com/o/r/pull/3", observedAt: "2026-11-17T00:03:00Z", reason: "approval without feedback" });
+  assert.equal(store.operatorIntake().find((item) => item.eventId === "approval")!.reason, "approval without feedback");
+  assert.throws(() => db.prepare("INSERT INTO intake_receipt VALUES (1, 'invalid', 'url', 'now', 'unknown')").run(), /CHECK constraint/);
+  assert.equal(db.prepare("PRAGMA foreign_key_check").get(), undefined);
+  assert.equal(migrate(db), migrations.length);
+});
+
 test("queued-turn migration preserves every prior state and supports honest cancellation", () => {
   const db = database();
   // Build through migration 27, then migrate real queued/running/finished rows through 28.
@@ -95,6 +153,39 @@ test("queued-turn migration preserves every prior state and supports honest canc
   assert.throws(() => db.exec("UPDATE queued_turn SET started_at = 'invented' WHERE state = 'cancelled'"), /CHECK constraint/);
   assert.equal(db.prepare("PRAGMA foreign_key_check").get(), undefined);
 });
+
+for (const [version, kind] of [[32, "conflict"], [34, "ci_fix"], [35, "dispatched_run"]] as const) {
+test(`${kind} migration preserves version-${version} queued turns and widens only their kind constraint`, () => {
+  const db = database({ enableForeignKeyConstraints: false });
+  db.exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL) STRICT");
+  for (const [index, sql] of migrations.slice(0, version).entries()) {
+    db.exec(sql);
+    db.prepare("INSERT INTO schema_version VALUES (?, ?)").run(index + 1, "2026-11-17T00:00:00Z");
+  }
+  const insert = db.prepare(
+    "INSERT INTO queued_turn (assignment_id, delivery_key, kind, prompt, state, turn_id, created_at, started_at, finished_at) VALUES (1, ?, ?, 'work', ?, ?, 'now', ?, ?)",
+  );
+  insert.run("queued", "review", "queued", null, null, null);
+  insert.run("running", "recovery", "running", "s:1", "started", null);
+  insert.run("finished", "follow_up", "finished", "s:2", "started", "finished");
+  insert.run("cancelled", "control", "cancelled", null, null, "finished");
+  const before = db.prepare("SELECT * FROM queued_turn ORDER BY delivery_key").all();
+  const columns = db.prepare("PRAGMA table_info(queued_turn)").all();
+  const index = db.prepare("SELECT sql FROM sqlite_schema WHERE name = 'queued_turn_unfinished'").get();
+  assert.throws(() => insert.run(kind, kind, "queued", null, null, null), /CHECK constraint/);
+  assert.equal(migrate(db), migrations.length);
+  assert.deepEqual(db.prepare("SELECT * FROM queued_turn ORDER BY delivery_key").all(), before);
+  assert.deepEqual(db.prepare("PRAGMA table_info(queued_turn)").all(), columns);
+  assert.deepEqual(db.prepare("SELECT sql FROM sqlite_schema WHERE name = 'queued_turn_unfinished'").get(), index);
+  const table = db.prepare("PRAGMA table_list('queued_turn')").get()!;
+  assert.equal(table["strict"], 1);
+  assert.equal(table["wr"], 1);
+  insert.run(kind, kind, "queued", null, null, null);
+  assert.throws(() => insert.run("unknown", "unknown", "queued", null, null, null), /CHECK constraint/);
+  assert.throws(() => insert.run("invalid-state", kind, "finished", null, null, null), /CHECK constraint/);
+  assert.equal(migrate(db), migrations.length);
+});
+}
 
 test("assignment terminal paths cancel queued prompts and finish started ones", () => {
   for (const terminal of ["endAssignment", "abandonAssignment", "endTicket", "failed outcome"] as const) {
@@ -330,6 +421,16 @@ test("due replies come back oldest due first, up to the limit", () => {
   assert.deepEqual(store.dueReplies(2).map((r) => r.id), ["r2", "r1"]);
 });
 
+test("intake receipts deduplicate and preserve first observation time", () => {
+  const { store, source, advance } = fixture();
+  const receipt = { sourceId: source.id, sourceEventId: "issue-1:opened", url: "https://github.com/o/r/issues/1", reason: "missing @ostrom mention" as const };
+  store.recordIntakeReceipt(receipt);
+  const first = store.operatorIntake()[0]!.observedAt;
+  advance(60_000);
+  store.recordIntakeReceipt(receipt);
+  assert.deepEqual(store.operatorIntake(), [{ eventId: "issue-1:opened", url: receipt.url, observedAt: first, disposition: "excluded", reason: receipt.reason }]);
+});
+
 test("the schema refuses an unstarted assignment that ends without a reason", () => {
   const db = database({ enableForeignKeyConstraints: true });
   const store = new Store(db);
@@ -430,31 +531,134 @@ test("a native turn is counted, marked while it runs, and its usage is added", (
   );
 });
 
-test("a ticket budget persists limits and sums every assignment's turn usage", () => {
+test("turn records retain requests, observations and failures without copying transcript text", () => {
   const { store, accept } = fixture();
+  const ticketId = accept();
+  const id = store.createAssignment(ticketId);
+  store.configureNativeAssignment(id, { harness: "codex", model: "luna", worktree: "/w", branch: "b", machine: "h" });
+  store.startWorkerTurn(id, "dispatch", "low");
+  store.finishWorkerTurn(id, "failed", { inputTokens: 5, cachedInputTokens: 3, outputTokens: 2 },
+    { model: "sol", effort: "high" }, "model mismatch: asked for luna, ran sol");
+  store.startNativeAssignment(id, "sess");
+  store.startWorkerTurn(id, "recovery");
+  store.finishWorkerTurn(id, "interrupted", null);
+  const turns = store.operatorTicket(ticketId).turns;
+  assert.equal(turns.length, 2);
+  assert.deepEqual([turns[0]!.requestedModel, turns[0]!.requestedEffort, turns[0]!.observedModel, turns[0]!.observedEffort], ["luna", "low", "sol", "high"]);
+  assert.deepEqual([turns[0]!.status, turns[0]!.inputTokens, turns[0]!.cachedInputTokens, turns[0]!.outputTokens], ["failed", 5, 3, 2]);
+  assert.equal(turns[1]!.kind, "recovery");
+  assert.equal(turns[1]!.observedModel, null);
+  assert.equal(turns[1]!.requestedEffort, null);
+  assert.equal(turns[1]!.status, "interrupted");
+  assert.ok(turns.every((turn) => turn.endedAt !== null));
+});
+
+test("recovery charges the last observed activity, excluding daemon downtime", () => {
+  for (const activityMinutes of [0, 5]) {
+    const { store, accept, advance } = fixture();
+    const ticketId = accept();
+    const id = store.createAssignment(ticketId);
+    store.configureNativeAssignment(id, { harness: "codex", model: "m", worktree: "/w", branch: "b", machine: "h" });
+    store.startNativeAssignment(id, "session");
+    store.recordWorkerActivity(id); // activity from before this turn must not extend it
+    advance(60_000);
+    store.beginTurn(id);
+    store.startWorkerTurn(id, "dispatch");
+    advance(activityMinutes * 60_000);
+    if (activityMinutes > 0) store.recordWorkerActivity(id);
+    advance((60 - activityMinutes) * 60_000);
+    store.interruptRecoveredTurn(id, "daemon stopped");
+    store.endTurn(id, null);
+    const turn = store.ticketTurns(ticketId)[0]!;
+    assert.equal(turn.status, "interrupted");
+    assert.equal(Date.parse(turn.endedAt!) - Date.parse(turn.startedAt), activityMinutes * 60_000);
+    assert.equal(store.ticketBudget(ticketId).completedTurnSeconds, activityMinutes * 60);
+  }
+});
+
+test("a graceful interruption keeps its recovery marker without charging stopped time twice", () => {
+  const { store, accept, advance } = fixture();
+  const ticketId = accept();
+  const id = store.createAssignment(ticketId);
+  store.configureNativeAssignment(id, { harness: "codex", model: "m", worktree: "/w", branch: "b", machine: "h" });
+  store.startNativeAssignment(id, "session");
+  store.beginTurn(id);
+  store.startWorkerTurn(id, "dispatch");
+  advance(5 * 60_000);
+  store.finishWorkerTurn(id, "interrupted", null);
+  advance(55 * 60_000);
+  assert.notEqual(store.getAssignment(id).turnStartedAt, null);
+  assert.equal(store.ticketBudget(ticketId).turnStartedAt, null);
+  assert.equal(store.ticketBudget(ticketId).completedTurnSeconds, 300);
+  const endedAt = store.ticketTurns(ticketId)[0]!.endedAt;
+  store.interruptRecoveredTurn(id, "daemon restarted");
+  assert.equal(store.ticketTurns(ticketId)[0]!.endedAt, endedAt, "recovery preserves an explicit stop time");
+  store.endTurn(id, null);
+  store.beginTurn(id);
+  store.startWorkerTurn(id, "recovery");
+  assert.notEqual(store.ticketBudget(ticketId).turnStartedAt, null);
+});
+
+test("a ticket budget persists limits and sums every assignment's turn usage", () => {
+  const { store, accept, advance } = fixture();
   const ticketId = accept();
   store.setTicketBudget(ticketId, { timeMinutes: 90, idleMinutes: 15, turns: 4, tokens: 500, escalations: 1 });
   const first = store.createAssignment(ticketId);
   store.configureNativeAssignment(first, { harness: "codex", model: "m", worktree: "/w1", branch: "b1", machine: "h" });
   store.startNativeAssignment(first, "s1");
   store.beginTurn(first);
+  store.startWorkerTurn(first, "dispatch");
+  advance(20 * 60_000);
+  store.finishWorkerTurn(first, "completed", { inputTokens: 10, cachedInputTokens: 20, outputTokens: 30 });
   store.endTurn(first, { inputTokens: 10, cachedInputTokens: 20, outputTokens: 30 });
   store.endAssignment(first);
   const second = store.createAssignment(ticketId);
   store.configureNativeAssignment(second, { harness: "codex", model: "m", worktree: "/w2", branch: "b2", machine: "h" });
   store.startNativeAssignment(second, "s2");
   store.beginTurn(second);
+  store.startWorkerTurn(second, "follow_up");
+  advance(40 * 60_000);
+  store.finishWorkerTurn(second, "completed", { inputTokens: 1, cachedInputTokens: 2, outputTokens: 3 });
   store.endTurn(second, { inputTokens: 1, cachedInputTokens: 2, outputTokens: 3 });
   const budget = store.ticketBudget(ticketId);
   assert.deepEqual(
     [budget.ticketId, budget.timeMinutes, budget.idleMinutes, budget.turnLimit, budget.tokenLimit, budget.escalationLimit,
-      budget.escalations, budget.turns, budget.inputTokens, budget.cachedInputTokens, budget.outputTokens, budget.turnStartedAt],
-    [ticketId, 90, 15, 4, 500, 1, 0, 2, 11, 22, 33, null],
+      budget.escalations, budget.turns, budget.inputTokens, budget.cachedInputTokens, budget.outputTokens,
+      budget.completedTurnSeconds, budget.turnStartedAt],
+    [ticketId, 90, 15, 4, 500, 1, 0, 2, 11, 22, 33, 60 * 60, null],
   );
   store.pauseTicketForBudget(ticketId, "tokens");
   assert.equal(store.getTicket(ticketId).pauseCause, "budget reached: tokens");
   store.resumeTicket(ticketId);
   assert.equal(store.getTicket(ticketId).pauseCause, null);
+});
+
+test("extension resumes only the exhausted budget it raises, after every limit clears", () => {
+  const { store, accept } = fixture();
+  const ticketId = accept();
+  store.setTicketBudget(ticketId, { timeMinutes: 480, idleMinutes: 30, turns: 1, tokens: 10, escalations: 0 });
+  const assignment = store.createAssignment(ticketId);
+  store.configureNativeAssignment(assignment, { harness: "codex", model: "m", worktree: "/w", branch: "b", machine: "h" });
+  store.startNativeAssignment(assignment, "s");
+  store.beginTurn(assignment);
+  store.endTurn(assignment, { inputTokens: 20, cachedInputTokens: 0, outputTokens: 0 });
+  store.pauseTicketForBudget(ticketId, "tokens");
+  store.extendTicketBudget(ticketId, { timeMinutes: 60 });
+  assert.equal(store.getTicket(ticketId).state, "paused", "raising another budget does not resume");
+  store.extendTicketBudget(ticketId, { tokens: 5 });
+  assert.equal(store.getTicket(ticketId).state, "paused", "insufficient extension does not resume");
+  store.extendTicketBudget(ticketId, { tokens: 10 });
+  assert.equal(store.getTicket(ticketId).state, "paused", "the turn limit is still exhausted");
+  store.extendTicketBudget(ticketId, { tokens: 1, turns: 1 });
+  assert.equal(store.getTicket(ticketId).state, "open");
+  assert.equal(store.getTicket(ticketId).pauseCause, null);
+  for (const cause of ["paused by the operator", "paused by @alice on GitHub"]) {
+    store.pauseTicket(ticketId, cause);
+    store.extendTicketBudget(ticketId, { tokens: 10, turns: 1 });
+    assert.equal(store.getTicket(ticketId).state, "paused");
+    assert.equal(store.getTicket(ticketId).pauseCause, cause);
+    store.resumeTicket(ticketId);
+  }
 });
 
 test("a stopped native assignment ends with its reason and is owed a reply; a finished one is not", () => {

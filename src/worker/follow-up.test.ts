@@ -3,7 +3,7 @@ import { afterEach, test } from "node:test";
 
 import { Store } from "../store/store.ts";
 import { FakeRunner } from "./fake-runner.ts";
-import { followUpMessage, routeFollowUps } from "./follow-up.ts";
+import { followUpMessage, reviewFollowUpMessage, routeFollowUps } from "./follow-up.ts";
 import { workerTurnPrompt, Workers } from "./workers.ts";
 
 const REPO = "onsager-ai/ostrom";
@@ -66,6 +66,63 @@ function fixture() {
   store.subscribe(ticketId, pr);
   return { store, runner, workers, thread, issue, pr, trigger, accept, worker, ticketId, assignmentId };
 }
+
+test("a new ticket receives only comments after its start trigger", () => {
+  const { store, issue, trigger, ticketId: oldTicket } = fixture();
+  trigger(issue);
+  store.endTicket(oldTicket);
+
+  const newStart = trigger(issue);
+  const newTicket = store.recordDecision({ threadId: issue, triggerIds: [newStart], verdict: "accept", reason: "new work" }).ticketId!;
+  const newerComment = trigger(issue);
+
+  assert.deepEqual(store.pendingDeliveries().map((delivery) => [delivery.ticketId, delivery.trigger.id]), [[newTicket, newerComment]]);
+});
+
+test("trusted comments and reviews acknowledge public stalls in every ticket state", async () => {
+  for (const state of ["open", "paused", "ended"] as const) {
+    for (const review of [false, true]) {
+      const { store, workers, ticketId, assignmentId, issue, pr, trigger } = fixture();
+      const stall = store.recordStall({ assignmentId, semonReason: "waiting-question", detail: "?" }).id;
+      store.publishStall(stall);
+      if (state === "paused") store.pauseTicket(ticketId, "stuck turn reported by the Watchdog");
+      if (state === "ended") store.endTicket(ticketId);
+      trigger(review ? pr : issue, review ? "pull_request_review" : "issue_comment", review ? { reviewId: "R1" } : {});
+      const pass = routeFollowUps(store, workers, ["alice"]);
+      assert.deepEqual(pass.failed, []);
+      assert.notEqual(store.getStall(stall).clearedAt, null);
+      assert.equal(store.getTicket(ticketId).state, state === "ended" ? "ended" : "open");
+      await workers.drain();
+    }
+  }
+});
+
+test("a trusted reply clears the stall while preserving a separate pause", async () => {
+  for (const cause of ["paused by the operator", "budget reached: time"]) {
+    const { store, workers, ticketId, assignmentId, pr, trigger } = fixture();
+    const stall = store.recordStall({ assignmentId, semonReason: "waiting-question", detail: "?" }).id;
+    store.publishStall(stall);
+    store.pauseTicket(ticketId, cause);
+    trigger(pr, "pull_request_review", { reviewId: "R1" });
+    routeFollowUps(store, workers, ["alice"]);
+    assert.notEqual(store.getStall(stall).clearedAt, null);
+    assert.equal(store.getTicket(ticketId).state, "paused");
+    assert.equal(store.getTicket(ticketId).pauseCause, cause);
+    await workers.drain();
+  }
+});
+
+test("a non-allowlisted review cannot clear a public stall", async () => {
+  const { store, workers, ticketId, assignmentId, pr, trigger } = fixture();
+  const stall = store.recordStall({ assignmentId, semonReason: "waiting-question", detail: "?" }).id;
+  store.publishStall(stall);
+  store.pauseTicket(ticketId, "stuck turn reported by the Watchdog");
+  trigger(pr, "pull_request_review", { reviewId: "R1" });
+  routeFollowUps(store, workers, ["bob"]);
+  assert.equal(store.getStall(stall).clearedAt, null);
+  assert.equal(store.getTicket(ticketId).state, "paused");
+  await workers.drain();
+});
 
 test("a review on a subscribed PR goes to the ticket's Worker session, with no decision", async () => {
   const { store, runner, workers, pr, trigger, ticketId, assignmentId } = fixture();
@@ -144,6 +201,79 @@ test("a restart during a review turn posts its one reply when recovery completes
   );
 });
 
+test("recovery folds newer reviews into the interrupted prompt and finishes their deliveries together", async () => {
+  const { store, runner, workers, pr, trigger } = fixture();
+  runner.hold = true;
+  trigger(pr, "pull_request_review", { reviewId: "44", body: "Earlier review." });
+  routeFollowUps(store, workers);
+  await tick();
+  workers.stop();
+  await workers.drain();
+
+  trigger(pr, "pull_request_review", { reviewId: "45", body: "Newer review." });
+  routeFollowUps(store, workers);
+  const restarted = new Workers({
+    store,
+    config: { repo: "/repo", base: "main", worktrees: "/wt", harness: "codex", model: "gpt-6-luna", machine: "host" },
+    runners: { claude: runner, codex: runner },
+  });
+  restarted.recover();
+  await tick();
+  const resumed = runner.sessions.at(-1)!;
+  assert.equal(resumed.prompts.length, 1);
+  const prompt = resumed.prompts[0]!;
+  assert.match(prompt, /^The previous turn was interrupted by a daemon stop\./);
+  assert.match(prompt, /work may be partly pushed/);
+  assert.match(prompt, /current PR head and CI before acting/);
+  assert.ok(prompt.indexOf("Earlier review.") > 0);
+  assert.ok(prompt.indexOf("Newer review.") > prompt.indexOf("Earlier review."));
+  const running = store.unfinishedTurns(1);
+  assert.equal(running.length, 2);
+  assert.ok(running.every((turn) => turn.state === "running" && turn.turnId === "session-1:2"));
+  assert.deepEqual(store.pendingDeliveries(), []);
+  resumed.release();
+  await restarted.drain();
+  assert.deepEqual(store.unfinishedTurns(1), []);
+  const results = store.dueReplies().filter((reply) => reply.id.startsWith("review-")).sort((a, b) => a.id.localeCompare(b.id));
+  assert.deepEqual(results.map((reply) => reply.id), ["review-1-44", "review-1-45"]);
+  assert.ok(results.every((reply) => reply.blocking), "recovery results include folded feedback and bypass batching");
+});
+
+test("interrupting recovery again preserves both review replies and prompts", async () => {
+  const { store, runner, workers, pr, trigger } = fixture();
+  const make = () => new Workers({
+    store,
+    config: { repo: "/repo", base: "main", worktrees: "/wt", harness: "codex", model: "gpt-6-luna", machine: "host" },
+    runners: { claude: runner, codex: runner },
+  });
+  runner.hold = true;
+  trigger(pr, "pull_request_review", { reviewId: "44", body: "Earlier review." });
+  routeFollowUps(store, workers);
+  await tick();
+  workers.stop();
+  await workers.drain();
+  trigger(pr, "pull_request_review", { reviewId: "45", body: "Newer review." });
+  routeFollowUps(store, workers);
+  const firstRecovery = make();
+  firstRecovery.recover();
+  await tick();
+  firstRecovery.stop();
+  await firstRecovery.drain();
+
+  runner.hold = false;
+  const secondRecovery = make();
+  secondRecovery.recover();
+  await secondRecovery.drain();
+  const prompts = runner.sessions.at(-1)!.prompts;
+  assert.equal(prompts.length, 1);
+  assert.ok(prompts[0]!.indexOf("Earlier review.") > 0);
+  assert.ok(prompts[0]!.indexOf("Newer review.") > prompts[0]!.indexOf("Earlier review."));
+  assert.deepEqual(store.unfinishedTurns(1), []);
+  const results = store.dueReplies().filter((reply) => reply.id.startsWith("review-")).sort((a, b) => a.id.localeCompare(b.id));
+  assert.deepEqual(results.map((reply) => reply.id), ["review-1-44", "review-1-45"]);
+  assert.ok(results.every((reply) => reply.blocking), "recovery results include folded feedback and bypass batching");
+});
+
 test("the follow-up is a summary plus a pointer to the trigger", () => {
   const { store, pr, trigger, ticketId } = fixture();
   const id = trigger(pr, "pull_request_review");
@@ -153,6 +283,13 @@ test("the follow-up is a summary plus a pointer to the trigger", () => {
   assert.match(message, new RegExp(`^Follow-up for Ostrom ticket ${ticketId}: a new review \\(pull_request_review\\) by @alice\n`));
   assert.match(message, new RegExp(`on pull request #12: https://github.com/${REPO}/pull/12#event-${id}\n`));
   assert.match(message, /Read it with `gh`/);
+  for (const prompt of [message, reviewFollowUpMessage(ticketId, store.getThread(pr), [pending!.trigger])]) {
+    assert.match(prompt, /Ostrom may post your final message publicly on the issue or pull request/);
+    assert.match(prompt, /explain what prevented delivery/);
+    assert.match(prompt, /use repository-relative paths/);
+    assert.match(prompt, /do not narrate your own process or what you did or did not post/);
+    assert.match(prompt, /Do not claim CI or merge state; Ostrom reports those/);
+  }
   assert.match(message, /push\nto the branch of your existing pull request; do not open a new one/);
 });
 
@@ -172,13 +309,14 @@ test("a replayed pass sends nothing twice", async () => {
   const later = trigger(pr);
   const pass = routeFollowUps(store, workers);
   assert.deepEqual(pass.queued.map((d) => [d.triggerId, d.assignmentId]), [[later, second]]);
+  await workers.drain();
 });
 
 test("follow-ups queue behind a running turn, one at a time, and are never queued twice", async () => {
-  const { store, runner, workers, pr, trigger } = fixture();
+  const { store, runner, workers, pr, trigger, assignmentId } = fixture();
   runner.hold = true;
-  const first = trigger(pr);
-  const second = trigger(pr);
+  const first = trigger(pr, "pull_request_review", { reviewId: "R1" });
+  const second = trigger(pr, "pull_request_review", { reviewId: "R2" });
   assert.equal(routeFollowUps(store, workers).queued.length, 2);
   await tick();
   const session = runner.sessions[0]!;
@@ -190,6 +328,9 @@ test("follow-ups queue behind a running turn, one at a time, and are never queue
   await tick();
   assert.equal(session.prompts.length, 2);
   assert.deepEqual(store.pendingDeliveries(), []);
+  const firstResult = store.dueReplies().find((reply) => reply.id === `review-${assignmentId}-R1`);
+  assert.equal(firstResult?.body, "ok", "the first review's result was enqueued before the next turn started");
+  assert.equal(firstResult?.blocking, true, "the first review's result bypasses batching");
   session.release();
   await workers.drain();
   assert.equal(session.maxRunning, 1);
@@ -253,7 +394,7 @@ test("when every subscribed ticket has ended, the trigger goes to the Router, no
   assert.deepEqual(store.undecidedTriggers().map((t) => t.id), [afterEnd], "already delivered stays delivered");
 });
 
-test("a trigger fans out to every open subscribed ticket; ended ones are skipped", () => {
+test("a trigger fans out to every open subscribed ticket; ended ones are skipped", async () => {
   const { store, workers, issue, pr, trigger, accept, worker, ticketId, assignmentId } = fixture();
   const second = accept(issue);
   const secondWorker = worker(second, "session-2");
@@ -268,9 +409,10 @@ test("a trigger fans out to every open subscribed ticket; ended ones are skipped
     [id, ticketId, assignmentId],
     [id, second, secondWorker],
   ]);
+  await workers.drain();
 });
 
-test("a ticket ended while paused at public Stuck is owed no follow-up", () => {
+test("a trusted reply clears an ended ticket's public stall without delivering work", () => {
   const { store, workers, pr, trigger, ticketId, assignmentId } = fixture();
   store.recordStall({ assignmentId, semonReason: "no-output", detail: null });
   const stall = store.unansweredStalls()[0]!;
@@ -279,8 +421,10 @@ test("a ticket ended while paused at public Stuck is owed no follow-up", () => {
   store.endTicket(ticketId);
   trigger(pr);
 
+  assert.equal(store.pendingDeliveries().length, 1);
+  assert.deepEqual(routeFollowUps(store, workers, ["alice"]), { queued: [], failed: [] });
+  assert.notEqual(store.getStall(stall.id).clearedAt, null);
   assert.deepEqual(store.pendingDeliveries(), []);
-  assert.deepEqual(routeFollowUps(store, workers), { queued: [], failed: [] });
 });
 
 test("an open ticket with no running Worker holds its follow-up and reports it", () => {

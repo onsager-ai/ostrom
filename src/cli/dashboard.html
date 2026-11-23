@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ostrom dashboard</title>
+<style>
+:root{color-scheme:light dark;--bg:#f5f6f8;--surface:#fff;--ink:#202936;--muted:#596575;--line:#dce1e8;--link:#245bb0;--blue:#245bb0;--blue-bg:#edf3ff;--amber:#855300;--amber-bg:#fff4d6;--red:#a42b32;--red-bg:#ffedef;--green:#19663e;--green-bg:#e7f5ed;--neutral:#515d6d;--neutral-bg:#eef0f4;--track:#e2e7ee;--meter:#5177ac}
+@media(prefers-color-scheme:dark){:root{--bg:#15191f;--surface:#1d232c;--ink:#e6eaf0;--muted:#a8b3c2;--line:#354050;--link:#9fc1ff;--blue:#b4ceff;--blue-bg:#243752;--amber:#f4d58d;--amber-bg:#44351a;--red:#ffb5bb;--red-bg:#48272e;--green:#a2e0ba;--green-bg:#213d2d;--neutral:#c6cfdb;--neutral-bg:#303944;--track:#354050;--meter:#8eafe0}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{max-width:1120px;margin:auto;padding:32px 24px}h1,h2,h3,p{margin:0}h1{font-size:26px;letter-spacing:-.6px}h2{font-size:17px;margin-bottom:12px}h3{font-size:17px;line-height:1.5;font-weight:600;overflow-wrap:anywhere}a{color:var(--link);text-underline-offset:3px}a:hover{text-decoration-thickness:2px}header{margin-bottom:24px}.eyebrow{font-size:12px;color:var(--muted);letter-spacing:.08em;text-transform:uppercase;margin-bottom:3px}.overview{font-size:16px;margin-top:7px}small,.muted{color:var(--muted)}#refresh{font-size:12px;margin-top:6px}.stale{background:var(--red-bg);border:1px solid var(--red);color:var(--red);padding:12px 16px;border-radius:8px;margin-bottom:20px}.stale[hidden]{display:none}section{margin:24px 0}.attention-box{border-left:3px solid var(--amber);background:var(--amber-bg);padding:14px 18px;border-radius:6px}.attention-box h2{margin-bottom:4px}.attention-box ul{padding-left:19px;margin:0}.attention-box li{padding:3px 0}.cards{display:grid;gap:14px}.ticket{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:18px 20px;min-width:0;scroll-margin-top:16px}.ticket:target{outline:2px solid var(--link)}.card-head{display:flex;align-items:start;justify-content:space-between;gap:16px}.phase{flex-shrink:0;max-width:100%;font-size:12px;font-weight:600;padding:4px 10px;border-radius:20px;display:inline-block}.phase::before{content:"";display:inline-block;width:6px;height:6px;background:currentColor;border-radius:50%;margin-right:6px;vertical-align:1px}.blue{color:var(--blue);background:var(--blue-bg)}.amber{color:var(--amber);background:var(--amber-bg)}.red{color:var(--red);background:var(--red-bg)}.green{color:var(--green);background:var(--green-bg)}.neutral{color:var(--neutral);background:var(--neutral-bg)}.phase-detail{margin-top:8px;overflow-wrap:anywhere}.meta{display:flex;flex-wrap:wrap;gap:6px 18px;font-size:12px;color:var(--muted);margin-top:10px}.pr-links{display:flex;gap:12px;flex-wrap:wrap;font-size:13px}.budgets{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:24px;margin-top:17px;max-width:740px}.meter-head{display:flex;justify-content:space-between;gap:8px;font-size:12px;margin-bottom:5px}.meter-value{color:var(--muted)}.budget-warning .meter-value{font-weight:600;color:var(--amber)}progress{display:block;width:100%;height:5px;border:0;border-radius:4px;background:var(--track);accent-color:var(--meter)}progress::-webkit-progress-bar{background:var(--track);border-radius:4px}progress::-webkit-progress-value{background:var(--meter);border-radius:0 4px 4px 0}progress::-moz-progress-bar{background:var(--meter);border-radius:0 4px 4px 0}.budget-warning progress{accent-color:var(--amber)}.budget-warning progress::-webkit-progress-value{background:var(--amber)}.budget-warning progress::-moz-progress-bar{background:var(--amber)}details{margin-top:14px}summary{cursor:pointer;color:var(--muted);width:fit-content;padding:4px 0;font-size:13px}summary:hover{color:var(--ink)}.detail-body{border-top:1px solid var(--line);margin-top:10px;padding-top:14px;overflow-wrap:anywhere}.detail-body h4{margin:16px 0 6px;font-size:13px}.detail-body ul{margin:0;padding-left:18px}.detail-body li{padding:4px 0}dl{display:grid;grid-template-columns:90px minmax(0,1fr);gap:5px 12px;margin:0}dt{color:var(--muted)}dd{margin:0}code{font-size:12px;white-space:normal;overflow-wrap:anywhere}button{font:inherit;font-size:12px;padding:3px 9px;border:1px solid var(--line);border-radius:4px;color:var(--ink);background:var(--surface);cursor:pointer;margin-left:8px}.compact{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:16px 20px}.compact details{margin:0}.compact summary{font-size:15px;font-weight:600;color:var(--ink)}table{border-collapse:collapse;width:100%;table-layout:fixed;font-size:12px}th{text-align:left;color:var(--muted);font-weight:500}td,th{padding:8px 10px 8px 0;border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:anywhere}tr:last-child td{border:0}.when{width:90px}.reference{width:110px}.disposition{width:125px}.table-note{font-size:12px;color:var(--muted);margin:8px 0}.finished-list{list-style:none;margin:8px 0 0;padding:0}.finished-list li{padding:4px 0}footer{color:var(--muted);font-size:12px;border-top:1px solid var(--line);padding-top:16px;margin-top:28px}time{white-space:nowrap}:focus-visible{outline:2px solid var(--link);outline-offset:3px}
+@media(max-width:680px){main{padding:20px 16px}.ticket,.compact{padding:14px}.card-head{flex-direction:column;gap:9px}.budgets{gap:12px}.meter-head{display:block}.meter-value{display:block}.reference{width:70px}.disposition{width:90px}.when{width:70px}h1{font-size:23px}h3{font-size:16px}dl{grid-template-columns:70px minmax(0,1fr)}}
+@media(forced-colors:active){.phase{border:1px solid}.budget-warning{outline:1px solid}progress{forced-color-adjust:auto}}
+</style>
+</head>
+<body><main>
+<header><p class="eyebrow">Ostrom · operator dashboard</p><h1 id="repo">Ostrom</h1><p id="overview" class="overview">Connecting to the daemon…</p><p id="refresh" class="muted" aria-live="polite">Waiting for first refresh</p></header>
+<div id="error" class="stale" role="alert" hidden></div>
+<section id="attention-section" class="attention-box" hidden><h2>Needs attention</h2><ul id="attention"></ul></section>
+<section aria-labelledby="tickets-heading"><h2 id="tickets-heading">Active tickets</h2><div id="tickets" class="cards"></div></section>
+<section class="compact" aria-labelledby="failures-heading"><h2 id="failures-heading">Recent failures</h2><div id="failures"></div></section>
+<section class="compact"><details id="finished-disclosure"><summary>Recently finished <span id="finished-count"></span></summary><ul id="finished" class="finished-list"></ul></details></section>
+<section class="compact"><details id="intake-disclosure"><summary>Recent intake</summary><p class="table-note">Observed through polling, not a complete GitHub audit. Includes stored triggers, approval reviews excluded because they contain no feedback, and newly opened issues excluded for a missing mention or unauthorized author.</p><div id="intake"></div></details></section>
+<footer id="health">Watchdog and machine information will appear after the first refresh.</footer>
+</main>
+<script type="module">
+import { ageLabel, attentionItems, budgetMeters, createRefresh, githubUrl, localTime, pendingSelection, phaseSummary, policyLabel, ticketPhase, ticketSummary } from "./dashboard-view.js";
+const token=location.hash.slice(1);
+history.replaceState(null,"",location.pathname+location.search);
+const el=id=>document.getElementById(id);
+const node=(tag,text,className)=>{const n=document.createElement(tag);n.textContent=text??"";if(className)n.className=className;return n};
+function link(parent,text,url){const safe=githubUrl(url);if(!safe){parent.append(document.createTextNode(text));return}const a=node("a",text);a.href=safe;a.rel="noopener noreferrer";parent.append(a)}
+function time(timestamp,relative=true){const n=node("time",relative?ageLabel(timestamp):localTime(timestamp));if(timestamp){n.dateTime=timestamp;n.title=new Date(timestamp).toLocaleString([], {dateStyle:"medium",timeStyle:"short"})}return n}
+function heading(parent,text){parent.append(node("h4",text))}
+function list(parent,rows,render){const ul=node("ul");if(!rows.length){parent.append(node("p","None","muted"));return}for(const row of rows){const li=node("li");render(li,row);ul.append(li)}parent.append(ul)}
+function table(headers,rows){const t=node("table"),head=node("thead"),tr=node("tr");for(const [label,cls] of headers){const th=node("th",label,cls);th.scope="col";tr.append(th)}head.append(tr);t.append(head);const body=node("tbody");for(const cells of rows){const row=node("tr");for(const content of cells){const td=node("td");td.append(content);row.append(td)}body.append(row)}t.append(body);return t}
+async function read(path){const response=await fetch(path,{headers:{Authorization:`Bearer ${token}`},cache:"no-store"});if(!response.ok)throw Error(`${path}: ${response.status}${response.status===502?" — ostromd is unavailable":""}`);return response.json()}
+async function fetchSnapshot(){const [status,tickets,intake]=await Promise.all([read("/v1/status"),read("/v1/tickets"),read("/v1/intake?limit=50")]);const details=await Promise.all(tickets.filter(t=>t.state!=="ended").map(t=>read(`/v1/tickets/${t.id}`)));return {status,tickets,intake,details}}
+const refresh=createRefresh(fetchSnapshot,(data,at)=>{render(data);el("error").hidden=true;el("error").textContent="";el("refresh").replaceChildren(document.createTextNode("Refreshed "),time(at.toISOString(),false),document.createTextNode(" · every 5 sec"))},(snapshot,error)=>{if(snapshot)render(snapshot);el("error").hidden=false;el("error").textContent=`${snapshot?"Stale — showing the last successful snapshot. ":"Unable to load dashboard. "}${error.message}. Retrying every 5 sec.`});
+function renderDetails(parent,t,detail){
+  const disclosure=node("details");disclosure.dataset.ticket=t.id;disclosure.append(node("summary","Details"));
+  const body=node("div",null,"detail-body"),dl=node("dl");
+  const field=(name,value)=>{dl.append(node("dt",name),node("dd",value??"Unavailable"))};
+  field("Ticket",`${t.id} · ${t.state}`);field("Branch",t.assignment?.branch);field("Worktree",t.assignment?.worktree);
+  dl.append(node("dt","Session"));const session=node("dd");
+  if(t.assignment?.sessionId){const id=t.assignment.sessionId;session.append(node("code",id));const copy=node("button","Copy");copy.type="button";copy.onclick=async()=>{try{await navigator.clipboard.writeText(id);copy.textContent="Copied"}catch{copy.textContent="Select and copy the ID"}};session.append(copy)}else session.textContent="Unavailable";
+  dl.append(session);body.append(dl);heading(body,"Task summary");body.append(node("p",ticketSummary(detail).full));
+  if(t.mergeCandidate){heading(body,"Merge");body.append(node("p",`Policy: ${policyLabel(t.mergeCandidate.policy)}`));if(t.mergeCandidate.blockingReason)body.append(node("p",t.mergeCandidate.blockingReason));if(t.mergeCandidate.quietDeadline){const p=node("p","Quiet deadline: ");p.append(time(t.mergeCandidate.quietDeadline,false));body.append(p)}}
+  heading(body,"Recent triggers");list(body,[...detail.triggers].sort((a,b)=>Date.parse(b.occurredAt)-Date.parse(a.occurredAt)).slice(0,10),(li,x)=>{link(li,`${x.actor} · ${x.kind}`,x.url);li.append(document.createTextNode(" · "),time(x.occurredAt))});
+  heading(body,"Outbox");list(body,detail.outbox,(li,x)=>{li.append(document.createTextNode(`${x.kind} · ${x.sentAt?"sent":"due"} `),time(x.sentAt??x.nextAttemptAt,false));if(x.lastError)li.append(document.createTextNode(` · ${x.lastError}`))});
+  heading(body,"Decisions");list(body,[...detail.decisions].sort((a,b)=>Date.parse(b.decidedAt)-Date.parse(a.decidedAt)),(li,x)=>{li.append(document.createTextNode(`${x.verdict} · `),time(x.decidedAt,false),document.createTextNode(` · ${x.reason}`))});
+  heading(body,"CLI controls");body.append(node("code",`ostrom pause ${t.id} · ostrom resume ${t.id} · ostrom stop ${t.id} · ostrom extend ${t.id} --time M`));
+  disclosure.append(body);parent.append(disclosure);
+}
+function card(t,detail){
+  const article=node("article",null,"ticket");article.id=`ticket-${t.id}`;
+  const head=node("div",null,"card-head"),title=node("h3"),summary=ticketSummary(detail),phase=ticketPhase(t);
+  link(title,`#${t.thread.number}`,t.thread.url);title.append(document.createTextNode(` · ${summary.short}`));title.title=summary.full;
+  head.append(title,node("span",phase.label,`phase ${phase.tone}`));article.append(head);
+  if(phase.detail)article.append(node("p",phase.detail,"phase-detail"));
+  const meta=node("div",null,"meta"),prs=node("span",null,"pr-links");for(const pr of t.pullRequests)link(prs,`PR #${githubUrl(pr)?.split("/").pop()??"unknown"}`,pr);
+  if(t.pullRequests.length)meta.append(prs);
+  const currentTurn=detail?.turns?.at(-1), currentModel=t.assignment?.model??currentTurn?.requestedModel;
+  const pendingModel=pendingSelection({...detail,assignment:t.assignment},"model",`${t.assignment?.harness}/${currentModel}`), pendingEffort=pendingSelection(detail,"effort",currentTurn?.requestedEffort);
+  if(currentModel) article.append(node("p",`Model: ${currentModel}${pendingModel?` (${pendingModel} from the next session)`:""} · Effort: ${currentTurn?.requestedEffort??"harness default"}${pendingEffort?` (${pendingEffort} from the next turn)`:""}`),node("p",currentTurn?.reason??"","muted"));
+  const activity=node("span","Last completed turn: ");activity.append(time(t.assignment?.lastActivityAt));meta.append(activity,node("span",`${t.assignment?.harness??"Unassigned"}${t.assignment?.model?` · ${t.assignment.model}`:""}`));article.append(meta);
+  const budgets=node("div",null,"budgets");
+  for(const meter of budgetMeters(t)){const container=node("div",null,meter.warning?"budget-warning":""),label=node("div",null,"meter-head"),value=node("span",`${meter.warning?"! ":""}${meter.text}`,"meter-value");label.append(node("span",meter.label),value);container.title=`${meter.label}: ${meter.used.toLocaleString()} used / ${meter.limit.toLocaleString()} limit${meter.warning?" — at least 80% used":""}`;const bar=node("progress");bar.max=100;bar.value=Math.max(0,Math.min(100,meter.percent??0));bar.setAttribute("aria-label",`${meter.label}: ${meter.text}`);container.append(label,bar);budgets.append(container)}
+  article.append(budgets);renderDetails(article,t,detail);return article;
+}
+function render(data){
+  const {status,tickets,intake,details}=data,active=tickets.filter(t=>t.state!=="ended"),byId=new Map(details.map(d=>[d.id,d]));
+  const open=new Set([...document.querySelectorAll("details[data-ticket][open]")].map(d=>d.dataset.ticket));
+  const focused=document.activeElement,focusId=focused?.closest("article")?.id,focusSummary=focused?.tagName==="SUMMARY";
+  el("repo").textContent=details.find(d=>d.context?.source?.name)?.context.source.name??"Ostrom";el("overview").textContent=phaseSummary(tickets);
+  const attention=attentionItems(status,tickets);el("attention-section").hidden=!attention.length;el("attention").replaceChildren(...attention.map(item=>{const li=node("li");if(item.ticketId){const t=tickets.find(t=>t.id===item.ticketId),a=node("a",t?`#${t.thread.number}`:`Ticket ${item.ticketId}`);a.href=`#ticket-${item.ticketId}`;li.append(a,document.createTextNode(" · "))}li.append(document.createTextNode(item.text));return li}));
+  el("tickets").replaceChildren(...(active.length?active.map(t=>card(t,byId.get(t.id))):[node("p","No active tickets","muted")]));
+  for(const d of document.querySelectorAll("details[data-ticket]"))d.open=open.has(d.dataset.ticket);
+  if(focusId&&focusSummary)el(focusId)?.querySelector("summary")?.focus({preventScroll:true});
+  const failures=tickets.flatMap(t=>(t.recentFailures??[]).map(f=>({t,f}))).sort((a,b)=>Date.parse(b.f.at)-Date.parse(a.f.at)).slice(0,20);
+  el("failures").replaceChildren(failures.length?table([["Ticket","reference"],["When","when"],["Failure",""]],failures.map(({t,f})=>{const a=node("span");link(a,`#${t.thread.number}`,t.thread.url);return [a,time(f.at),node("span",`${f.kind} · ${f.summary}`)]})):node("p","No recent failures","muted"));
+  const ended=tickets.filter(t=>t.state==="ended").sort((a,b)=>Date.parse(b.endedAt)-Date.parse(a.endedAt)).slice(0,10);el("finished-count").textContent=`(${ended.length})`;
+  el("finished").replaceChildren(...ended.map(t=>{const li=node("li");link(li,`#${t.thread.number}`,t.thread.url);li.append(document.createTextNode(" · finished "),time(t.endedAt));return li}));if(!ended.length)el("finished").append(node("li","No recently finished tickets","muted"));
+  el("intake").replaceChildren(intake.length?table([["When","when"],["Disposition","disposition"],["Reason",""]],intake.map(i=>{const a=node("span");link(a,i.disposition,i.url);return [time(i.observedAt),a,node("span",i.reason??"Awaiting a decision")]})):node("p","No recent intake","muted"));
+  const w=status.watchdog,m=status.machine,p=el("health");p.replaceChildren(document.createTextNode(`Watchdog: ${w.lastSuccess===null?"no read since restart":w.lastSuccess?"read OK":"read failed"}`));
+  if(w.lastAttemptAt)p.append(document.createTextNode(" · attempted "),time(w.lastAttemptAt));if(w.lastSuccessAt)p.append(document.createTextNode(" · last success "),time(w.lastSuccessAt));p.append(document.createTextNode(` · tick ${status.watchdogTickIntervalSeconds??"?"} sec · temperature ${m?.temperature==null?"unavailable":`${m.temperature} °C`}${m?.slots?` · CPU parallelism ${m.slots.used}/${m.slots.total}`:""}`));
+}
+setInterval(()=>void refresh(),5000);void refresh();
+</script>
+</body>
+</html>

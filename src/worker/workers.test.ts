@@ -1,15 +1,22 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, test } from "node:test";
+import { after, afterEach, test } from "node:test";
 
+import { FakeGitHub } from "../github/fake-github.ts";
+import { sendDueReplies } from "../github/outbox.ts";
 import { Store } from "../store/store.ts";
+import { annotationsPath } from "../session/annotations.ts";
 import { FakeRunner } from "./fake-runner.ts";
 import { workerBrief } from "./dispatch.ts";
 import { gitDirs, INTERRUPTED_PROMPT, workerTurnPrompt, Workers, type WorkersDeps } from "./workers.ts";
 
 const REPO = "onsager-ai/ostrom";
+// Dispatch writes Semon annotations under XDG_STATE_HOME; keep test runs out of the operator's state.
+const stateHome = mkdtempSync(join(tmpdir(), "workers-state-"));
+process.env["XDG_STATE_HOME"] = stateHome;
+after(() => rmSync(stateHome, { recursive: true, force: true }));
 const config = { repo: "/repo", base: "main", worktrees: "/wt", harness: "codex" as const, model: "gpt-6-luna", machine: "host" };
 const stores: Store[] = [];
 
@@ -67,6 +74,150 @@ test("dispatch makes the worktree, starts the session with the brief and stores 
   await workers.drain();
   const done = store.getAssignment(1);
   assert.deepEqual([done.turnStartedAt, done.inputTokens, done.cachedInputTokens, done.outputTokens, done.outcome], [null, 10, 5, 2, null]);
+  const [turn] = store.operatorTicket(ticketId).turns;
+  assert.deepEqual([turn!.kind, turn!.status, turn!.requestedModel, turn!.requestedEffort, turn!.observedModel], ["dispatch", "completed", "gpt-6-luna", null, null]);
+  assert.deepEqual([turn!.inputTokens, turn!.cachedInputTokens, turn!.outputTokens], [10, 5, 2]);
+});
+
+for (const harness of ["claude", "codex"] as const) {
+  test(`${harness} dispatch records and immediately posts a blocked turn's final message`, async () => {
+    const now = () => new Date("2026-11-09T12:00:00.000Z");
+    const github = new FakeGitHub(now);
+    github.issue(7);
+    const { store, runner, ticketId, workers } = fixture({ gh: github.gh, repo: REPO }, harness);
+    const start = runner.start.bind(runner);
+    const finalMessage = "I need a decision on the generated schema.\n\nThe local generation step is unavailable.";
+    runner.start = (options) => {
+      const session = start(options);
+      session.reply = () => finalMessage;
+      return session;
+    };
+
+    const { assignmentId } = await workers.dispatch(ticketId);
+    await workers.drain();
+    const [turn] = store.ticketTurns(ticketId);
+    assert.equal(turn!.status, "completed");
+    assert.equal(turn!.result, finalMessage);
+    assert.equal(store.getAssignment(assignmentId).outcome, "waiting");
+    assert.equal(store.getTicket(ticketId).state, "open");
+
+    const { thread } = store.ticketContext(ticketId);
+    const reply = store.dueReplies().find((item) => item.id === `blocked-a${assignmentId}-turn-1`)!;
+    assert.equal(reply.threadId, thread.id);
+    assert.equal(reply.blocking, true);
+    assert.equal(reply.body, `The Worker stopped without opening a pull request:\n\n${finalMessage}\n\nReply here to redirect, or \`@ostrom stop\`.`);
+    const send = () => sendDueReplies({ store, gh: github.gh, repo: REPO, now, batchWindowMs: 60_000, commentGapMs: 60_000 });
+    assert.deepEqual((await send()).failed, []);
+    assert.deepEqual((await send()).sent, []);
+    const bodies = github.commentsOn(7).map((comment) => String(comment["body"]));
+    assert.equal(bodies.filter((body) => body.startsWith(reply.body)).length, 1);
+    assert.ok(bodies.some((body) => body.startsWith("## Ostrom: Blocked\n\nWaiting for direction.")));
+  });
+}
+
+test("redirect clears Blocked on start and an unchanged pushed head can block again", async () => {
+  const github = new FakeGitHub(() => new Date());
+  const { store, runner, ticketId, workers, make } = fixture({ gh: github.gh, repo: REPO });
+  const { assignmentId, branch } = await workers.dispatch(ticketId);
+  await workers.drain();
+  const { thread } = store.ticketContext(ticketId);
+  github.branchHeads.set(branch, "old-head");
+  const restarted = make();
+  restarted.recover();
+  const session = runner.sessions.at(-1)!;
+  session.reply = () => "Still waiting for the input.";
+  const checkStarted = () => {
+    assert.equal(store.getAssignment(assignmentId).outcome, null);
+    assert.match(store.statusCardBody(thread.id)!, /^## Ostrom: Working/);
+  };
+  assert.equal(restarted.deliver(assignmentId, "redirect-1", "Try again", checkStarted), true);
+  assert.equal(restarted.deliver(assignmentId, "redirect-1", "Try again", checkStarted), false);
+  await restarted.drain();
+  assert.equal(store.getAssignment(assignmentId).outcome, "waiting");
+  assert.match(store.statusCardBody(thread.id)!, /^## Ostrom: Blocked/);
+  assert.equal(store.ticketTurns(ticketId).at(-1)!.result, "Still waiting for the input.");
+  assert.deepEqual(store.dueReplies().filter((reply) => reply.id.startsWith("blocked-")).map((reply) => reply.id),
+    [`blocked-a${assignmentId}-turn-1`, `blocked-a${assignmentId}-turn-2`]);
+
+  session.reply = () => {
+    github.branchHeads.set(branch, "new-head");
+    return "Pushed work in progress.";
+  };
+  restarted.deliver(assignmentId, "follow-up", "Keep going", checkStarted);
+  await restarted.drain();
+  assert.equal(store.getAssignment(assignmentId).outcome, null);
+  assert.match(store.statusCardBody(thread.id)!, /^## Ostrom: Working/);
+  assert.equal(store.hasReply(`blocked-a${assignmentId}-turn-3`), false);
+});
+
+for (const delivery of ["push", "PR", "unreadable"] as const) {
+  test(`${delivery} does not trigger the blocked-turn reply`, async () => {
+    const github = new FakeGitHub(() => new Date());
+    if (delivery === "unreadable") {
+      github.failWhen = (args) => args.some((arg) => arg.includes("/git/matching-refs/")) ? new Error("GitHub unavailable") : undefined;
+    }
+    const { store, runner, ticketId, workers } = fixture({ gh: github.gh, repo: REPO });
+    runner.hold = true;
+    const { assignmentId, branch } = await workers.dispatch(ticketId);
+    const session = runner.sessions[0]!;
+    if (delivery === "push") github.branchHeads.set(branch, "first-head");
+    if (delivery === "PR") github.pulls.push({ branch, number: 8, state: "open" });
+    session.release();
+    await workers.drain();
+    assert.equal(store.hasReply(`blocked-a${assignmentId}-turn-1`), false);
+    assert.equal(store.getAssignment(assignmentId).outcome, null);
+  });
+}
+
+test("a review turn without a push still calls its normal reply handler", async () => {
+  const github = new FakeGitHub(() => new Date());
+  const { store, ticketId, workers } = fixture({ gh: github.gh, repo: REPO });
+  const { assignmentId } = await workers.dispatch(ticketId);
+  await workers.drain();
+  let reply: string | undefined;
+  workers.deliver(assignmentId, "review-8", "Please explain", () => {}, (result) => { reply = result.text; });
+  await workers.drain();
+  assert.equal(reply, "ok");
+  assert.equal(store.ticketTurns(ticketId).at(-1)!.result, "ok");
+  assert.equal(store.getAssignment(assignmentId).outcome, null);
+  assert.equal(store.hasReply(`blocked-a${assignmentId}-turn-2`), false);
+});
+
+test("a recovered workflow result waits for an eligible merge pass and records its turn kind", async () => {
+  const { store, ticketId, workers, make } = fixture();
+  const { assignmentId } = await workers.dispatch(ticketId);
+  await workers.drain();
+  const key = `dispatched-run-a${assignmentId}-10`;
+  store.enqueueTurn({ assignmentId, deliveryKey: key, kind: "dispatched_run", prompt: "The run succeeded" });
+  const recovered = make();
+  recovered.recover();
+  await recovered.drain();
+  assert.equal(store.queuedTurn(assignmentId, key)?.state, "queued");
+  recovered.wakeDispatchedRun(assignmentId, key, () => false);
+  await recovered.drain();
+  assert.equal(store.queuedTurn(assignmentId, key)?.state, "queued");
+  recovered.wakeDispatchedRun(assignmentId, key, () => true);
+  await recovered.drain();
+  assert.equal(store.queuedTurn(assignmentId, key)?.state, "finished");
+  assert.equal(store.ticketTurns(ticketId).at(-1)?.kind, "dispatched_run");
+});
+
+test("every invoked follow-up records its source kind and failures retain a reason", async () => {
+  const { store, ticketId, workers, runner } = fixture();
+  await workers.dispatch(ticketId);
+  await workers.drain();
+  for (const key of ["review-1", "redirect-1", "stuck-recovery-1-1", "conflict-a1-head-base", "ci-fix-a1-head", "operator-pause-1", "budget-pause-1", "stuck-public-1", "ordinary"]) {
+    workers.deliver(1, key, "continue", () => {});
+  }
+  await workers.drain();
+  assert.deepEqual(store.ticketTurns(ticketId).map((turn) => turn.kind), ["dispatch", "review", "redirect", "recovery", "conflict", "ci_fix", "control", "budget_pause", "stuck", "follow_up"]);
+  assert.ok(store.ticketTurns(ticketId).every((turn) => turn.status === "completed"));
+  runner.sessions[0]!.failWith = new Error("provider failed");
+  workers.deliver(1, "failure", "continue", () => {});
+  await workers.drain();
+  const failed = store.ticketTurns(ticketId).at(-1)!;
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.result, "provider failed");
 });
 
 test("linked worktrees grant only the Git paths a commit changes", () => {
@@ -91,6 +242,7 @@ test("cancelling an in-flight turn lets its queued replacement run without a can
   assert.equal(store.getAssignment(1).turnStartedAt, null);
   assert.equal(store.getAssignment(1).outcome, null);
   assert.equal(session.maxRunning, 1);
+  assert.deepEqual(store.ticketTurns(ticketId).map((turn) => turn.status), ["cancelled", "completed"]);
 });
 
 test("a reached ticket budget pauses after the current turn and asks the Worker to push WIP", async () => {
@@ -102,6 +254,19 @@ test("a reached ticket budget pauses after the current turn and asks the Worker 
   assert.equal(store.getTicket(ticketId).pauseCause, "budget reached: turns");
   assert.match(runner.sessions[0]!.prompts[1]!, /Push your work in progress/);
   assert.equal(store.getAssignment(1).turns, 2);
+});
+
+test("a turn cancelled at its turn limit still pauses the ticket for budget", async () => {
+  const { store, runner, ticketId, workers } = fixture();
+  store.setTicketBudget(ticketId, { timeMinutes: 480, idleMinutes: 30, turns: 1, tokens: 1_000_000, escalations: 0 });
+  runner.hold = true;
+  await workers.dispatch(ticketId);
+  const session = runner.sessions[0]!;
+  assert.equal(workers.cancel(1), true);
+  session.auto = true;
+  await workers.drain();
+  assert.equal(store.getTicket(ticketId).state, "paused");
+  assert.equal(store.getTicket(ticketId).pauseCause, "budget reached: turns");
 });
 
 test("the session starts on the configured harness", async () => {
@@ -138,7 +303,7 @@ test("dispatch refuses an ended ticket without starting anything", async () => {
   assert.deepEqual(runner.sessions, []);
 });
 
-test("a turn that fails records a failed outcome; the next good turn clears it", async () => {
+test("a failed turn blocks queued deliveries before the Router ends the assignment", async () => {
   const { store, runner, ticketId, workers } = fixture();
   runner.hold = false;
   await workers.dispatch(ticketId);
@@ -146,14 +311,47 @@ test("a turn that fails records a failed outcome; the next good turn clears it",
   const session = () => runner.sessions.at(-1)!;
   session().failWith = new Error("boom");
   workers.deliver(1, "k1", "go", () => {});
+  let started = false;
+  workers.deliver(1, "operator-resume-1", "resume", () => { started = true; });
   await workers.drain();
   assert.equal(store.getAssignment(1).outcome, "failed");
   assert.equal(store.getAssignment(1).turnStartedAt, null);
   session().failWith = undefined;
   workers.deliver(1, "k2", "again", () => {});
   await workers.drain();
-  assert.equal(store.getAssignment(1).outcome, null);
-  assert.equal(store.getAssignment(1).turns, 3);
+  assert.equal(store.getAssignment(1).outcome, "failed");
+  assert.equal(store.getAssignment(1).lastError, "boom");
+  assert.equal(store.getAssignment(1).turns, 2);
+  assert.equal(started, false);
+  store.endAssignment(1);
+  store.endTicket(ticketId);
+  store.clearTurnError(1);
+  assert.equal(store.operatorTickets()[0]!.latestFailure?.summary, "boom");
+  assert.equal(store.operatorTickets()[0]!.recentFailures[0]?.summary, "boom");
+});
+
+test("a late success after the Router ends an assignment preserves its failure and skips callbacks", async () => {
+  const { store, runner, ticketId, workers } = fixture();
+  await workers.dispatch(ticketId);
+  await workers.drain();
+  const session = runner.sessions[0]!;
+  session.auto = false;
+  let completed = false;
+  workers.deliver(1, "approval", "continue", () => {}, () => { completed = true; });
+  // Let the queued turn start, then end the assignment while its result is still pending.
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(session.running, 1);
+  workers.deliver(1, "operator-pause-1", "pause", () => { assert.fail("ended assignment started a queued turn"); });
+  store.recordTurnError(1, "boom");
+  store.recordOutcome(1, "failed");
+  store.endAssignment(1);
+  store.endTicket(ticketId);
+  session.release();
+  await workers.drain();
+  assert.equal(store.getAssignment(1).lastError, "boom");
+  assert.equal(store.getAssignment(1).turnStartedAt, null);
+  assert.equal(store.operatorTickets()[0]!.latestFailure?.summary, "boom");
+  assert.equal(completed, false);
 });
 
 test("a first turn that fails after the session started is a failed outcome, not an abandon", async () => {
@@ -204,8 +402,27 @@ test("a queued turn survives a restart and runs exactly once", async () => {
   restarted.recover();
   await restarted.drain();
   const resumed = runner.sessions.at(-1)!;
-  assert.deepEqual(resumed.prompts, [workerTurnPrompt(INTERRUPTED_PROMPT), workerTurnPrompt("next")]);
-  assert.equal(resumed.prompts.filter((prompt) => prompt === workerTurnPrompt("next")).length, 1);
+  assert.deepEqual(resumed.prompts, [workerTurnPrompt(`${workerTurnPrompt(INTERRUPTED_PROMPT)}\n\n${workerTurnPrompt("next")}`)]);
+});
+
+test("a persisted recovery leads older queued feedback after another restart", async () => {
+  const { store, runner, ticketId, workers, make } = fixture();
+  runner.hold = true;
+  await workers.dispatch(ticketId);
+  workers.deliver(1, "queued", "next", () => {});
+  workers.stop();
+  await workers.drain();
+  store.pauseTicket(ticketId, "operator");
+  const paused = make();
+  paused.recover();
+  await paused.drain();
+  store.resumeTicket(ticketId);
+  runner.hold = false;
+  const restarted = make();
+  restarted.recover();
+  await restarted.drain();
+  assert.deepEqual(runner.sessions.at(-1)!.prompts, [workerTurnPrompt(`${workerTurnPrompt(INTERRUPTED_PROMPT)}\n\n${workerTurnPrompt("next")}`)]);
+  assert.deepEqual(store.unfinishedTurns(1), []);
 });
 
 test("a reservation blocks a new queued turn without consuming budget and release wakes it", async () => {
@@ -224,7 +441,57 @@ test("a reservation blocks a new queued turn without consuming budget and releas
   assert.equal(store.assignmentWorkIdle(1), true);
 });
 
-test("a stop cuts off the running turn, starts no queued one, and leaves the turn for recovery", async () => {
+test("shutdown is bounded when the SDK ignores cancellation and late activity is ignored", async () => {
+  const { store, runner, ticketId, workers } = fixture();
+  runner.hold = true;
+  const start = runner.start.bind(runner);
+  runner.start = (options) => {
+    const session = start(options);
+    const send = session.send.bind(session);
+    session.send = (prompt) => send(prompt); // emulate an SDK that never settles on abort
+    return session;
+  };
+  await workers.dispatch(ticketId);
+  assert.equal(await workers.shutdown(1), false);
+  assert.equal(store.ticketTurns(ticketId)[0]!.status, "interrupted");
+  store.close();
+  stores.splice(stores.indexOf(store), 1);
+  runner.sessions[0]!.options.onActivity?.();
+  runner.sessions[0]!.release();
+  await workers.drain();
+});
+
+test("shutdown ignores a pre-turn GitHub read that settles after the store closes", async () => {
+  const pending = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const github = new FakeGitHub(() => new Date());
+  let delay = false;
+  const { store, runner, workers, ticketId } = fixture({ gh: async (args) => {
+    if (delay && args.some((arg) => arg.includes("/git/matching-refs/"))) {
+      pending.resolve();
+      await release.promise;
+    }
+    return github.gh(args);
+  }, repo: REPO });
+  const { assignmentId } = await workers.dispatch(ticketId);
+  await workers.drain();
+  delay = true;
+  assert.equal(workers.deliver(assignmentId, "follow-up", "Check the head", () => {}), true);
+  await pending.promise;
+  assert.equal(await workers.shutdown(1), false);
+  assert.equal(store.ticketTurns(ticketId).at(-1)?.status, "interrupted");
+  let lateTicketReads = 0;
+  const getTicket = store.getTicket.bind(store);
+  store.getTicket = (id) => { lateTicketReads++; return getTicket(id); };
+  store.close();
+  stores.splice(stores.indexOf(store), 1);
+  release.resolve();
+  await workers.drain();
+  assert.equal(lateTicketReads, 0);
+  assert.equal(runner.sessions[0]!.prompts.length, 1);
+});
+
+test("a stop records interruption now, starts no queued one, and leaves the assignment for recovery", async () => {
   const { store, runner, ticketId, workers, make } = fixture();
   runner.hold = true;
   await workers.dispatch(ticketId);
@@ -234,14 +501,18 @@ test("a stop cuts off the running turn, starts no queued one, and leaves the tur
   assert.deepEqual(runner.sessions[0]!.prompts.length, 1, "the queued turn never started");
   const a = store.getAssignment(1);
   assert.deepEqual([a.state, a.outcome, a.lastError], ["running", null, null]);
-  assert.notEqual(a.turnStartedAt, null, "the cut-off turn stays open");
+  assert.notEqual(a.turnStartedAt, null, "the assignment requests a recovery turn");
+  const stopped = store.ticketTurns(ticketId)[0]!;
+  assert.equal(stopped.status, "interrupted");
+  assert.equal(stopped.endedAt, "2026-11-09T12:00:00.000Z");
 
   runner.hold = false;
   const restarted = make();
   assert.deepEqual(restarted.recover().interrupted, [1]);
   await restarted.drain();
-  assert.deepEqual(runner.sessions.at(-1)!.prompts, [workerTurnPrompt(INTERRUPTED_PROMPT), workerTurnPrompt("next")]);
+  assert.deepEqual(runner.sessions.at(-1)!.prompts, [workerTurnPrompt(`${workerTurnPrompt(INTERRUPTED_PROMPT)}\n\n${workerTurnPrompt("next")}`)]);
   assert.equal(store.getAssignment(1).turnStartedAt, null);
+  assert.deepEqual(store.ticketTurns(ticketId).map((turn) => [turn.kind, turn.status]), [["dispatch", "interrupted"], ["recovery", "completed"]]);
 });
 
 function rollout(model: string | null, thread = "sess-1") {
@@ -279,15 +550,98 @@ test("Codex: a different model or an unreadable record ends the assignment with 
       assert.equal(a.state, "ended");
       assert.match(a.endReason!, reason);
       assert.equal(store.abandonedAssignments().length, 1, "the Router owes a reply");
+      const turn = store.ticketTurns(ticketId)[0]!;
+      assert.equal(turn.observedModel, model);
+      assert.equal(turn.status, "failed");
+      assert.equal(turn.result, a.endReason);
+      assert.equal(a.inputTokens, 10);
     } finally {
       rmSync(dir, { recursive: true });
     }
   }
 });
 
-test("Claude turns are not checked against a rollout", async () => {
-  const { store, ticketId, workers } = fixture({ codexSessions: "/does/not/exist" }, "claude");
+test("Codex model enforcement stays after budget and cancellation checks", async () => {
+  const dir = rollout(null);
+  try {
+    const { store, ticketId, workers } = fixture({ codexSessions: dir });
+    store.setTicketBudget(ticketId, { timeMinutes: 480, idleMinutes: 30, turns: 1, tokens: 1_000_000, escalations: 0 });
+    await workers.dispatch(ticketId);
+    await workers.drain();
+    assert.equal(store.getTicket(ticketId).pauseCause, "budget reached: turns");
+    assert.deepEqual(store.ticketTurns(ticketId).map((turn) => [turn.kind, turn.status]), [["dispatch", "completed"], ["budget_pause", "failed"]]);
+    assert.match(store.getAssignment(1).endReason!, /model unverified: no rollout record/);
+
+    const cancelled = fixture({ codexSessions: dir });
+    cancelled.runner.hold = true;
+    await cancelled.workers.dispatch(cancelled.ticketId);
+    cancelled.workers.cancel(1);
+    await cancelled.workers.drain();
+    assert.equal(cancelled.store.getAssignment(1).state, "running");
+    assert.equal(cancelled.store.ticketTurns(cancelled.ticketId)[0]!.status, "cancelled");
+  } finally { rmSync(dir, { recursive: true }); }
+});
+
+test("Claude records a resolved model without enforcing equality or checking a rollout", async () => {
+  const { store, ticketId, workers, runner } = fixture({ codexSessions: "/does/not/exist" }, "claude");
+  const start = runner.start.bind(runner);
+  runner.start = (options) => {
+    const session = start(options);
+    const send = session.send.bind(session);
+    session.send = async (prompt, signal) => ({ ...await send(prompt, signal), model: "claude-resolved-model-id" });
+    return session;
+  };
   await workers.dispatch(ticketId);
   await workers.drain();
   assert.equal(store.getAssignment(1).state, "running");
+  assert.equal(store.getAssignment(1).outcome, null);
+  const turn = store.ticketTurns(ticketId)[0]!;
+  assert.equal(turn.observedModel, "claude-resolved-model-id");
+  assert.equal(turn.status, "completed");
+  assert.equal(turn.result, "ok");
+});
+
+test("the session start writes one Semon annotation line, and a failed write is logged once without failing the turn", async () => {
+  const home = mkdtempSync(join(tmpdir(), "workers-annotations-"));
+  const saved = process.env["XDG_STATE_HOME"];
+  process.env["XDG_STATE_HOME"] = home;
+  try {
+    const { store, ticketId, workers } = fixture();
+    await workers.dispatch(ticketId);
+    await workers.drain();
+    const [line] = readFileSync(annotationsPath(process.env), "utf8").trim().split("\n").map((text) => JSON.parse(text) as Record<string, unknown>);
+    const { updated_at, ...rest } = line!;
+    assert.equal(typeof updated_at, "string");
+    assert.deepEqual(rest, {
+      v: 1, harness: "codex", native_id: "sess-1", system: "ostrom", repository: REPO, ticket: String(ticketId), issue: 7, pr: null, title: null,
+    });
+    assert.equal(store.getAssignment(1).outcome, null);
+  } finally {
+    if (saved === undefined) delete process.env["XDG_STATE_HOME"];
+    else process.env["XDG_STATE_HOME"] = saved;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("an annotation that cannot be written is logged once and the Worker turn still completes", async () => {
+  const home = mkdtempSync(join(tmpdir(), "workers-annotations-"));
+  const blocker = join(home, "state-is-a-file");
+  writeFileSync(blocker, "");
+  const saved = process.env["XDG_STATE_HOME"];
+  process.env["XDG_STATE_HOME"] = blocker;
+  try {
+    const logs: string[] = [];
+    const { store, runner, ticketId, workers } = fixture({ log: (line) => logs.push(line) });
+    runner.hold = true;
+    await workers.dispatch(ticketId);
+    runner.sessions[0]!.release();
+    await workers.drain();
+    assert.equal(logs.filter((line) => line.includes("could not append Semon annotation")).length, 1);
+    assert.equal(store.getAssignment(1).turns, 1);
+    assert.equal(store.getAssignment(1).outcome, null);
+  } finally {
+    if (saved === undefined) delete process.env["XDG_STATE_HOME"];
+    else process.env["XDG_STATE_HOME"] = saved;
+    rmSync(home, { recursive: true, force: true });
+  }
 });

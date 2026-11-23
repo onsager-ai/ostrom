@@ -4,7 +4,7 @@
 import { controlsLine } from "../commands/table.ts";
 import { replyMarker } from "./marker.ts";
 
-export type StatusCardState = "working" | "recovering" | "paused" | "stuck" | "waiting_to_merge" | "waiting_for_human_merge" | "done" | "stopped";
+export type StatusCardState = "working" | "blocked" | "recovering" | "paused" | "stuck" | "waiting_to_merge" | "waiting_for_human_merge" | "done" | "stopped" | "failed";
 
 export interface StatusCard {
   state: StatusCardState;
@@ -15,8 +15,13 @@ export interface StatusCard {
   /** The Worker's newest known checklist, in its order. Omit when it has not published one. */
   plan?: readonly string[];
   pullRequest?: string;
+  sessionUrl?: string;
   harness: "claude" | "codex";
   model: string;
+  pendingModel?: string;
+  effort?: string | null;
+  pendingEffort?: string | null;
+  selectionReason?: string;
   lastActivityAt: Date;
   now: Date;
   /** Stable outbox id, embedded to recognise and recover the card after a crash. */
@@ -25,6 +30,7 @@ export interface StatusCard {
 
 const STATE_LABEL: Record<StatusCardState, string> = {
   working: "Working",
+  blocked: "Blocked",
   recovering: "Recovering",
   paused: "Paused",
   stuck: "Stuck",
@@ -32,21 +38,26 @@ const STATE_LABEL: Record<StatusCardState, string> = {
   waiting_for_human_merge: "Waiting for a human merge",
   done: "Done",
   stopped: "Stopped",
+  failed: "Failed",
 };
 
 /** Renders the exact Markdown stored in and edited on the GitHub status-card comment. */
 export function renderStatusCard(card: StatusCard): string {
   const lines = [`## Ostrom: ${card.stoppedReason === "issue closed" ? "Stopped: issue closed" : STATE_LABEL[card.state]}`];
+  if (card.state === "blocked") lines.push("", "Waiting for direction.");
   if (card.plan !== undefined && card.plan.length > 0) {
     lines.push("", "### Plan", ...card.plan.map((item) => `- [ ] ${item}`));
   }
   if (card.pullRequest !== undefined) lines.push("", `PR: ${card.pullRequest}`);
+  if (card.sessionUrl !== undefined) lines.push(`Session: [View in Semon](${card.sessionUrl})`);
   if (card.budgetWarning !== undefined) lines.push("", `Warning: budget at 80% — ${card.budgetWarning}`);
   if (card.pauseCause !== undefined) lines.push("", `Paused: ${card.pauseCause}`);
   if (card.mergeStatus !== undefined) lines.push("", `Merge: ${card.mergeStatus}`);
   lines.push(
     "",
-    `Harness: \`${card.harness}\` · Model: \`${card.model}\``,
+    `Harness: \`${card.harness}\` · Model: \`${card.model}\`${card.pendingModel === undefined ? "" : ` (${card.pendingModel} from the next session)`}`,
+    ...(card.effort === undefined ? [] : [`Effort: \`${card.effort ?? "harness default"}\`${card.pendingEffort === undefined ? "" : ` (${card.pendingEffort} from the next turn)`}`]),
+    ...(card.selectionReason === undefined ? [] : [`Selection: ${card.selectionReason}`]),
     `Last activity: ${utcMinute(card.lastActivityAt)}`,
     controlsLine(),
     "",

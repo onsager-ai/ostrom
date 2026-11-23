@@ -58,6 +58,8 @@ export function parseStuckReply(text: string, cause: string): StuckReply {
 export async function advanceStuckLadder(store: Store, workers: Workers): Promise<{ recovered: number[]; published: number[] }> {
   const result = { recovered: [] as number[], published: [] as number[] };
   for (const stall of store.unansweredStalls()) {
+    const ticket = store.getTicket(store.getAssignment(stall.assignmentId).ticketId);
+    if (ticket.state !== "open") continue;
     if (stall.recoveryAttempts < 2 && stall.publicAt === null) {
       const started = store.beginStallRecovery(stall.id);
       if (started === null) continue;
@@ -85,7 +87,7 @@ async function publish(store: Store, workers: Workers, stall: Stall): Promise<vo
   const assignment = store.getAssignment(stall.assignmentId);
   const context = store.ticketContext(assignment.ticketId);
   store.publishStall(stall.id);
-  if (store.getTicket(assignment.ticketId).state === "open") store.pauseTicket(assignment.ticketId);
+  if (store.getTicket(assignment.ticketId).state === "open") store.pauseTicket(assignment.ticketId, "stuck turn reported by the Watchdog");
   workers.cancel(assignment.id);
   workers.deliver(
     assignment.id,

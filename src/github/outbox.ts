@@ -5,6 +5,7 @@
 import type { Reply, Store } from "../store/store.ts";
 import { ghGet, sinceParam, type GhRunner } from "./gh.ts";
 import { replyMarker } from "./marker.ts";
+import { publicReplyBody } from "./public-reply.ts";
 
 export interface SendOptions {
   store: Store;
@@ -104,7 +105,8 @@ async function postCommentBatch(replies: readonly Reply[], options: SendOptions,
     // A rendered status card already carries its marker, so later edits keep it; add one only when missing.
     const body = remaining.map((reply) => {
       const marker = replyMarker(reply.id);
-      return reply.body.includes(marker) ? reply.body : `${reply.body}\n\n${marker}`;
+      const publicBody = publicReplyBody(store, reply.threadId, reply.body);
+      return publicBody.includes(marker) ? publicBody : `${publicBody}\n\n${marker}`;
     }).join("\n\n---\n\n");
     const posted = JSON.parse(await gh(["api", "--method", "POST", `repos/${repo}/issues/${number}/comments`, "-f", `body=${body}`])) as { id?: unknown };
     for (const reply of remaining) {
@@ -124,7 +126,7 @@ async function postCommentBatch(replies: readonly Reply[], options: SendOptions,
 async function sendOne(reply: Reply, options: SendOptions, result: SendResult): Promise<void> {
   try {
     if (reply.kind === "edit") {
-      await options.gh(["api", "--method", "PATCH", cardPath(options.repo, reply), "-f", `body=${reply.body}`]);
+      await options.gh(["api", "--method", "PATCH", cardPath(options.repo, reply), "-f", `body=${publicReplyBody(options.store, reply.threadId, reply.body)}`]);
     } else if (reply.kind === "reaction") {
       await options.gh(["api", "--method", "POST", reactionPath(options.repo, reply), "-f", `content=${reply.reaction!}`]);
     } else {

@@ -7,9 +7,10 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { test } from "node:test";
-import type { SDKResultSuccess, SDKSystemMessage } from "@anthropic-ai/claude-agent-sdk";
-import { Codex, type AgentMessageItem, type ItemCompletedEvent, type ThreadStartedEvent, type TurnCompletedEvent } from "@openai/codex-sdk";
+import type { Options, SDKMessage, SDKResultSuccess, SDKSystemMessage } from "@anthropic-ai/claude-agent-sdk";
+import { Codex, type AgentMessageItem, type ItemCompletedEvent, type ThreadOptions, type ThreadStartedEvent, type TurnCompletedEvent, type TurnOptions } from "@openai/codex-sdk";
 import { sessionConfig } from "./config.ts";
+import { claudeRunner, codexRunner } from "./runner.ts";
 
 // The fixture projections are the fields the runner reads. Referencing SDK types
 // here makes removal or type changes in those fields a compile-time failure.
@@ -60,6 +61,75 @@ test("pinned Codex SDK applies provider overrides to start and resume before ses
       await assert.rejects(run("openai", resume), /Not inside a trusted directory/);
     }
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("effort options retain the pinned SDK names and values across same-session resumes", async () => {
+  const claudeCalls: Options[] = [];
+  const run = async function* (input: Parameters<typeof import("@anthropic-ai/claude-agent-sdk").query>[0]): AsyncGenerator<SDKMessage> {
+    claudeCalls.push(input.options!);
+    yield* fixture("claude") as SDKMessage[];
+  };
+  const claude = claudeRunner({}, run).resume({ cwd: "/tmp", model: "haiku", sessionId: "claude-id", effort: "low" });
+  await claude.send("first");
+  await claude.send("next", undefined, "max");
+  await claude.send("default", undefined, null);
+  assert.deepEqual(claudeCalls.map((options) => options.effort), ["low", "max", undefined]);
+  assert.equal("effort" in claudeCalls[2]!, false);
+
+  const calls: { id: string | null; options: ThreadOptions }[] = [];
+  const thread = { runStreamed: async () => ({ events: (async function* () { yield* fixture("codex") as import("@openai/codex-sdk").ThreadEvent[]; })() }) };
+  const client = {
+    startThread: (options: ThreadOptions) => { calls.push({ id: null, options }); return thread; },
+    resumeThread: (id: string, options: ThreadOptions) => { calls.push({ id, options }); return thread; },
+  } as unknown as Pick<Codex, "startThread" | "resumeThread">;
+  const codex = codexRunner({}, () => client).resume({ cwd: "/tmp", model: "luna", sessionId: "codex-id", effort: "minimal" });
+  await codex.send("first");
+  await codex.send("next", undefined, "xhigh");
+  await codex.send("default", undefined, null);
+  assert.deepEqual(calls.map(({ options }) => options.modelReasoningEffort), ["minimal", "xhigh", undefined]);
+  assert.equal(calls[0]!.id, "codex-id");
+  assert.ok(calls.every(({ id }) => id !== null));
+  assert.equal("modelReasoningEffort" in calls[2]!.options, false);
+});
+
+test("pinned SDK cancellation uses Claude abortController and Codex turn signal", async () => {
+  const stop = new AbortController();
+  let claudeSignal: AbortSignal | undefined;
+  let activity = 0;
+  const run = async function* (input: Parameters<typeof import("@anthropic-ai/claude-agent-sdk").query>[0]): AsyncGenerator<SDKMessage> {
+    const options: Pick<Options, "abortController"> = input.options!;
+    claudeSignal = options.abortController!.signal;
+    yield (fixture("claude") as SDKMessage[])[0]!;
+    await new Promise<void>((resolve) => {
+      claudeSignal!.addEventListener("abort", () => resolve(), { once: true });
+      stop.abort();
+    });
+    throw new Error("SDK aborted");
+  };
+  const claude = claudeRunner({}, run).start({ cwd: "/tmp", model: "haiku", onActivity: () => { activity++; } });
+  assert.equal((await claude.send("work", stop.signal)).status, "cancelled");
+  assert.equal(claudeSignal!.aborted, true);
+  assert.equal(activity, 1);
+
+  const codexStop = new AbortController();
+  let codexSignal: TurnOptions["signal"];
+  const thread = { runStreamed: async (_prompt: string, options?: TurnOptions) => {
+    codexSignal = options?.signal;
+    return { events: (async function* (): AsyncGenerator<import("@openai/codex-sdk").ThreadEvent> {
+      yield { type: "thread.started", thread_id: "id" };
+      await new Promise<void>((resolve) => {
+        codexSignal!.addEventListener("abort", () => resolve(), { once: true });
+        codexStop.abort();
+      });
+      throw new Error("SDK aborted");
+    })() };
+  } };
+  const client = { startThread: () => thread, resumeThread: () => thread } as unknown as Pick<Codex, "startThread" | "resumeThread">;
+  const codex = codexRunner({}, () => client).start({ cwd: "/tmp", model: "luna", onActivity: () => { activity++; } });
+  assert.equal((await codex.send("work", codexStop.signal)).status, "cancelled");
+  assert.equal(codexSignal, codexStop.signal);
+  assert.equal(codexSignal!.aborted, true);
+  assert.equal(activity, 2);
 });
 
 function fixture(name: string): unknown {

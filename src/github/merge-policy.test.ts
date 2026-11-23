@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { countApprovals, effectiveReviews, mergeEligibility, type EligibilityInput } from "./merge-policy.ts";
 import { readMergeEvidence, type MergeEvidence, type MergeReview } from "./merge-reader.ts";
 
-const review = (id: string, state: string, commitOid = "head", author = "alice"): MergeReview => ({ id, state, submittedAt: "2026-11-10T00:00:00Z", author: { id: `U_${author}`, login: author, type: "User" }, commitOid });
+const review = (id: string, state: string, commitOid = "head", author = "alice"): MergeReview => ({ id, state, submittedAt: "2026-11-10T00:00:00Z", author: { id: `U_${author}`, login: author, type: "User" }, commitOid, body: "", inlineComments: 0 });
 
 function evidence(): MergeEvidence {
   return {
@@ -90,7 +90,12 @@ test("eligibility reports every blocker in design order", () => {
   const cases: [string, (value: ReturnType<typeof input>) => void][] = [
     ["local work is not mergeable", (v) => { v.local.issueOpen = false; }],
     ["Worker is not idle", (v) => { v.local.workerIdle = false; }],
-    ["pull request is not clean at the captured head and base", (v) => { v.evidence.pr.draft = true; }],
+    ["pull request state is CLOSED", (v) => { v.evidence.pr.state = "CLOSED"; }],
+    ["pull request is a draft", (v) => { v.evidence.pr.draft = true; }],
+    ["pull request head moved from head to new-head", (v) => { v.evidence.pr.head.sha = "new-head"; }],
+    ["pull request base moved from base to new-base", (v) => { v.evidence.pr.base.sha = "new-base"; }],
+    ["pull request mergeable=CONFLICTING", (v) => { v.evidence.pr.mergeable = "CONFLICTING"; }],
+    ["pull request mergeStateStatus=DIRTY", (v) => { v.evidence.pr.mergeStateStatus = "DIRTY"; }],
     ["pull request head is from a fork", (v) => { v.evidence.pr.head.repository = "fork/r"; }],
     ["CI rollup is not successful for the captured head", (v) => { v.evidence.rollup!.state = "FAILURE"; }],
     ["no successful pull_request workflow is evidenced for this PR", (v) => { v.evidence.rollup!.suites = []; }],
@@ -141,6 +146,18 @@ test("newer failed workflow cannot be masked by old success and suite provenance
     const value = input(); value.evidence.rollup!.suites = [suite];
     assert.equal(mergeEligibility(value).eligible, false);
   }
+});
+
+test("approval policy distinguishes stale, current, and absent approvals", () => {
+  const value = input();
+  value.policy = { strategy: "approvals", approvals: 1, approvers: [] };
+  value.approvals = { authorLogin: "author", identities: new Map([["U_alice", { id: "U_alice", login: "alice", permission: "write", bot: false }]]) };
+  value.evidence.reviews = [review("old", "APPROVED", "0123456789abcdef")];
+  assert.deepEqual(mergeEligibility(value), { eligible: false, reason: "Approved on 0123456; the head is now head. Approve again to merge." });
+  value.evidence.reviews = [review("current", "APPROVED")];
+  assert.deepEqual(mergeEligibility(value), { eligible: true });
+  value.evidence.reviews = [];
+  assert.deepEqual(mergeEligibility(value), { eligible: false, reason: "policy approvals are not satisfied" });
 });
 
 test("approval and human policies are blockers", () => {

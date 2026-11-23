@@ -14,15 +14,22 @@ export interface CommentInput {
 export type IssueInput = Partial<CommentInput>;
 
 export class FakeGitHub {
-  readonly repo = "onsager-ai/ostrom";
+  /** REST and GraphQL merge evidence for merge-pass tests. */
+  readonly mergePulls = new Map<number, { pull: Item; evidence: Item }>();
+  readonly mergeProtection: Item = {};
+  readonly mergeRules: Item[] = [];
+  readonly workflowRuns: Item[] = [];
+  readonly workflowJobs = new Map<number, Item[]>();
   readonly issueComments: Item[] = [];
   readonly reviewComments: Item[] = [];
   readonly issues = new Map<number, Item>();
   readonly reviews = new Map<number, Item[]>();
+  readonly requestedReviewers = new Map<number, string[]>();
   readonly issueEvents = new Map<number, Item[]>();
   readonly permissions = new Map<string, string>();
-  /** Pull requests served by `pulls?head=`: head branch, number, state. */
-  readonly pulls: { branch: string; number: number; state: "open" | "closed" | "merged" }[] = [];
+  readonly branchHeads = new Map<string, string>();
+  /** Pull requests served by `pulls?head=`: head branch, number, state, draft flag and body. */
+  readonly pulls: { branch: string; number: number; state: "open" | "closed" | "merged"; draft?: boolean; body?: string }[] = [];
   readonly calls: string[][] = [];
   /** Throw this from the next call whose argv matches. */
   failWhen: ((args: readonly string[]) => Error | undefined) | undefined;
@@ -31,8 +38,11 @@ export class FakeGitHub {
   #ids = 1000;
   readonly #now: () => Date;
 
-  constructor(now: () => Date) {
+  readonly repo: string;
+
+  constructor(now: () => Date, repo = "onsager-ai/ostrom") {
     this.#now = now;
+    this.repo = repo;
   }
 
   issue(number: number, pr = false, input: IssueInput = {}): void {
@@ -128,7 +138,18 @@ export class FakeGitHub {
     this.calls.push([...args]);
     const failure = this.failWhen?.(args);
     if (failure) throw failure;
-    const [api, flag, method, path, ...rest] = args;
+    if (args[0] === "api" && args[1] === "graphql") {
+      const number = Number(args.find((arg) => arg.startsWith("number="))?.slice(7));
+      const pull = this.mergePulls.get(number);
+      if (!pull) throw new Error(`fake gh: no merge evidence for #${number}`);
+      return JSON.stringify({ data: { repository: { pullRequest: pull.evidence } } });
+    }
+    // Merge reads pin the REST API version with a header before --method.
+    const request = [...args];
+    for (let index = 1; index < request.length; index++) {
+      if (request[index] === "-H") request.splice(index--, 2);
+    }
+    const [api, flag, method, path, ...rest] = request;
     if (api !== "api" || flag !== "--method" || path === undefined) throw new Error(`fake gh: ${args.join(" ")}`);
     if (method === "POST") return JSON.stringify(this.#post(path, rest));
     if (method === "PATCH") return JSON.stringify(this.#patch(path, rest));
@@ -143,6 +164,12 @@ export class FakeGitHub {
     const route = path.slice(`repos/${this.repo}/`.length);
     let match: RegExpMatchArray | null;
     let found: Item | undefined;
+    if (path === `repos/${this.repo}`) return { allow_squash_merge: true };
+    if (/^branches\/[^/]+\/protection$/.test(route)) return this.mergeProtection;
+    if ((match = route.match(/^pulls\/(\d+)$/))) {
+      const pull = this.mergePulls.get(Number(match[1]));
+      if (pull) return pull.pull;
+    }
     if ((match = route.match(/^collaborators\/([^/]+)\/permission$/))) {
       return permissionBody(this.permissions.get(decodeURIComponent(match[1]!)) ?? "none");
     } else if ((match = route.match(/^issues\/(\d+)$/))) {
@@ -160,12 +187,27 @@ export class FakeGitHub {
     return found;
   }
 
-  #get(path: string): Item[] {
+  #get(path: string): Item[] | Item {
     const url = new URL(`https://api.github.com/${path}`);
     const q = url.searchParams;
     const prefix = `/repos/${this.repo}/`;
     if (!url.pathname.startsWith(prefix)) throw new Error(`fake gh: unknown repo in ${path}`);
     const route = url.pathname.slice(prefix.length);
+    if (route === "actions/runs") {
+      const runs = this.workflowRuns.filter((run) => run["head_branch"] === q.get("branch") && run["status"] === q.get("status"));
+      return { total_count: runs.length, workflow_runs: runs.slice(0, Number(q.get("per_page"))) };
+    }
+    const runJobs = route.match(/^actions\/runs\/(\d+)\/jobs$/);
+    if (runJobs) {
+      const jobs = this.workflowJobs.get(Number(runJobs[1])) ?? [];
+      return { total_count: jobs.length, jobs: jobs.slice(0, Number(q.get("per_page"))) };
+    }
+    if (/^rules\/branches\/[^/]+$/.test(route)) return this.mergeRules;
+    if (route.startsWith("git/matching-refs/heads/")) {
+      const branch = decodeURIComponent(route.slice("git/matching-refs/heads/".length));
+      return [...this.branchHeads].filter(([name]) => name.startsWith(branch))
+        .map(([name, sha]) => ({ ref: `refs/heads/${name}`, object: { sha } }));
+    }
     const permission = route.match(/^collaborators\/([^/]+)\/permission$/);
     if (permission) return [permissionBody(this.permissions.get(decodeURIComponent(permission[1]!)) ?? "none")];
     let items: Item[];
@@ -179,11 +221,16 @@ export class FakeGitHub {
         .map((pull) => ({
           number: pull.number,
           html_url: this.#threadUrl(pull.number, true),
+          body: pull.body ?? "",
+          head: this.mergePulls.get(pull.number)?.pull["head"],
           state: pull.state === "open" ? "open" : "closed",
+          draft: pull.draft ?? false,
           merged_at: pull.state === "merged" ? "2026-11-09T12:00:00Z" : null,
         }));
     } else if (route === "issues") items = [...this.issues.values()];
     else if ((match = route.match(/^issues\/(\d+)\/events$/))) items = this.issueEvents.get(Number(match[1])) ?? [];
+    else if ((match = route.match(/^pulls\/(\d+)\/reviews\/(\d+)\/comments$/))) items = this.reviewComments.filter((comment) => comment["pull_request_review_id"] === Number(match![2]));
+    else if ((match = route.match(/^pulls\/(\d+)\/comments$/))) items = this.reviewComments.filter((comment) => (comment["pull_request_url"] as string).endsWith(`/pulls/${match![1]}`));
     else if ((match = route.match(/^pulls\/(\d+)\/reviews$/))) items = this.reviews.get(Number(match[1])) ?? [];
     else if ((match = route.match(/^issues\/(\d+)\/comments$/))) items = this.commentsOn(Number(match[1]));
     else throw new Error(`fake gh: no route ${route}`);
@@ -205,7 +252,14 @@ export class FakeGitHub {
   #post(path: string, rest: string[]): Item {
     const issue = path.match(new RegExp(`^repos/${this.repo}/issues/(\\d+)/comments$`));
     const reaction = path.match(new RegExp(`^repos/${this.repo}/(issues/comments|pulls/comments)/(\\d+)/reactions$`));
+    const request = path.match(new RegExp(`^repos/${this.repo}/pulls/(\\d+)/requested_reviewers$`));
     const [flag, field] = rest;
+    if (request && flag === "-f" && field?.startsWith("reviewers[]=")) {
+      const number = Number(request[1]);
+      const reviewer = field.slice("reviewers[]=".length);
+      this.requestedReviewers.set(number, [...(this.requestedReviewers.get(number) ?? []), reviewer]);
+      return { reviewers: this.requestedReviewers.get(number) };
+    }
     if (issue && flag === "-f" && field?.startsWith("body=")) {
       return this.comment(Number(issue[1]), { login: "operator", body: field.slice("body=".length), at: this.#now() });
     }
@@ -214,8 +268,15 @@ export class FakeGitHub {
   }
 
   #patch(path: string, rest: string[]): Item {
+    const pull = path.match(new RegExp(`^repos/${this.repo}/pulls/(\\d+)$`));
     const match = path.match(new RegExp(`^repos/${this.repo}/issues/comments/(\\d+)$`));
     const [flag, field] = rest;
+    if (pull && flag === "-f" && field?.startsWith("body=")) {
+      const pr = this.pulls.find((item) => item.number === Number(pull[1]));
+      if (pr === undefined) throw new Error("gh api failed: gh: Not Found (HTTP 404)");
+      pr.body = field.slice("body=".length);
+      return { number: pr.number, body: pr.body };
+    }
     if (!match || flag !== "-f" || !field?.startsWith("body=")) throw new Error(`fake gh: PATCH ${path}`);
     const comment = this.issueComments.find((item) => item["id"] === Number(match[1]));
     if (comment === undefined) throw new Error("gh api failed: gh: Not Found (HTTP 404)");

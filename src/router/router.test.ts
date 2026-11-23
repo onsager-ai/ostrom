@@ -7,6 +7,7 @@ import { Store } from "../store/store.ts";
 import { FakeRunner } from "../worker/fake-runner.ts";
 import { routeFollowUps } from "../worker/follow-up.ts";
 import { Workers } from "../worker/workers.ts";
+import { chooseEffort } from "./selection.ts";
 import {
   bodyPath,
   parseRouterAnswer,
@@ -44,8 +45,8 @@ const NOW = new Date("2026-11-09T12:00:00.000Z");
 function setup(dbPath = ":memory:") {
   const now = () => NOW;
   const github = new FakeGitHub(now);
-  github.issue(7);
-  github.issue(8);
+  github.issue(7, false, { body: "Issue seven body" });
+  github.issue(8, false, { body: "Issue eight body" });
   const runner = new FakeRunner();
   let answer: (batch: Batch) => RouterAnswer | string = acceptAll;
   const start = runner.start.bind(runner);
@@ -72,7 +73,7 @@ function setup(dbPath = ":memory:") {
     runners: { claude: runner, codex: runner },
   });
   const comment = (body: string, minute = 58, issue = 7) =>
-    github.comment(issue, { login: "alice", body, at: new Date(`2026-11-09T11:${minute}:00Z`) });
+    github.comment(issue, { login: "alice", body: `@ostrom ${body}`, at: new Date(`2026-11-09T11:${minute}:00Z`) });
   const poll = () => pollOnce({ store, gh: github.gh, repo: github.repo, allowlist: ["alice"], now });
   const reopen = () => {
     store.close();
@@ -102,19 +103,66 @@ const pr = (number: number, state: string) => ({
   state,
 });
 
+test("Router includes bounded repository history for allowed models and preserves it for replay", async () => {
+  const s = setup();
+  const store = s.store();
+  store.models.discovered("codex", ["allowed", "removed"].map((id) => ({ harness: "codex", id, displayName: id, description: "", efforts: ["medium"], defaultEffort: "medium" })));
+  store.models.change({ action: "allow", harness: "codex", model: "allowed" });
+  const seed = (repository: string, model: string, kind: string, number: number) => {
+    const source = store.ensureSource("github", repository);
+    const threadId = store.ensureThread({ sourceId: source.id, kind: "issue", number, url: "https://example.test/issue" });
+    const ticketId = store.recordDecision({ threadId, triggerIds: [], verdict: "accept", reason: "past work" }).ticketId!;
+    const id = store.createAssignment(ticketId);
+    store.configureNativeAssignment(id, { harness: "codex", model, worktree: "/tmp/work", branch: "past", machine: "test" });
+    store.startNativeAssignment(id, `past-${id}`);
+    store.startWorkerTurn(id, kind);
+    store.finishWorkerTurn(id, "failed", { inputTokens: 10, cachedInputTokens: 100, outputTokens: 5 });
+    store.endAssignment(id);
+    store.endTicket(ticketId);
+  };
+  for (let index = 0; index < 26; index++) seed(s.github.repo, "allowed", `kind-${String(index).padStart(2, "0")}`, 100 + index);
+  seed(s.github.repo, "removed", "dispatch", 200);
+  seed("other/repo", "allowed", "dispatch", 201);
+  s.comment("fix the typo");
+  await s.poll();
+  const pass = await routeCandidates(s.options());
+  const payload = JSON.parse(s.routerSessions()[0]!.prompts[0]!.split("The batch:\n")[1]!);
+  assert.equal(payload.selection.history.rows.length, 24);
+  assert.equal(payload.selection.history.omittedRows, 2);
+  assert.ok(payload.selection.history.rows.every((row: { repository: string; model: string }) => row.repository === s.github.repo && row.model === "allowed"));
+  assert.equal(payload.selection.history.rows[0].medianFreshTokens, 15);
+  assert.deepEqual(JSON.parse(store.selections.current(pass.decisions[0]!.ticketId!, "model")!.input).selection, payload.selection);
+});
+
+test("Router explicitly describes cold start when there is no outcome history", async () => {
+  const s = setup();
+  s.comment("fix the typo");
+  await s.poll();
+  await routeCandidates(s.options());
+  const prompt = s.routerSessions()[0]!.prompts[0]!;
+  const payload = JSON.parse(prompt.split("The batch:\n")[1]!);
+  assert.deepEqual(payload.selection.history.rows, []);
+  assert.equal(payload.selection.history.omittedRows, 0);
+  assert.match(payload.selection.history.note, /No outcome history.*cheapest model and a moderate effort/);
+});
+
 test("an opened issue reaches the Router with its current body", async () => {
   const s = setup();
   s.github.issue(9, false, { login: "alice", body: "@ostrom please fix this", at: new Date("2026-11-09T11:58:00Z") });
+  s.github.issues.get(9)!["title"] = "Issue nine title";
   await s.poll();
   await routeCandidates(s.options());
 
-  const [candidate] = batchOf(s.routerSessions()[0]!.prompts[0]!).threads[0]!.candidates;
+  const thread = batchOf(s.routerSessions()[0]!.prompts[0]!).threads[0]!;
+  const [candidate] = thread.candidates;
+  assert.deepEqual([thread.title, thread.bodyExcerpt, thread.bodyTruncated], ["Issue nine title", "@ostrom please fix this", false]);
   assert.deepEqual([candidate!.kind, candidate!.excerpt], ["issue_opened", "@ostrom please fix this"]);
 });
 
 test("an accept records a ticket, dispatches a Worker and queues the Router's acknowledgement", async () => {
   const s = setup();
   s.comment("please fix the typo in the README");
+  s.github.issues.get(7)!["title"] = "README typo";
   await s.poll();
   const pass = await routeCandidates(s.options());
 
@@ -123,7 +171,9 @@ test("an accept records a ticket, dispatches a Worker and queues the Router's ac
   assert.equal(session?.options.sandbox, "read-only");
   assert.equal(session?.options.model, "gpt-6-luna");
   const sent = batchOf(session!.prompts[0]!);
-  assert.equal(sent.threads[0]?.candidates[0]?.excerpt, "please fix the typo in the README");
+  assert.equal(sent.threads[0]?.candidates[0]?.excerpt, "@ostrom please fix the typo in the README");
+  assert.deepEqual([sent.threads[0]?.title, sent.threads[0]?.bodyExcerpt], ["README typo", "Issue seven body"]);
+  assert.equal(s.github.calls.filter((args) => args[3] === `repos/${s.github.repo}/issues/7`).length, 1);
 
   assert.equal(pass.decisions.length, 1);
   const decision = pass.decisions[0]!;
@@ -143,6 +193,39 @@ test("an accept records a ticket, dispatches a Worker and queues the Router's ac
   const again = await routeCandidates(s.options());
   assert.equal(again.router, null);
   assert.equal(s.routerSessions().length, 1);
+});
+
+test("start comment effort override is recorded before the first Worker turn", async () => {
+  const s = setup();
+  s.store().models.discovered("codex", [{ harness: "codex", id: "gpt-6-luna", displayName: "Luna", description: "", efforts: ["low", "medium", "high"], defaultEffort: "medium" }]);
+  s.store().models.change({ action: "allow", harness: "codex", model: "gpt-6-luna" });
+  s.github.issue(9, false, { login: "alice", body: "@ostrom please take this issue.\n@ostrom effort high", at: new Date("2026-11-09T11:58:00Z") });
+  await s.poll();
+  const pass = await routeCandidates(s.options());
+  const ticketId = pass.decisions[0]!.ticketId!;
+  assert.equal(s.store().ticketContext(ticketId).thread.number, 9);
+  const assignment = s.store().latestAssignment(ticketId)!;
+  const chosen = await chooseEffort({ store: s.store(), assignmentId: assignment.id, prompt: "first turn", kind: "dispatch", router, runners: { claude: s.runner, codex: s.runner }, signal: new AbortController().signal });
+  assert.equal(chosen.effort, "high");
+  assert.equal(s.store().selections.current(ticketId, "effort")?.source, "override");
+  assert.equal(s.store().selections.current(ticketId, "effort")?.reason, "Effort override: high. Applies from this turn and holds until changed.");
+  const threadId = s.store().ticketContext(ticketId).thread.id;
+  assert.equal(s.store().dueReplies().some((reply) => reply.id.startsWith("selection-") && reply.body.includes("Effort override: high")), false);
+  assert.match(s.store().statusCardBody(threadId)!, /Selection: Effort override: high\. Applies from this turn and holds until changed\./);
+  assert.doesNotMatch(s.store().statusCardBody(threadId)!, /high from the next turn/);
+});
+
+test("invalid start comment model replies with refusal and keeps Router's model", async () => {
+  const s = setup();
+  s.store().models.discovered("codex", [{ harness: "codex", id: "gpt-6-luna", displayName: "Luna", description: "", efforts: ["low", "medium", "high"], defaultEffort: "medium" }]);
+  s.store().models.change({ action: "allow", harness: "codex", model: "gpt-6-luna" });
+  s.comment("@ostrom please take this issue. @ostrom use missing/model");
+  await s.poll();
+  const pass = await routeCandidates(s.options());
+  const ticketId = pass.decisions[0]!.ticketId!;
+  assert.equal(s.store().selections.current(ticketId, "model")?.value, "codex/gpt-6-luna");
+  assert.ok(s.store().dueReplies().some((reply) => reply.body.includes("Override refused")));
+  assert.deepEqual(pass.dispatched.map((item) => item.ticketId), [ticketId]);
 });
 
 test("an ignore is recorded with no ticket, no Worker and no reply", async () => {
@@ -194,6 +277,9 @@ test("the answer must decide each candidate once, on its thread, and answer exac
         kind: "issue",
         number: 7,
         url: "u",
+        title: "Issue",
+        bodyExcerpt: "Body",
+        bodyTruncated: false,
         candidates: [
           { trigger: 10, kind: "issue_comment", actor: "a", url: "u", occurredAt: "t", excerpt: "x", truncated: false },
           { trigger: 11, kind: "issue_comment", actor: "a", url: "u", occurredAt: "t", excerpt: "y", truncated: false },
@@ -347,6 +433,58 @@ test("each outcome gets one reply, and a merged PR ends the assignment and the t
   assert.match(card.body, /^## Ostrom: Done$/m);
 });
 
+test("the Router queues a ready reply once when a draft PR becomes ready", async () => {
+  const s = setup();
+  const store = s.store();
+  const options = { ...s.options(), mergePolicy: { strategy: "human" as const } };
+  s.comment("please fix the typo");
+  await s.poll();
+  const first = await routeCandidates(options);
+  const { assignmentId, branch, ticketId } = first.dispatched[0]!;
+  const draft = { branch, number: 12, state: "open" as const, draft: true };
+  s.github.pulls.push(draft);
+  const replyId = `outcome-a${assignmentId}-pr12-opened`;
+
+  assert.deepEqual((await routeCandidates(options)).outcomes, []);
+  assert.equal(store.hasReply(replyId), false);
+  assert.equal(store.readyReplyId(assignmentId), null);
+
+  draft.draft = false;
+  assert.deepEqual((await routeCandidates(options)).outcomes, [
+    { key: replyId, event: "pr_opened", ticketId, ticketEnded: false },
+  ]);
+  assert.equal(store.readyReplyId(assignmentId), replyId);
+  assert.equal((await routeCandidates(options)).router, null);
+  assert.deepEqual(store.dueReplies().filter((reply) => reply.id.startsWith("outcome-")).map((reply) => reply.body), [
+    "Update: pr_opened\n\nOstrom is waiting for a human merge.",
+  ]);
+});
+
+test("a failed Worker outcome retains its subscribed PR and renders a Failed card", async () => {
+  const s = setup();
+  s.comment("please fix the typo");
+  await s.poll();
+  const first = await routeCandidates(s.options());
+  const ticketId = first.decisions[0]!.ticketId!;
+  const assignment = s.store().latestAssignment(ticketId)!;
+  const thread = s.store().ensureThread({ sourceId: s.store().ticketContext(ticketId).thread.sourceId,
+    kind: "pull_request", number: 33, url: pr(33, "open").url });
+  s.store().subscribe(ticketId, thread);
+  s.github.pulls.push({ branch: assignment.branch!, number: 33, state: "open" });
+  s.store().recordTurnError(assignment.id, "provider exhausted retries");
+  s.store().recordOutcome(assignment.id, "failed");
+
+  await routeCandidates(s.options());
+  const outcome = batchOf(s.routerSessions().at(-1)!.prompts[0]!).outcomes.find((item) => item.event === "failed")!;
+  assert.equal(outcome.pullRequest, pr(33, "open").url);
+  assert.equal(outcome.detail, "provider exhausted retries");
+  assert.equal(s.store().getTicket(ticketId).state, "ended");
+  const card = s.store().dueReplies().find((reply) => reply.id.startsWith("card-thread-"))!;
+  assert.match(card.body, /^## Ostrom: Failed$/m);
+  assert.match(card.body, /PR: https:\/\/github.com\/onsager-ai\/ostrom\/pull\/33/);
+  assert.equal(s.store().operatorTickets()[0]!.latestFailure?.summary, "provider exhausted retries");
+});
+
 test("a Worker that failed to start gets one failure reply, and its ticket ends", async () => {
   const s = setup();
   s.comment("please fix the typo");
@@ -441,12 +579,16 @@ test("a trigger's body is fetched by the id in its URL", () => {
 
 test("a comment deleted since intake reaches the Router as deleted; long bodies are cut", async () => {
   const s = setup();
+  s.github.issues.get(7)!["body"] = "x".repeat(2500);
   const gone = s.comment("short-lived", 57);
   s.comment("x".repeat(1000), 58);
   await s.poll();
   s.github.issueComments.splice(s.github.issueComments.indexOf(gone), 1);
   await routeCandidates(s.options());
-  const [deleted, long] = batchOf(s.routerSessions()[0]!.prompts[0]!).threads[0]!.candidates;
+  const thread = batchOf(s.routerSessions()[0]!.prompts[0]!).threads[0]!;
+  const [deleted, long] = thread.candidates;
+  assert.equal(thread.bodyExcerpt.length, 2000);
+  assert.equal(thread.bodyTruncated, true);
   assert.match(deleted!.excerpt, /deleted from GitHub/);
   assert.equal(long!.truncated, true);
   assert.equal(long!.excerpt.length, 601);

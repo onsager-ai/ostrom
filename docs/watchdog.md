@@ -18,6 +18,12 @@ Workers are driven turn by turn, so Semon's verdicts are read against the turn. 
 
 A stall opens one `stall` row and remains one episode until Semon no longer reports it. The Router sees each unanswered, uncleared episode once and answers `wait` or `stop`; a stop needs a reply and ends the assignment only after that Router answer.
 
+Budget exhaustion pauses with `budget reached: <limit>` and never opens a stall or advances the
+stuck ladder. Extending the exhausted budget resumes the ticket only when every limit clears;
+operator pauses remain paused. Public stalls clear through operator resume or an allowlisted human
+comment or review, even if the ticket has already reopened or ended. A reply resumes only a pause
+caused by the public stall; other pause causes remain in force.
+
 ## Scripted stall
 
 Semon reports a completed Codex exec turn as `ended`, not `waiting-question`, even when its last
@@ -25,15 +31,15 @@ Worker message says it is waiting for an answer. Nor does a hung command look id
 polls a long-running command about once a minute, so the session keeps writing and Semon reports it
 working. The exercise therefore hangs an *open* turn (`sleep 3600`) under a short idle budget. Idle
 time is how long the running turn has gone without finishing; between turns a Worker waits on people
-and is not idle. The budget flags the hung turn as `budget reached: idle`. Each ladder step cancels
-the turn and starts a recovery turn, so each of the two recoveries and the public reply comes one
-idle budget after the last, as long as the Worker keeps hanging.
+and is not idle. The budget pauses the hung turn as `budget reached: idle`; it does not open a
+stall, run recovery attempts, or post a public stuck reply. This exercises budget pausing. Use the
+Semon question fixtures and `stuck.test.ts` to exercise the separate stuck ladder.
 
 Use a throwaway database. Start `ostromd run` against that store first; the script only seeds an
 accepted decision, whose ticket takes its budget from the environment as a Router-accepted one does.
 The daemon dispatches the ticket in its normal `route-candidates` pass and owns the turn it later
-cancels. Its public stuck reply is queued in the outbox and posts to the supplied issue when the
-daemon reaches its `send` pass.
+cancels. The status card on the supplied issue shows the budget pause when the daemon reaches its
+`send` pass.
 
 ```sh
 export OSTROM_REPO=onsager-ai/ostrom OSTROM_ALLOWLIST=<login> OSTROM_DB=/tmp/ostrom-stall/ostrom.sqlite

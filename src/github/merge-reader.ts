@@ -15,6 +15,8 @@ export interface MergeReview {
   submittedAt: string | null;
   author: { id: string | null; login: string | null; type: string } | null;
   commitOid: string | null;
+  body: string;
+  inlineComments: number;
 }
 
 export interface MergeEvidence {
@@ -104,7 +106,8 @@ export async function readMergeEvidence(gh: GhRunner, repo: string, prNumber: nu
       if (!state.contextsAfter.done) {
         for (const item of contextPage.nodes) {
           const row = object(item);
-          const key = `${string(row, "__typename")}:${nullableNumber(row, "databaseId") ?? nullableString(row, "context") ?? ""}`;
+          const type = string(row, "__typename");
+          const key = `${type}:${type === "StatusContext" ? string(row, "context") : nullableNumber(row, "databaseId")}`;
           if (seen.contexts.add(key)) contexts.push(item);
         }
         advance(state.contextsAfter, contextPage.page);
@@ -129,6 +132,40 @@ export async function readMergeEvidence(gh: GhRunner, repo: string, prNumber: nu
   decoded.base.repository = nestedString(pull, "base", "repo", "full_name");
   reviews.sort((left, right) => (left.submittedAt ?? "").localeCompare(right.submittedAt ?? "") || left.id.localeCompare(right.id));
   return { pr: decoded, rollup, threads, reviews, rest: { pull, repository: object(repository), protection, rules } };
+}
+
+/** Reviewers to notify after the PR head advances beyond their latest change request. */
+export function reviewersToReRequest(evidence: MergeEvidence): string[] {
+  const latest = new Map<string, MergeReview>();
+  for (const review of evidence.reviews) {
+    const login = review.author?.login;
+    if (login === null || login === undefined || login === evidence.pr.authorLogin || login.endsWith("[bot]") ||
+        review.author?.type !== "User" || review.submittedAt === null) continue;
+    const previous = latest.get(login);
+    if (previous === undefined || (review.submittedAt > (previous.submittedAt ?? "")) ||
+        (review.submittedAt === previous.submittedAt && review.id > previous.id)) latest.set(login, review);
+  }
+  return [...latest].flatMap(([login, review]) =>
+    review.state === "CHANGES_REQUESTED" && review.commitOid !== null && review.commitOid !== evidence.pr.head.sha ? [login] : []);
+}
+
+export interface FailedCheck { name: string; url: string | null; }
+
+/** Only explicit failures on the current PR head can wake a Worker; pending checks wait. Any failure
+ * counts, because the merge needs the whole rollup to succeed, not only protection-required checks. */
+export function failedChecks(evidence: MergeEvidence): FailedCheck[] {
+  if (evidence.rollup === null || evidence.rollup.oid !== evidence.pr.head.sha) return [];
+  const failed: FailedCheck[] = [];
+  for (const value of evidence.rollup.contexts) {
+    const check = object(value);
+    if (check["__typename"] === "CheckRun" && check["status"] === "COMPLETED" &&
+        ["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"].includes(String(check["conclusion"]))) {
+      failed.push({ name: string(check, "name"), url: typeof check["detailsUrl"] === "string" ? check["detailsUrl"] : null });
+    } else if (check["__typename"] === "StatusContext" && ["FAILURE", "ERROR"].includes(String(check["state"]))) {
+      failed.push({ name: string(check, "context"), url: typeof check["targetUrl"] === "string" ? check["targetUrl"] : null });
+    }
+  }
+  return failed;
 }
 
 async function optionalGet(gh: GhRunner, path: string, classicProtection = false): Promise<unknown> {
@@ -169,6 +206,7 @@ function decodeReview(value: unknown): MergeReview {
     id: string(row, "id"), state: string(row, "state"), submittedAt: nullableString(row, "submittedAt"),
     author: author === null ? null : { id: nullableString(author, "id"), login: nullableString(author, "login"), type: string(author, "__typename") },
     commitOid: commit === null ? null : nullableString(commit, "oid"),
+    body: string(row, "body"), inlineComments: number(object(row, "comments"), "totalCount"),
   };
 }
 

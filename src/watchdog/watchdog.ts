@@ -9,7 +9,8 @@
 // output. A Worker's session is matched to its assignment by its git branch
 // (`ostrom/ticket-<ticket>-<assignment>-<uuid>` for new work). A failed read is reported and never clears an episode.
 
-import { budgetReached } from "../budget/budgets.ts";
+import { watchdogBudgetReached } from "../budget/budgets.ts";
+import { queueStatusCard } from "../github/cards.ts";
 import type { ProcessRunner } from "../process.ts";
 import type { Store } from "../store/store.ts";
 
@@ -83,6 +84,7 @@ export interface WatchdogOptions {
   idleMinutes: number;
   /** Clock used for budget evaluation; injectable for deterministic checks. */
   now?: () => Date;
+  onBudgetPause?: (assignmentId: number) => void;
 }
 
 export interface Checked {
@@ -124,13 +126,24 @@ export async function watchdog(options: WatchdogOptions): Promise<WatchdogPass> 
       newEpisode: false,
       clearedStallId: null,
     };
-    const budget = budgetReached(store.ticketBudget(assignment.ticketId), now());
+    const ticket = store.getTicket(assignment.ticketId);
+    const budget = watchdogBudgetReached(store.ticketBudget(assignment.ticketId), now());
+    if (ticket.state !== "open" || budget !== null) {
+      if (ticket.state === "open" && budget !== null) {
+        store.pauseTicketForBudget(ticket.id, budget);
+        checked.clearedStallId = store.clearStall(assignment.id);
+        queueStatusCard(store, ticket.id, now());
+        options.onBudgetPause?.(assignment.id);
+      }
+      pass.checked.push(checked);
+      continue;
+    }
     const repeatedError = assignment.consecutiveErrors >= 2;
-    if (semonReason !== null || budget !== null || repeatedError) {
+    if (semonReason !== null || repeatedError) {
       const question = matched?.openQuestion ?? null;
       const detail =
         question === null ? assignment.lastError : question.length > DETAIL_CHARS ? `${question.slice(0, DETAIL_CHARS)}…` : question;
-      const cause = budget === null ? repeatedError ? "same turn error twice" : semonReason! : `budget reached: ${budget}`;
+      const cause = repeatedError ? "same turn error twice" : semonReason!;
       const recorded = store.recordStall({ assignmentId: assignment.id, semonReason, detail, cause });
       checked.stallId = recorded.id;
       checked.newEpisode = !recorded.duplicate;

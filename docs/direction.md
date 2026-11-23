@@ -75,7 +75,7 @@ ostrom (CLI) ──local API──▶ ostromd          Semon ──reads──�
 ```
 
 `ostromd` is the daemon and has no user-facing commands. `ostrom` is the operator's CLI and talks to
-`ostromd` over a local API; the milestone-2 dashboard uses the same API.
+`ostromd` over a local API; the milestone-3 dashboard uses the same API.
 
 The Router is a one-shot model call per batch, not a long-lived session. Every batch already carries
 the whole contract, the undecided triggers with short excerpts and URLs, and the outcomes owed a
@@ -87,7 +87,11 @@ deterministic step.
 A Worker runs in its own git worktree on a branch `ostrom/ticket-<ticket>-<assignment>`, so Semon
 can attribute its session to the repository and branch. A follow-up on a subscribed thread goes from
 the daemon straight to the Worker, as the next turn of the same session resumed by its ID, and never
-reaches the Router. After an `ostromd` restart, running Workers are resumed by their stored IDs.
+reaches the Router, except that intake first asks the Router whether a non-trivial APPROVED review
+with no inline comments asks the Worker for anything. Commentary judged `ignore` gets an excluded
+intake receipt and does not wake the Worker or restart the merge quiet window; Router errors keep
+normal delivery. Empty and short approval bodies use the deterministic fast path. After an
+`ostromd` restart, running Workers are resumed by their stored IDs.
 
 ## Data model
 
@@ -102,7 +106,7 @@ Borrowed from the prototype's domain and narrowed to what milestone 1 needs:
 | `ticket` | One unit of accepted work | `open → paused → open → ended`; carries its budget and what it has used |
 | `assignment` | A Ticket bound to one Worker session | Harness, model, native session ID, worktree, branch and machine; `pending → running → ended`; a Ticket may have several |
 | `subscription` | Ticket ↔ thread (many-to-many) | Fan-out without a new Decision; an accept subscribes its own thread, and the Worker's PR thread is subscribed automatically |
-| `outbox` | Writes owed to GitHub: comments, card edits, reactions, labels | Batched per thread (10-minute window, at most one new comment per 30 minutes; blocking questions skip the wait); each sent once, retried with backoff |
+| `outbox` | Writes owed to GitHub: comments, card edits, reactions, labels | Batched per thread (10-minute window, at most one new ordinary comment per 30 minutes; blocking questions, control-command replies, and Worker turn results skip the wait); each sent once, retried with backoff |
 
 ## Milestone 1
 
@@ -142,22 +146,48 @@ and the GitHub URLs.
 Stack: TypeScript on Node, chosen by the user on 2026-11-09. No orchestration framework: the
 operator ruled on 2026-11-09 that Mastra is not needed, and ACP is deprioritised. CI runs the tests;
 nothing is built or tested locally on the operator's laptop. Milestone-1 budget defaults are
-`OSTROM_BUDGET_TIME_MIN=480` (8 wall-clock hours), `OSTROM_BUDGET_IDLE_MIN=30`,
+`OSTROM_BUDGET_TIME_MIN=480` (8 hours of Worker turn time), `OSTROM_BUDGET_IDLE_MIN=30`,
 `OSTROM_BUDGET_TURNS=80`, `OSTROM_BUDGET_TOKENS=1000000` (fresh input plus output; cached input is
 recorded but not limited), and `OSTROM_BUDGET_ESCALATIONS=0`. A new ticket stores these values, so
 later environment changes do not alter existing work; `ostrom
-extend` raises an individual ticket's limits. Workers run on cheap tiers (gpt-6-luna, Haiku) unless
-a ticket's budget says otherwise.
+extend` raises an individual ticket's limits. The Router chooses a model per ticket and an effort per turn within the operator’s allowed selections;
+without selections the configured Worker model remains in use. See [model-selection.md](model-selection.md).
 
 ## Milestone 2
 
-[The merging design](merging.md) is implemented with unattended, human and approval policies,
-durable merge inhibition and reconciliation. [The sandbox run](e2e-m2.md) provides partial evidence:
-real Worker PRs and PR CI, ready delivery, same-session revision, pause across restart, stop to
-draft and a human merge reconciled as external after three separately reviewed fixes. Host thermal shutdowns prevented the natural unattended merge and completion proof. The
-follow-up's final window/merge, resume eligibility, runtime approval/protection gates and ambiguous
-send reconciliation remain deferred; read-only diagnostics are recorded separately and do not
-complete those runtime exercises.
+Done, 2026-11-16. [The merging design](merging.md) is implemented with unattended, human and
+approval policies, durable merge inhibition and reconciliation. [The first sandbox run](e2e-m2.md)
+covered pause across restart, stop to draft and a human merge reconciled as external, but host
+overheating stopped it before an unattended merge. [The hp-code-2 run](e2e-m2-hp2.md) completed the
+rest as the GitHub App: an App-authored PR merged by the App after an operator approval, and a
+second merged unattended after a same-session review follow-up, each ending with a Done reply.
+Resume-to-merge after a pause, runtime protection gates and lost merge responses have unit tests
+but no live run yet.
+
+## Milestone 3
+
+Done, 2026-11-16. [The operator dashboard](dashboard.md) is a read-only local page on the CLI's
+daemon API: attention items, ticket progress, merge waits, failures, budgets and Watchdog health.
+[The hp-code-2 run](e2e-m3.md) passed every live acceptance step. It also found three defects,
+fixed before it finished: a Codex reconnect notice ended a ticket and its reason was lost, a turn
+budget cancelled the last allowed turn, and several page gaps. Worker placement is deferred.
+
+## First real-repository pilot
+
+Passed 2026-11-17. [Six issues on duhem and tolmap](pilot-1.md) became PRs that the App authored
+and merged, under the approvals policy and tolmap's required check. The run found the defects to fix
+before wider use: #725 and #729 to #733.
+
+## Model selection
+
+Accepted 2026-11-17. [The design](model-selection.md) lets Ostrom choose each ticket's model and
+each turn's effort within limits the operator sets, learn from past outcomes, and escalate within
+one harness when a ticket struggles. The operator chose the lowest cost that still merges as the
+default objective, and allowed models selected from those the harnesses report. Rule 3 now lets
+the Router make model and effort judgements. Discovery, stored selections, Router choices, durable
+overrides and reasons on the status card/dashboard are implemented. Outcome history and escalation
+remain planned. Models requiring approval fall back to a model without approval until explicitly
+overridden; with no such model, dispatch waits.
 
 ## Non-goals (for now)
 
@@ -166,7 +196,7 @@ complete those runtime exercises.
 - Creating T3 Code threads, or "promote to foreground". Deferred by the operator on 2026-11-09:
   Workers are native sessions the operator can already open after `ostrom pause`.
 - More than one repository or machine, chat sources, CI-as-source, webhooks or any publicly
-  reachable listener, or a hosted service. The dashboard waits for milestone 2.
+  reachable listener, or a hosted service.
 
 ## Open questions
 
@@ -179,9 +209,15 @@ complete those runtime exercises.
    The choice is configuration: `OSTROM_CLAUDE_AUTH=login` and `OSTROM_CODEX_PROVIDER=openai`. By
    default the operator's environment passes through unchanged, which on this machine means the
    gateway and the Magpie provider.
-2. **Model checks.** The Codex SDK reports token usage but not the model. Ostrom must confirm the
-   model each turn used (from the native session record) so that a resume never silently runs on an
-   expensive default, as happened once in the spike.
+2. **Model checks: answered 2026-11-17 (model-selection PR 1).** Claude's SDK init message reports
+   the model. Codex's SDK does not, so the existing bounded rollout reader reads the latest
+   `turn_context` model and effort from the native session ID's date-partitioned JSONL. Semon's query
+   summary formats model names and does not expose per-turn effort, so it is unsuitable for this
+   exact check. Each Worker turn stores requested and observed values. Codex retains its existing
+   check: an unverified or mismatched model ends the assignment with its reason and records the
+   turn as failed. Claude's observed model is recorded without equality enforcement because aliases
+   and gateway IDs may resolve differently; its observed effort stays null because the SDK does
+   not report it.
 3. **Bot identity: answered 2026-11-11 by the operator.** Option B: a GitHub App, identified
    by App ID, never its changeable name or slug. The daemon, CLI GitHub reads and Worker GitHub
    commands use installation tokens when configured; see [running.md](running.md#github-app-identity).
@@ -195,8 +231,13 @@ complete those runtime exercises.
    conditions and policy options are proposed in [`merging.md`](merging.md), for milestone 2;
    Journey 1 now points to that design. Rule 1 holds gates back until the loop runs and a real
    failure calls for them; the loop now runs, and this policy is the operator's call.
-5. **Mid-turn crashes: narrowed.** A restart records an interrupted native turn and sends the
-   resumed session the recovery prompt; production still needs an observed mid-turn crash run.
+5. **Mid-turn crashes.** A restart records an interrupted native turn and resumes the session with
+   a note that the daemon stopped it, work may already be partly pushed, and the Worker must check
+   the current PR head and CI before acting. Recovery carries the interrupted delivery prompt,
+   followed in queue order by feedback already queued for the assignment when recovery starts.
+   Those deliveries are acknowledged and finished with the single recovery turn. Pause and stop
+   controls keep separate turns. With no delivery prompt or queued feedback, only the recovery
+   note is sent.
 6. **Semon readiness.** Today Semon exposes `list_sessions`, `get_session`, `read_transcript` and
    `stalls`. The Watchdog uses `stalls` through `semon query` (CLI, not MCP), matched to Workers by
    branch; see `docs/watchdog.md`. If the operator needs a ticket view in Semon, it is added there.

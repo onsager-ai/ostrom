@@ -1,4 +1,4 @@
-export type CommandName = "redirect" | "pause" | "resume" | "stop" | "close_issue" | "close_pull_request" | "forbidden";
+export type CommandName = "use" | "effort" | "redirect" | "pause" | "resume" | "stop" | "close_issue" | "close_pull_request" | "forbidden";
 
 export interface CommandDefinition {
   name: CommandName;
@@ -51,6 +51,16 @@ export const COMMANDS: readonly CommandDefinition[] = [
     effect: "Ends that attempt only; the issue stays open for a new decision",
     whoMay: "Whoever can close it",
     acknowledgement: "Card updated, no new comment",
+  },
+  {
+    name: "use", sayOrDo: "`@ostrom use <model>`",
+    effect: "Overrides the ticket model; an existing session keeps its model until the next session",
+    whoMay: "Issue author, or repo triage or higher", acknowledgement: "Reply with the effective session boundary",
+  },
+  {
+    name: "effort", sayOrDo: "`@ostrom effort <level>`",
+    effect: "Overrides effort from the next turn until changed; in the comment that starts a ticket, applies from its first turn",
+    whoMay: "Issue author, or repo triage or higher", acknowledgement: "Reply confirming the effort, except the start comment uses the status card",
   },
   {
     name: "forbidden",

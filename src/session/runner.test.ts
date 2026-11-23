@@ -51,10 +51,11 @@ test("Codex constructs a Worker with its explicit profile and leaves the Router 
   ]);
 });
 
-test("Codex returns an unverified model and forwards resume options", async () => {
+test("Codex returns the last agent message, an unverified model, and forwards resume options", async () => {
   const events: ThreadEvent[] = [
     { type: "thread.started", thread_id: "id" },
-    { type: "item.completed", item: { type: "agent_message", id: "item", text: "ok" } },
+    { type: "item.completed", item: { type: "agent_message", id: "progress", text: "I will look into it." } },
+    { type: "item.completed", item: { type: "agent_message", id: "final", text: "I hit a blocker." } },
     { type: "turn.completed", usage: { input_tokens: 4, cached_input_tokens: 3, cache_write_input_tokens: 0, output_tokens: 2, reasoning_output_tokens: 0 } },
   ];
   let seen: unknown;
@@ -63,6 +64,7 @@ test("Codex returns an unverified model and forwards resume options", async () =
   const session = codexRunner({}, () => client).resume({ cwd: "/tmp", model: "luna", sessionId: "id", writableDirs: ["/repo/.git"] });
   const result = await session.send("hello");
   assert.equal(result.model, null);
+  assert.equal(result.text, "I hit a blocker.");
   assert.deepEqual(result.usage, { inputTokens: 1, cachedInputTokens: 3, outputTokens: 2 });
   assert.deepEqual(seen, { id: "id", options: { workingDirectory: "/tmp", model: "luna", networkAccessEnabled: true, approvalPolicy: "never" } });
 });
@@ -109,6 +111,20 @@ test("Codex cancellation is reported rather than treated as success", async () =
   const controller = new AbortController(); controller.abort();
   const result = await codexRunner({}, () => client).start({ cwd: "/tmp", model: "luna" }).send("hello", controller.signal);
   assert.equal(result.status, "cancelled");
+});
+
+test("Codex reconnect notices defer to the terminal turn event", async () => {
+  const notice: ThreadEvent = { type: "error", message: "Reconnecting... 1/5 (idle timeout waiting for SSE)" };
+  const completed: ThreadEvent = { type: "turn.completed", usage: { input_tokens: 0, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0 } };
+  const send = (events: ThreadEvent[]) => {
+    const thread = { runStreamed: async () => ({ events: (async function* () { yield* events; })() }) };
+    const client = { startThread: () => thread } as unknown as Pick<Codex, "startThread" | "resumeThread">;
+    return codexRunner({}, () => client).start({ cwd: "/tmp", model: "luna" }).send("hello");
+  };
+  assert.equal((await send([notice, completed])).status, "completed");
+  await assert.rejects(send([notice, { type: "turn.failed", error: { message: "provider exhausted retries" } }]), { message: "provider exhausted retries" });
+  await assert.rejects(send([notice]), { message: `Codex ended without a result: ${notice.message}` });
+  await assert.rejects(send([]), { message: "Codex ended without a result" });
 });
 
 test("provider selection comes from the environment", () => {

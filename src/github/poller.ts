@@ -13,6 +13,8 @@
 import type { Store, ThreadKind } from "../store/store.ts";
 import { ghGet, sinceParam, type GhRunner } from "./gh.ts";
 import { hasReplyMarker } from "./marker.ts";
+import { isApprovalOnly } from "./approval.ts";
+import { approvalAsksForWork, type RouteOptions } from "../router/router.ts";
 
 export type TriggerKind = "issue_opened" | "issue_comment" | "pull_request_review_comment" | "pull_request_review" | "issue_state";
 
@@ -68,6 +70,8 @@ export interface PollOptions {
    * event can surface after a later one; the overlap catches it and dedup absorbs the re-reads.
    */
   overlapMs?: number;
+  /** Configured Router for non-trivial approval commentary; absent means deliver conservatively. */
+  approvalRouter?: Pick<RouteOptions, "router" | "runners">;
 }
 
 /** Per-stream positions: the newest `updated_at` fully read. Stored as JSON in `source.cursor`. */
@@ -101,6 +105,15 @@ export async function pollOnce(options: PollOptions): Promise<PollResult> {
   const reviewComments = await listUpdatedSince(gh, `repos/${repo}/pulls/comments`, from(cursor.reviewComments), perPage);
   const issues = await listUpdatedSince(gh, `repos/${repo}/issues`, from(cursor.issues), perPage, "state=all");
 
+  for (const issue of issues) {
+    const opened = issueOpenedReceiptEvent(issue, from(cursor.issues));
+    if (opened === null || classify(opened, allowlist) === "own") continue;
+    const reason = !/@ostrom\b/i.test(opened.body)
+      ? "missing @ostrom mention"
+      : !allowlist.has(opened.actor.toLowerCase()) ? "unauthorized author" : null;
+    if (reason !== null) store.recordIntakeReceipt({ sourceId: source.id, sourceEventId: opened.id, url: opened.url, reason });
+  }
+
   const issueStateEvents = await Promise.all(
     issues.map((issue) => issueStateEventsFor(issue, store, source.id, gh, repo, perPage)),
   );
@@ -116,7 +129,35 @@ export async function pollOnce(options: PollOptions): Promise<PollResult> {
     const pr = field(issue, "number", "number");
     for (const review of await listPages(gh, `repos/${repo}/pulls/${pr}/reviews`, perPage)) {
       const event = reviewEvent(review, pr);
-      if (event !== null && event.occurredAt.getTime() >= reviewsSince) events.push(event);
+      if (event === null || event.occurredAt.getTime() < reviewsSince) continue;
+      if (review["state"] === "APPROVED" && !store.hasTriggerEvent(source.id, event.id)) {
+        // The repository comment stream is cursor-limited; read this review directly so older
+        // inline comments cannot make an approval look empty.
+        const path = `repos/${repo}/pulls/${pr}/reviews/${event.reviewId}/comments?per_page=1`;
+        const comments = asItems(await ghGet(gh, path), path);
+        const observedInline = reviewComments.some((comment) => String(comment["pull_request_review_id"]) === event.reviewId);
+        if (comments.length === 0 && !observedInline) {
+          let approvalOnly = isApprovalOnly("APPROVED", event.body, 0) || store.hasApprovalReceipt(source.id, event.id);
+          const verdict = classify(event, allowlist);
+          const existing = store.findThread(source.id, event.number);
+          const eligible = verdict === "keep" || (verdict === "not_allowed" && existing !== null &&
+            store.ticketsForThread(existing.id).some((ticket) => ticket.state === "open" || ticket.state === "paused"));
+          if (!approvalOnly && eligible && options.approvalRouter !== undefined) {
+            try {
+              approvalOnly = !await approvalAsksForWork(options.approvalRouter, event);
+            } catch {
+              // A failed judgement must not swallow a request: retain the normal Worker delivery.
+            }
+          }
+          if (approvalOnly) {
+            if (verdict !== "own") store.recordIntakeReceipt({
+              sourceId: source.id, sourceEventId: event.id, url: event.url, reason: "approval without feedback",
+            });
+            continue;
+          }
+        }
+      }
+      events.push(event);
     }
   }
   events.sort((a, b) => a.occurredAt.getTime() - b.occurredAt.getTime());
@@ -129,10 +170,12 @@ export async function pollOnce(options: PollOptions): Promise<PollResult> {
       continue;
     }
     const existing = store.findThread(source.id, event.number);
-    if (verdict === "not_allowed" && event.kind !== "issue_state" && (existing === null || !store.ticketsForThread(existing.id).some((ticket) => ticket.state === "open" || ticket.state === "paused"))) {
+    const hasActiveTicket = existing !== null && store.ticketsForThread(existing.id).some((ticket) => ticket.state === "open" || ticket.state === "paused");
+    if (verdict === "not_allowed" && event.kind !== "issue_state" && !hasActiveTicket) {
       result.droppedNotAllowed++;
       continue;
     }
+    if (event.kind === "issue_comment" && !hasActiveTicket && !/@ostrom\b/i.test(event.body)) continue;
     const threadId = existing?.id ?? store.ensureThread({
       sourceId: source.id,
       kind: event.threadKind,
@@ -275,13 +318,16 @@ function issueCommentEvent(item: Item): GitHubEvent {
 
 /** A newly opened issue asks the Router only when it explicitly mentions Ostrom in its body. */
 function issueOpenedEvent(item: Item, since: Date): GitHubEvent[] {
-  if (item["pull_request"] != null || item["state"] !== "open") return [];
+  const event = issueOpenedReceiptEvent(item, since);
+  return event !== null && /@ostrom\b/i.test(event.body) ? [event] : [];
+}
+
+function issueOpenedReceiptEvent(item: Item, since: Date): GitHubEvent | null {
+  if (item["pull_request"] != null || item["state"] !== "open") return null;
   const createdAt = new Date(field(item, "created_at", "string"));
-  if (createdAt.getTime() < since.getTime()) return [];
-  const body = bodyOf(item);
-  if (!/@ostrom\b/i.test(body)) return [];
+  if (createdAt.getTime() < since.getTime()) return null;
   const url = field(item, "html_url", "string");
-  return [{
+  return {
     id: `${field(item, "node_id", "string")}:opened`,
     kind: "issue_opened",
     threadKind: "issue",
@@ -289,9 +335,9 @@ function issueOpenedEvent(item: Item, since: Date): GitHubEvent[] {
     threadUrl: url,
     url,
     actor: login(item),
-    body,
+    body: bodyOf(item),
     occurredAt: createdAt,
-  }];
+  };
 }
 
 async function issueStateEventsFor(

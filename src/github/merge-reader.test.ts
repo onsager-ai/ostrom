@@ -36,6 +36,29 @@ test("reader decodes the recorded sandbox GraphQL and pinned REST shapes", async
   assert.equal(calls.filter((call) => call[1] !== "graphql").every((call) => call.includes("X-GitHub-Api-Version: 2022-11-28")), true);
 });
 
+test("reader keys legacy statuses by context and still validates CheckRun database IDs", async () => {
+  const graphql = fixture("merge-reader-graphql.json") as {
+    data: { repository: { pullRequest: { commits: { nodes: { commit: { statusCheckRollup: { contexts: { nodes: Record<string, unknown>[] } } } }[] } } } };
+  };
+  const contexts = graphql.data.repository.pullRequest.commits.nodes[0]!.commit.statusCheckRollup.contexts;
+  const status = { __typename: "StatusContext", context: "external", state: "FAILURE" };
+  contexts.nodes = [status, { ...status, context: "another" }];
+  const gh: GhRunner = async (args) => {
+    if (args[1] === "graphql") return JSON.stringify(graphql);
+    const path = args.at(-1)!;
+    if (path.endsWith("/pulls/8")) return JSON.stringify(fixture("merge-reader-pr.json"));
+    if (path.endsWith("/protection")) return "{}";
+    if (path.includes("/rules/")) return "[]";
+    return JSON.stringify(fixture("merge-reader-repository.json"));
+  };
+  const evidence = await readMergeEvidence(gh, "onsager-ai/ostrom-sandbox", 8);
+  assert.deepEqual(evidence.rollup?.contexts, contexts.nodes);
+  for (const databaseId of [undefined, "invalid"]) {
+    contexts.nodes = [{ __typename: "CheckRun", databaseId }];
+    await assert.rejects(readMergeEvidence(gh, "onsager-ai/ostrom-sandbox", 8), /invalid number databaseId/);
+  }
+});
+
 test("reader finishes connections with different page counts without refetching page one", async () => {
   const pull = { head: { ref: "branch", sha: "head", repo: { full_name: "o/r" } }, base: { ref: "main", sha: "base", repo: { full_name: "o/r" } } };
   const rest = { allow_squash_merge: true };
@@ -50,9 +73,9 @@ test("reader finishes connections with different page counts without refetching 
     const value = (key: string) => args.find((arg) => arg.startsWith(`${key}=`))?.slice(key.length + 1);
     const threads = page(value("threadsAfter"), [{ id: "t1", isResolved: true }, { id: "t2", isResolved: true }], "t");
     const reviews = page(value("reviewsAfter"), [
-      { id: "r1", state: "COMMENTED", submittedAt: "2026-01-01T00:00:00Z", author: { __typename: "User", id: "u", login: "a" }, commit: { oid: "head" } },
-      { id: "r2", state: "COMMENTED", submittedAt: "2026-01-02T00:00:00Z", author: { __typename: "User", id: "u", login: "a" }, commit: { oid: "head" } },
-      { id: "r3", state: "COMMENTED", submittedAt: "2026-01-03T00:00:00Z", author: { __typename: "User", id: "u", login: "a" }, commit: { oid: "head" } },
+      { id: "r1", state: "COMMENTED", submittedAt: "2026-01-01T00:00:00Z", author: { __typename: "User", id: "u", login: "a" }, commit: { oid: "head" }, body: "feedback", comments: { totalCount: 2 } },
+      { id: "r2", state: "COMMENTED", submittedAt: "2026-01-02T00:00:00Z", author: { __typename: "User", id: "u", login: "a" }, commit: { oid: "head" }, body: "feedback", comments: { totalCount: 2 } },
+      { id: "r3", state: "COMMENTED", submittedAt: "2026-01-03T00:00:00Z", author: { __typename: "User", id: "u", login: "a" }, commit: { oid: "head" }, body: "feedback", comments: { totalCount: 2 } },
     ], "r");
     const contexts = page(value("contextsAfter"), [], "c");
     const suites = page(value("suitesAfter"), [], "s");
@@ -68,6 +91,7 @@ test("reader finishes connections with different page counts without refetching 
   assert.equal(calls.filter((call) => call[1] === "graphql").length, 3);
   assert.deepEqual(evidence.threads.map((thread) => thread.id), ["t1", "t2"]);
   assert.deepEqual(evidence.reviews.map((review) => review.id), ["r1", "r2", "r3"]);
+  assert.deepEqual(evidence.reviews.map((review) => [review.body, review.inlineComments]), [["feedback", 2], ["feedback", 2], ["feedback", 2]]);
   assert.deepEqual(evidence.rollup?.associatedPrNumbers, [1]);
 });
 
@@ -113,4 +137,30 @@ test("the committed query contains every paginated evidence connection", () => {
   for (const field of ["reviewThreads", "reviews", "contexts", "checkSuites", "associatedPullRequests"]) assert.match(MERGE_EVIDENCE_QUERY, new RegExp(`${field}\\(first: 100`));
   assert.match(MERGE_EVIDENCE_QUERY, /mergeable mergeStateStatus reviewDecision/);
   assert.match(MERGE_EVIDENCE_QUERY, /workflowRun \{ event runAttempt workflow/);
+});
+
+test("re-request only the latest change requests from non-author human reviewers on older heads", async () => {
+  const { reviewersToReRequest } = await import("./merge-reader.ts");
+  const makeReview = (login: string, state: string, commitOid: string, submittedAt: string, id: string, type = "User") => ({
+    id, state, submittedAt, author: { id: null, login, type }, commitOid, body: "", inlineComments: 0,
+  });
+  const evidence = {
+    pr: {
+      number: 1, state: "OPEN", draft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", reviewDecision: null,
+      head: { ref: "feature", sha: "new", repository: "o/r" }, base: { ref: "main", sha: "base", repository: "o/r" }, authorLogin: "author",
+    },
+    rollup: null, threads: [], rest: { pull: {}, repository: {}, protection: null, rules: null },
+    reviews: [
+      makeReview("reviewer", "CHANGES_REQUESTED", "old", "2026-11-10T10:00:00Z", "1"),
+      makeReview("reviewer", "COMMENTED", "old", "2026-11-10T11:00:00Z", "2"),
+      makeReview("reviewer-two", "CHANGES_REQUESTED", "old", "2026-11-10T09:00:00Z", "3"),
+      makeReview("reviewer-two", "CHANGES_REQUESTED", "new", "2026-11-10T12:00:00Z", "4"),
+      makeReview("author", "CHANGES_REQUESTED", "old", "2026-11-10T12:00:00Z", "5"),
+      makeReview("automation[bot]", "CHANGES_REQUESTED", "old", "2026-11-10T12:00:00Z", "6"),
+      { ...makeReview("pending", "CHANGES_REQUESTED", "old", "", "7"), submittedAt: null },
+      makeReview("reviewer-three", "CHANGES_REQUESTED", "old", "2026-11-10T12:00:00Z", "8"),
+      makeReview("automation", "CHANGES_REQUESTED", "old", "2026-11-10T12:00:00Z", "9", "Bot"),
+    ],
+  };
+  assert.deepEqual(reviewersToReRequest(evidence), ["reviewer-three"]);
 });

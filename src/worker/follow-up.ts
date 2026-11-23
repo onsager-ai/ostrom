@@ -6,6 +6,7 @@ import { queueStatusCard } from "../github/cards.ts";
 import { renderReviewReply } from "../github/review-reply.ts";
 import type { Store, Thread, Trigger } from "../store/store.ts";
 import type { Workers } from "./workers.ts";
+import { PUBLIC_FINAL_MESSAGE } from "./dispatch.ts";
 
 export interface Delivered {
   triggerId: number;
@@ -18,18 +19,28 @@ export interface RoutePass {
   failed: { triggerId: number; ticketId: number; error: string }[];
 }
 
-export function routeFollowUps(store: Store, workers: Workers): RoutePass {
+export function clearStallForHumanReply(store: Store, ticketId: number): boolean {
+  const cleared = store.clearTicketStalls(ticketId);
+  if (!cleared) return false;
+  const ticket = store.getTicket(ticketId);
+  if (ticket.state === "paused" && ticket.pauseCause === "stuck turn reported by the Watchdog") {
+    store.resumeTicket(ticketId);
+  }
+  queueStatusCard(store, ticketId);
+  return true;
+}
+
+export function routeFollowUps(store: Store, workers: Workers, allowlist: readonly string[] = []): RoutePass {
   const pass: RoutePass = { queued: [], failed: [] };
   const pending = store.pendingDeliveries();
   const grouped = new Set<string>();
   for (const delivery of pending) {
     const { trigger, ticketId, assignmentId } = delivery;
-    const cleared = assignmentId === null ? null : store.clearStallForHumanReply(assignmentId);
-    // Only the public stuck step pauses the ticket; a silent recovery leaves it open.
-    if (cleared !== null && store.getStall(cleared).publicAt !== null) {
-      store.resumeTicket(ticketId);
-      queueStatusCard(store, ticketId);
+    if (allowlist.some((actor) => actor.toLowerCase() === trigger.actor.toLowerCase()) &&
+        ["issue_comment", "pull_request_review", "pull_request_review_comment"].includes(trigger.kind)) {
+      clearStallForHumanReply(store, ticketId);
     }
+    if (store.getTicket(ticketId).state === "ended") continue;
     if (assignmentId === null) {
       pass.failed.push({ triggerId: trigger.id, ticketId, error: `ticket ${ticketId} has no running Worker` });
       continue;
@@ -55,6 +66,7 @@ export function routeFollowUps(store: Store, workers: Workers): RoutePass {
             id: `review-${assignmentId}-${trigger.reviewId}`,
             threadId: trigger.threadId,
             body: renderReviewReply(result.text),
+            blocking: true,
           });
         },
         "review",
@@ -109,6 +121,7 @@ export function followUpMessage(ticketId: number, trigger: Trigger, thread: Thre
     "Read it with `gh`; this message does not copy it. If it asks for changes, make them and push",
     "to the branch of your existing pull request; do not open a new one. Do not comment on GitHub",
     "yourself: Ostrom replies to people. Do not merge, enable auto-merge, dismiss reviews, or resolve human review threads.",
+    PUBLIC_FINAL_MESSAGE,
   ].join("\n");
 }
 
@@ -130,6 +143,7 @@ export function reviewFollowUpMessage(ticketId: number, thread: Thread, triggers
     ]),
     "",
     "Address the review. Ostrom will post one summary reply using your final answer; do not comment on GitHub yourself.",
+    PUBLIC_FINAL_MESSAGE,
     "Do not merge, enable auto-merge, dismiss reviews, or resolve human review threads.",
   ];
   return lines.join("\n");

@@ -2,8 +2,12 @@
 // See docs/direction.md, "Data model". Only the operations milestone 1 needs live here.
 
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+import { budgetReached, budgetUsage, budgetWarning } from "../budget/budgets.ts";
 import type { BudgetDefaults } from "../budget/budgets.ts";
 import { migrate } from "./migrations.ts";
+import { ModelStore } from "./models.ts";
+import { modelOutcomes, type ModelOutcome } from "./outcomes.ts";
+import { TicketSelections, type SelectionDecision } from "./ticket-selection.ts";
 
 export type SourceKind = "github";
 export type ThreadKind = "issue" | "pull_request";
@@ -81,7 +85,7 @@ export interface ReviewDelivery {
   reviewId: string;
 }
 
-export type CommandReceiptName = "redirect" | "pause" | "resume" | "stop" | "forbidden" | "close_issue" | "close_pull_request" | "ignore_issue_state";
+export type CommandReceiptName = "use" | "effort" | "redirect" | "pause" | "resume" | "stop" | "forbidden" | "close_issue" | "close_pull_request" | "ignore_issue_state";
 
 export interface PendingCommand {
   trigger: Trigger;
@@ -113,7 +117,7 @@ export interface Ticket {
   stopRequestedAt: string | null;
 }
 
-export type QueuedTurnKind = "follow_up" | "review" | "control" | "budget_pause" | "stuck" | "recovery";
+export type QueuedTurnKind = "follow_up" | "review" | "control" | "budget_pause" | "stuck" | "recovery" | "conflict" | "ci_fix" | "dispatched_run";
 export type QueuedTurnState = "queued" | "running" | "finished" | "cancelled";
 
 /** A durable Worker prompt. Source pointers identify domain data, not a transcript. */
@@ -144,6 +148,8 @@ export interface TicketBudget {
   inputTokens: number;
   cachedInputTokens: number;
   outputTokens: number;
+  /** Finished native-turn time accumulated for this ticket, in seconds. */
+  completedTurnSeconds: number;
   /** When the ticket's running turn started; null between turns. */
   turnStartedAt: string | null;
 }
@@ -153,6 +159,50 @@ export interface OperatorTicket extends Ticket {
   thread: Thread;
   assignment: Assignment | null;
   budget: TicketBudget;
+  budgetUsage: Record<"time" | "idle" | "turns" | "tokens" | "escalations", number>;
+  budgetWarning: "time" | "idle" | "turns" | "tokens" | "escalations" | null;
+  pullRequests: string[];
+  mergeCandidate: { policy: string; blockingReason: string | null; quietDeadline: string | null } | null;
+  latestFailure: { kind: "assignment" | "dispatch"; summary: string; at: string } | null;
+  recentFailures: { kind: "assignment" | "dispatch"; summary: string; at: string }[];
+}
+
+export type IntakeReason = "missing @ostrom mention" | "unauthorized author" | "approval without feedback";
+export interface IntakeReceipt {
+  sourceId: number;
+  sourceEventId: string;
+  url: string;
+  observedAt: string;
+  reason: IntakeReason;
+}
+export interface OperatorIntakeItem {
+  eventId: string;
+  url: string;
+  observedAt: string;
+  disposition: "accept" | "ignore" | "stop" | "awaiting decision" | "excluded";
+  reason: string | null;
+}
+
+export interface PushedHead { prNumber: number; sha: string; }
+
+export interface WorkerTurn {
+  id: number;
+  assignmentId: number;
+  ticketId: number;
+  startedAt: string;
+  endedAt: string | null;
+  harness: "claude" | "codex";
+  requestedModel: string;
+  requestedEffort: string | null;
+  reason: string | null;
+  observedModel: string | null;
+  observedEffort: string | null;
+  kind: string;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  status: "running" | "completed" | "cancelled" | "failed" | "interrupted";
+  result: string | null;
 }
 
 export interface OperatorTicketDetail extends OperatorTicket {
@@ -160,6 +210,8 @@ export interface OperatorTicketDetail extends OperatorTicket {
   triggers: Trigger[];
   decisions: { id: number; verdict: Verdict; reason: string; decidedAt: string }[];
   assignments: Assignment[];
+  turns: WorkerTurn[];
+  selections: SelectionDecision[];
   outbox: Reply[];
 }
 
@@ -168,6 +220,7 @@ export interface OperatorStatus {
   runningWorkers: Assignment[];
   stuckTickets: { ticketId: number; assignmentId: number; cause: string | null; detectedAt: string }[];
   tokensToday: number;
+  watchdog: { lastAttemptAt: string | null; lastSuccess: boolean | null; lastSuccessAt: string | null; error: string | null };
 }
 
 export interface Assignment {
@@ -323,6 +376,8 @@ export interface StoreOptions {
 type Row = Record<string, unknown>;
 
 export class Store {
+  readonly models: ModelStore;
+  readonly selections: TicketSelections;
   readonly #db: DatabaseSync;
   readonly #now: () => Date;
 
@@ -330,6 +385,8 @@ export class Store {
     this.#db = db;
     this.#now = options.now ?? (() => new Date());
     migrate(db, this.#now());
+    this.models = new ModelStore(db, this.#now);
+    this.selections = new TicketSelections(db, this.#now);
   }
 
   /** Opens (creating if needed) the store at `path`; `:memory:` gives a throwaway store. */
@@ -359,6 +416,46 @@ export class Store {
   advanceCursor(sourceId: number, cursor: string): void {
     const { changes } = this.#run("UPDATE source SET cursor = ? WHERE id = ?", cursor, sourceId);
     if (Number(changes) !== 1) throw new Error(`no source ${sourceId}`);
+  }
+
+  /** Records an excluded intake event once, preserving its first observation time. */
+  recordIntakeReceipt(receipt: Omit<IntakeReceipt, "observedAt"> & { observedAt?: string }): void {
+    this.#run(
+      `INSERT INTO intake_receipt (source_id, source_event_id, url, observed_at, reason)
+       VALUES (?, ?, ?, ?, ?) ON CONFLICT (source_id, source_event_id) DO NOTHING`,
+      receipt.sourceId, receipt.sourceEventId, receipt.url, receipt.observedAt ?? this.#stamp(), receipt.reason,
+    );
+  }
+
+  hasApprovalReceipt(sourceId: number, sourceEventId: string): boolean {
+    return this.#get("SELECT 1 FROM intake_receipt WHERE source_id = ? AND source_event_id = ? AND reason = 'approval without feedback'", sourceId, sourceEventId) !== undefined;
+  }
+
+  hasTriggerEvent(sourceId: number, sourceEventId: string): boolean {
+    return this.#get('SELECT 1 FROM "trigger" WHERE source_id = ? AND source_event_id = ?', sourceId, sourceEventId) !== undefined;
+  }
+
+  /** Recent triggers with their latest Router decision, plus excluded event receipts. */
+  operatorIntake(limit = 50): OperatorIntakeItem[] {
+    const triggers = this.#all(
+      `SELECT trigger.source_event_id, trigger.url, trigger.received_at,
+              (SELECT decision.verdict FROM decision JOIN decision_trigger ON decision_trigger.decision_id = decision.id
+               WHERE decision_trigger.trigger_id = trigger.id ORDER BY decision.id DESC LIMIT 1) AS verdict,
+              (SELECT decision.reason FROM decision JOIN decision_trigger ON decision_trigger.decision_id = decision.id
+               WHERE decision_trigger.trigger_id = trigger.id ORDER BY decision.id DESC LIMIT 1) AS reason
+       FROM "trigger" AS trigger
+       ORDER BY trigger.received_at DESC, trigger.url, trigger.source_event_id LIMIT ?`,
+      limit,
+    ).map((row): OperatorIntakeItem => ({
+      eventId: row["source_event_id"] as string, url: row["url"] as string, observedAt: row["received_at"] as string,
+      disposition: (row["verdict"] as OperatorIntakeItem["disposition"] | null) ?? "awaiting decision",
+      reason: row["reason"] as string | null,
+    }));
+    const receipts = this.#all("SELECT source_event_id, url, observed_at, reason FROM intake_receipt ORDER BY observed_at DESC, url, source_event_id LIMIT ?", limit).map((row): OperatorIntakeItem => ({
+      eventId: row["source_event_id"] as string, url: row["url"] as string, observedAt: row["observed_at"] as string,
+      disposition: "excluded", reason: row["reason"] as string,
+    }));
+    return [...triggers, ...receipts].sort((a, b) => b.observedAt.localeCompare(a.observedAt) || a.url.localeCompare(b.url) || a.eventId.localeCompare(b.eventId)).slice(0, limit);
   }
 
   findThread(sourceId: number, number: number): Thread | null {
@@ -545,7 +642,20 @@ export class Store {
 
   /** Tickets in operator-list order, with the fields needed by CLI and dashboard clients. */
   operatorTickets(): OperatorTicket[] {
-    return this.#all("SELECT id FROM ticket ORDER BY id DESC").map((row) => this.#operatorTicket(row["id"] as number));
+    const tickets = this.#all("SELECT id FROM ticket ORDER BY id DESC").map((row) => this.#operatorTicket(row["id"] as number));
+    const failures = tickets.flatMap((ticket) => ticket.recentFailures.map((failure, index) => ({ ticketId: ticket.id, index, failure })))
+      .sort((a, b) => b.failure.at.localeCompare(a.failure.at)).slice(0, 20);
+    const visible = new Map<number, Set<number>>();
+    for (const { ticketId, index } of failures) {
+      const entries = visible.get(ticketId) ?? new Set<number>();
+      entries.add(index);
+      visible.set(ticketId, entries);
+    }
+    return tickets.map((ticket) => {
+      const keep = visible.get(ticket.id) ?? new Set<number>();
+      const recentFailures = ticket.recentFailures.filter((_, index) => keep.has(index));
+      return { ...ticket, recentFailures, latestFailure: recentFailures[0] ?? null };
+    });
   }
 
   /** One ticket and its durable operator-visible timeline. */
@@ -569,11 +679,11 @@ export class Store {
        WHERE subscription.ticket_id = ? ORDER BY outbox.enqueued_at, outbox.id`,
       ticketId,
     ).map(toReply);
-    return { ...summary, context, triggers, decisions, assignments, outbox };
+    return { ...summary, context, triggers, decisions, assignments, turns: this.ticketTurns(ticketId), selections: this.selections.history(ticketId), outbox };
   }
 
   /** The daemon-wide counter view. Time zone is SQLite's UTC day, matching stored timestamps. */
-  operatorStatus(): OperatorStatus {
+  operatorStatus(watchdog: OperatorStatus["watchdog"] = { lastAttemptAt: null, lastSuccess: null, lastSuccessAt: null, error: null }): OperatorStatus {
     const states = this.#all("SELECT state, COUNT(*) AS count FROM ticket GROUP BY state");
     const counts = new Map(states.map((row) => [row["state"] as TicketState, row["count"] as number]));
     const runningWorkers = this.runningAssignments();
@@ -586,13 +696,38 @@ export class Store {
     const today = this.#get(
       "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) AS tokens FROM assignment WHERE last_activity_at >= date('now')",
     )!["tokens"] as number;
-    return { tickets: { open: counts.get("open") ?? 0, paused: counts.get("paused") ?? 0, ended: counts.get("ended") ?? 0 }, runningWorkers, stuckTickets, tokensToday: today };
+    return { tickets: { open: counts.get("open") ?? 0, paused: counts.get("paused") ?? 0, ended: counts.get("ended") ?? 0 }, runningWorkers, stuckTickets, tokensToday: today, watchdog };
   }
 
   #operatorTicket(ticketId: number): OperatorTicket {
     const ticket = this.getTicket(ticketId);
     const context = this.ticketContext(ticketId);
-    return { ...ticket, thread: context.thread, assignment: this.latestAssignment(ticketId), budget: this.ticketBudget(ticketId) };
+    const assignment = this.latestAssignment(ticketId);
+    const budget = this.ticketBudget(ticketId);
+    const now = this.#now();
+    const recentFailures = this.#all(
+      `SELECT outcome, last_error, outcome_at, end_reason, ended_at FROM assignment
+       WHERE ticket_id = ? AND ((outcome = 'failed' AND last_error IS NOT NULL) OR (started_at IS NULL AND end_reason IS NOT NULL))
+       ORDER BY COALESCE(outcome_at, ended_at) DESC`, ticketId,
+    ).map((row) => ({ kind: row["outcome"] === "failed" ? "assignment" as const : "dispatch" as const,
+      summary: (row["last_error"] ?? row["end_reason"]) as string,
+      at: (row["outcome_at"] ?? row["ended_at"]) as string }));
+    const latestFailure = recentFailures[0];
+    const merge = assignment === null ? null : this.mergeCandidateForAssignment(assignment.id);
+    const prs = this.#all(
+      `SELECT thread.url FROM subscription JOIN thread ON thread.id = subscription.thread_id
+       WHERE subscription.ticket_id = ? AND thread.kind = 'pull_request' ORDER BY thread.number`, ticketId,
+    ).map((row) => row["url"] as string);
+    return {
+      ...ticket, thread: context.thread, assignment, budget,
+      budgetUsage: { time: budgetUsage(budget, "time", now), idle: budgetUsage(budget, "idle", now),
+        turns: budgetUsage(budget, "turns", now), tokens: budgetUsage(budget, "tokens", now),
+        escalations: budgetUsage(budget, "escalations", now) },
+      budgetWarning: budgetWarning(budget, now), pullRequests: prs,
+      mergeCandidate: merge === null ? null : { policy: merge.policy, blockingReason: merge.blockingReason, quietDeadline: merge.quietDeadline },
+      latestFailure: latestFailure ?? null,
+      recentFailures,
+    };
   }
 
   /** The ticket with the thread, decision reason and trigger URLs that opened it. */
@@ -609,10 +744,15 @@ export class Store {
     return { ticket, thread, source, reason: decision["reason"] as string, triggerUrls };
   }
 
-  pauseTicket(ticketId: number): void {
+  ticketPauseCount(ticketId: number): number {
+    return this.#get("SELECT pause_count FROM ticket WHERE id = ?", ticketId)!["pause_count"] as number;
+  }
+
+  /** Pauses an open ticket; the cause is shown to the operator until the ticket resumes. */
+  pauseTicket(ticketId: number, cause: string): void {
     const { changes } = this.#run(
-      "UPDATE ticket SET state = 'paused' WHERE id = ? AND state = 'open'",
-      ticketId,
+      "UPDATE ticket SET state = 'paused', pause_cause = ?, pause_count = pause_count + 1 WHERE id = ? AND state = 'open'",
+      cause, ticketId,
     );
     if (Number(changes) !== 1) {
       throw new IllegalTransition(`ticket ${ticketId}: ${this.getTicket(ticketId).state} → paused is not allowed`);
@@ -627,6 +767,16 @@ export class Store {
     if (Number(changes) !== 1) {
       throw new IllegalTransition(`ticket ${ticketId}: ${this.getTicket(ticketId).state} → open is not allowed`);
     }
+    this.clearTicketStalls(ticketId);
+  }
+
+  /** Operator resume and trusted GitHub replies acknowledge the same stall episodes. */
+  clearTicketStalls(ticketId: number): boolean {
+    let cleared = false;
+    for (const row of this.#all("SELECT id FROM assignment WHERE ticket_id = ?", ticketId)) {
+      if (this.clearStallForHumanReply(row["id"] as number) !== null) cleared = true;
+    }
+    return cleared;
   }
 
   /** Sets the durable interlock before a stop cancels a turn or queues its cleanup. */
@@ -657,7 +807,7 @@ export class Store {
   pauseTicketForBudget(ticketId: number, limit: string): void {
     const cause = `budget reached: ${limit}`;
     const { changes } = this.#run(
-      "UPDATE ticket SET state = 'paused', pause_cause = ? WHERE id = ? AND state = 'open'",
+      "UPDATE ticket SET state = 'paused', pause_cause = ?, pause_count = pause_count + 1 WHERE id = ? AND state = 'open'",
       cause, ticketId,
     );
     if (Number(changes) !== 1) throw new IllegalTransition(`ticket ${ticketId}: ${this.getTicket(ticketId).state} → paused is not allowed`);
@@ -673,12 +823,19 @@ export class Store {
     if (ticket.state !== "open" && ticket.state !== "paused") {
       throw new IllegalTransition(`ticket ${ticketId} is ${ticket.state}; it cannot be extended`);
     }
-    this.#run(
-      `UPDATE ticket SET budget_time_minutes = budget_time_minutes + ?, budget_turns = budget_turns + ?,
-       budget_tokens = budget_tokens + ?, state = CASE WHEN pause_cause LIKE 'budget reached:%' THEN 'open' ELSE state END,
-       pause_cause = CASE WHEN pause_cause LIKE 'budget reached:%' THEN NULL ELSE pause_cause END WHERE id = ?`,
-      increases.timeMinutes ?? 0, increases.turns ?? 0, increases.tokens ?? 0, ticketId,
-    );
+    this.#transaction(() => {
+      this.#run(
+        `UPDATE ticket SET budget_time_minutes = budget_time_minutes + ?, budget_turns = budget_turns + ?,
+         budget_tokens = budget_tokens + ? WHERE id = ?`,
+        increases.timeMinutes ?? 0, increases.turns ?? 0, increases.tokens ?? 0, ticketId,
+      );
+      const raisedCause = ticket.pauseCause === "budget reached: time" && increases.timeMinutes !== undefined ||
+        ticket.pauseCause === "budget reached: turns" && increases.turns !== undefined ||
+        ticket.pauseCause === "budget reached: tokens" && increases.tokens !== undefined;
+      if (ticket.state === "paused" && raisedCause && budgetReached(this.ticketBudget(ticketId), this.#now()) === null) {
+        this.resumeTicket(ticketId);
+      }
+    });
   }
 
   /** Returns stored limits and usage accumulated from every assignment on this ticket. */
@@ -690,7 +847,11 @@ export class Store {
               COALESCE(SUM(assignment.input_tokens), 0) AS input_tokens,
               COALESCE(SUM(assignment.cached_input_tokens), 0) AS cached_input_tokens,
               COALESCE(SUM(assignment.output_tokens), 0) AS output_tokens,
-              MAX(assignment.turn_started_at) AS turn_started_at
+              COALESCE((SELECT SUM(ROUND((julianday(ended_at) - julianday(started_at)) * 86400))
+                        FROM turn WHERE turn.ticket_id = ticket.id AND ended_at IS NOT NULL), 0) AS completed_turn_seconds,
+              MAX(CASE WHEN (SELECT status FROM turn WHERE turn.assignment_id = assignment.id
+                ORDER BY id DESC LIMIT 1) = 'interrupted'
+                THEN NULL ELSE assignment.turn_started_at END) AS turn_started_at
          FROM ticket LEFT JOIN assignment ON assignment.ticket_id = ticket.id WHERE ticket.id = ? GROUP BY ticket.id`,
       ticketId,
     );
@@ -702,6 +863,7 @@ export class Store {
       escalationLimit: row["budget_escalations"] as number, escalations: row["escalations"] as number,
       turns: row["turns"] as number, inputTokens: row["input_tokens"] as number,
       cachedInputTokens: row["cached_input_tokens"] as number, outputTokens: row["output_tokens"] as number,
+      completedTurnSeconds: row["completed_turn_seconds"] as number,
       turnStartedAt: row["turn_started_at"] as string | null,
     };
   }
@@ -799,10 +961,79 @@ export class Store {
     return this.#all("SELECT * FROM assignment WHERE state = 'pending' ORDER BY id").map(toAssignment);
   }
 
+  /** Records a native invocation, including a first turn that fails before returning a session ID. */
+  startWorkerTurn(assignmentId: number, kind: string, effort: string | null = null, reason: string | null = null): number {
+    const assignment = this.getAssignment(assignmentId);
+    if (assignment.harness === null || assignment.model === null) throw new Error("turn needs a configured native assignment");
+    const result = this.#run(
+      `INSERT INTO turn (assignment_id, ticket_id, started_at, harness, requested_model, requested_effort, kind, reason, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running')`,
+      assignmentId, assignment.ticketId, this.#stamp(), assignment.harness, assignment.model, effort, kind, reason,
+    );
+    return Number(result.lastInsertRowid);
+  }
+
+  finishWorkerTurn(assignmentId: number, status: Exclude<WorkerTurn["status"], "running">,
+    usage: { inputTokens: number; cachedInputTokens: number; outputTokens: number } | null,
+    observed: { model: string | null; effort: string | null } = { model: null, effort: null }, result: string | null = null,
+    blockedReply?: NewReply, pushedHead: PushedHead | null = null): void {
+    this.#transaction(() => {
+      const { changes } = this.#run(
+        `UPDATE turn SET ended_at = ?, status = ?, observed_model = ?, observed_effort = ?,
+         input_tokens = ?, cached_input_tokens = ?, output_tokens = ?, result = ?, pushed_head_sha = ?, pushed_pr_number = ?
+         WHERE assignment_id = ? AND status = 'running'`,
+        this.#stamp(), status, observed.model, observed.effort, usage?.inputTokens ?? 0, usage?.cachedInputTokens ?? 0,
+        usage?.outputTokens ?? 0, result, pushedHead?.sha ?? null, pushedHead?.prNumber ?? null, assignmentId,
+      );
+      if (blockedReply !== undefined && Number(changes) === 1) {
+        this.recordOutcome(assignmentId, "waiting");
+        this.#insertReply(blockedReply);
+      }
+    });
+  }
+
+  workerTurnPushedHead(assignmentId: number, prNumber: number, sha: string): boolean {
+    return this.#get(`SELECT 1 FROM turn WHERE assignment_id = ? AND status = 'completed'
+      AND pushed_pr_number = ? AND pushed_head_sha = ? LIMIT 1`, assignmentId, prNumber, sha) !== undefined;
+  }
+
+  /** Session events are activity evidence; recovery must never charge daemon downtime. */
+  recordWorkerActivity(assignmentId: number): void {
+    this.#run("UPDATE assignment SET last_activity_at = ? WHERE id = ?", this.#stamp(), assignmentId);
+  }
+
+  interruptRecoveredTurn(assignmentId: number, reason: string): void {
+    this.#run(
+      `UPDATE turn SET ended_at = MAX(started_at, COALESCE(
+         (SELECT last_activity_at FROM assignment WHERE id = ?), started_at)),
+       status = 'interrupted', result = ? WHERE assignment_id = ? AND status = 'running'`,
+      assignmentId, reason, assignmentId,
+    );
+  }
+
+  modelOutcomes(repository?: string): ModelOutcome[] {
+    return modelOutcomes(this.#db, repository);
+  }
+
+  ticketTurns(ticketId: number): WorkerTurn[] {
+    return this.#all("SELECT * FROM turn WHERE ticket_id = ? ORDER BY id", ticketId).map((row) => ({
+      id: row["id"] as number, assignmentId: row["assignment_id"] as number, ticketId: row["ticket_id"] as number,
+      startedAt: row["started_at"] as string, endedAt: row["ended_at"] as string | null,
+      harness: row["harness"] as WorkerTurn["harness"], requestedModel: row["requested_model"] as string,
+      requestedEffort: row["requested_effort"] as string | null, reason: row["reason"] as string | null, observedModel: row["observed_model"] as string | null,
+      observedEffort: row["observed_effort"] as string | null, kind: row["kind"] as string,
+      inputTokens: row["input_tokens"] as number, cachedInputTokens: row["cached_input_tokens"] as number,
+      outputTokens: row["output_tokens"] as number, status: row["status"] as WorkerTurn["status"], result: row["result"] as string | null,
+    }));
+  }
+
   /** Marks a native turn as running and returns the assignment's turn number. */
   beginTurn(assignmentId: number): number {
     const row = this.#get(
-      "UPDATE assignment SET turns = turns + 1, turn_started_at = ? WHERE id = ? AND state = 'running' RETURNING turns",
+      `UPDATE assignment SET turns = turns + 1, turn_started_at = ?,
+       outcome = CASE WHEN outcome = 'waiting' THEN NULL ELSE outcome END,
+       outcome_at = CASE WHEN outcome = 'waiting' THEN NULL ELSE outcome_at END
+       WHERE id = ? AND state = 'running' RETURNING turns`,
       this.#stamp(),
       assignmentId,
     );
@@ -832,9 +1063,9 @@ export class Store {
     );
   }
 
-  /** Clears the repeated-error detector after a successful turn. */
+  /** Clears the repeated-error detector after success, preserving terminal failure evidence. */
   clearTurnError(assignmentId: number): void {
-    this.#run("UPDATE assignment SET last_error = NULL, consecutive_errors = 0 WHERE id = ?", assignmentId);
+    this.#run("UPDATE assignment SET last_error = NULL, consecutive_errors = 0 WHERE id = ? AND state = 'running' AND outcome IS NOT 'failed'", assignmentId);
   }
 
   /** Counts a turn that a restart found unfinished. */
@@ -929,6 +1160,16 @@ export class Store {
        JOIN ticket ON ticket.id = subscription.ticket_id AND ticket.state IN ('open', 'paused')
        WHERE t.kind IN ('issue_comment', 'issue_state')
          AND (ticket.state = 'open' OR t.kind = 'issue_state' OR lower(ltrim(COALESCE(t.body, ''))) GLOB '@ostrom *')
+         AND NOT EXISTS (
+           SELECT 1 FROM decision_trigger AS start_decision
+           JOIN "trigger" AS start_trigger ON start_trigger.id = start_decision.trigger_id
+           WHERE start_decision.decision_id = ticket.decision_id
+             AND (t.occurred_at, t.id) < (start_trigger.occurred_at, start_trigger.id)
+             AND NOT EXISTS (
+               SELECT 1 FROM decision_trigger AS earlier_decision
+               JOIN "trigger" AS earlier_trigger ON earlier_trigger.id = earlier_decision.trigger_id
+               WHERE earlier_decision.decision_id = ticket.decision_id
+                 AND (earlier_trigger.occurred_at, earlier_trigger.id) < (start_trigger.occurred_at, start_trigger.id)))
          AND NOT EXISTS (SELECT 1 FROM decision_trigger WHERE trigger_id = t.id)
          AND NOT EXISTS (SELECT 1 FROM delivery WHERE delivery.trigger_id = t.id)
          AND NOT EXISTS (
@@ -953,19 +1194,29 @@ export class Store {
     return { duplicate: Number(changes) === 0 };
   }
 
-  /** Every follow-up owed to an open ticket's Worker, including the first human reply to a ticket paused at public Stuck. */
+  /** Open-ticket follow-ups, plus replies that can acknowledge a public stall in any ticket state. */
   pendingDeliveries(): PendingDelivery[] {
     return this.#all(
       `SELECT t.*, ticket.id AS p_ticket_id, worker.id AS p_assignment_id
        FROM "trigger" AS t
        JOIN subscription ON subscription.thread_id = t.thread_id
        JOIN ticket ON ticket.id = subscription.ticket_id AND (
-         ticket.state = 'open' OR ticket.state = 'paused' AND EXISTS (
+         ticket.state = 'open' OR EXISTS (
            SELECT 1 FROM stall JOIN assignment AS stalled ON stalled.id = stall.assignment_id
            WHERE stalled.ticket_id = ticket.id AND stall.public_at IS NOT NULL AND stall.cleared_at IS NULL))
        LEFT JOIN assignment AS worker ON worker.id = (
          SELECT id FROM assignment WHERE ticket_id = ticket.id AND state = 'running' ORDER BY id DESC LIMIT 1)
-       WHERE NOT EXISTS (SELECT 1 FROM decision_trigger WHERE trigger_id = t.id)
+       WHERE NOT EXISTS (
+           SELECT 1 FROM decision_trigger AS start_decision
+           JOIN "trigger" AS start_trigger ON start_trigger.id = start_decision.trigger_id
+           WHERE start_decision.decision_id = ticket.decision_id
+             AND (t.occurred_at, t.id) < (start_trigger.occurred_at, start_trigger.id)
+             AND NOT EXISTS (
+               SELECT 1 FROM decision_trigger AS earlier_decision
+               JOIN "trigger" AS earlier_trigger ON earlier_trigger.id = earlier_decision.trigger_id
+               WHERE earlier_decision.decision_id = ticket.decision_id
+                 AND (earlier_trigger.occurred_at, earlier_trigger.id) < (start_trigger.occurred_at, start_trigger.id)))
+         AND NOT EXISTS (SELECT 1 FROM decision_trigger WHERE trigger_id = t.id)
          AND NOT EXISTS (
            SELECT 1 FROM command_receipt
            WHERE command_receipt.trigger_id = t.id AND command_receipt.ticket_id = ticket.id)
@@ -1049,10 +1300,11 @@ export class Store {
   }
 
   /** True only when no durable/in-flight local work or undispatched receipts remain. */
-  assignmentWorkIdle(assignmentId: number, ignoreReservation = false): boolean {
+  assignmentWorkIdle(assignmentId: number, options: { ignoreReservation?: boolean; ignoreQueuedDispatchedRuns?: boolean } = {}): boolean {
     const row = this.#get(
       `SELECT (SELECT turn_started_at FROM assignment WHERE id = ?) IS NULL
-          AND NOT EXISTS (SELECT 1 FROM queued_turn WHERE assignment_id = ? AND state IN ('queued', 'running'))
+          AND NOT EXISTS (SELECT 1 FROM queued_turn WHERE assignment_id = ? AND state IN ('queued', 'running')
+            AND NOT (? AND kind = 'dispatched_run' AND state = 'queued'))
           AND (? OR NOT EXISTS (SELECT 1 FROM assignment_reservation WHERE assignment_id = ?))
           AND NOT EXISTS (SELECT 1 FROM merge_attempt WHERE candidate_id IN (SELECT id FROM merge_candidate WHERE assignment_id = ?) AND state IN ('pending', 'unknown'))
           AND NOT EXISTS (
@@ -1060,11 +1312,22 @@ export class Store {
             JOIN ticket ON ticket.id = subscription.ticket_id
             WHERE ticket.id = (SELECT ticket_id FROM assignment WHERE id = ?)
               AND ticket.state IN ('open', 'paused')
+              AND NOT EXISTS (
+                SELECT 1 FROM decision_trigger AS start_decision
+                JOIN "trigger" AS start_trigger ON start_trigger.id = start_decision.trigger_id
+                WHERE start_decision.decision_id = ticket.decision_id
+                  AND (t.occurred_at, t.id) < (start_trigger.occurred_at, start_trigger.id)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM decision_trigger AS earlier_decision
+                    JOIN "trigger" AS earlier_trigger ON earlier_trigger.id = earlier_decision.trigger_id
+                    WHERE earlier_decision.decision_id = ticket.decision_id
+                      AND (earlier_trigger.occurred_at, earlier_trigger.id) < (start_trigger.occurred_at, start_trigger.id)))
               AND NOT EXISTS (SELECT 1 FROM decision_trigger WHERE trigger_id = t.id)
               AND NOT EXISTS (SELECT 1 FROM delivery WHERE delivery.trigger_id = t.id)
               AND NOT EXISTS (SELECT 1 FROM command_receipt WHERE command_receipt.trigger_id = t.id AND command_receipt.ticket_id = ticket.id)
           ) AS idle`,
-      assignmentId, assignmentId, ignoreReservation ? 1 : 0, assignmentId, assignmentId, assignmentId,
+      assignmentId, assignmentId, options.ignoreQueuedDispatchedRuns ? 1 : 0, options.ignoreReservation ? 1 : 0,
+      assignmentId, assignmentId, assignmentId,
     );
     if (row === undefined) throw new Error(`no assignment ${assignmentId}`);
     return row["idle"] === 1;
@@ -1137,6 +1400,14 @@ export class Store {
   }
 
   // --- merge reconciliation ------------------------------------------------------------------
+
+  recordReviewRequest(repository: string, prNumber: number, headSha: string, reviewer: string): boolean {
+    const result = this.#run(
+      `INSERT OR IGNORE INTO review_request (repository, pr_number, head_sha, reviewer, requested_at)
+       VALUES (?, ?, ?, ?, ?)`, repository, prNumber, headSha, reviewer, this.#stamp(),
+    );
+    return result.changes === 1;
+  }
 
   mergeCandidate(assignmentId: number, repository: string, prNumber: number): MergeCandidate | null {
     const row = this.#get(
@@ -1284,6 +1555,14 @@ export class Store {
     this.#transaction(() => {
       for (const triggerId of triggerIds) this.recordDelivery(triggerId, assignmentId, turnId);
     });
+  }
+
+  /** Recovery takes responsibility for replies if it is itself interrupted again. */
+  recoverDeliveries(assignmentId: number, interruptedTurnId: string, recoveryTurnId: string): void {
+    this.#run(
+      "UPDATE delivery SET turn_id = ? WHERE assignment_id = ? AND turn_id = ?",
+      recoveryTurnId, assignmentId, interruptedTurnId,
+    );
   }
 
   /** Submitted reviews delivered to one native turn. Recovery re-attaches their summary reply. */
