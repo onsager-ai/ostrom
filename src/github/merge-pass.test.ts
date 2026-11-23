@@ -814,7 +814,7 @@ test("a Worker push first observed during the final evidence refresh re-requests
   try {
     await ready(f);
     let refreshed = false;
-    const result = await mergePass({ ...f.options(), refreshBeforeSend: async () => {
+    const result = await mergePass({ ...f.options(), appBotId: 42, refreshBeforeSend: async () => {
       refreshed = true;
       f.workerPush("refreshed-head");
     } });
