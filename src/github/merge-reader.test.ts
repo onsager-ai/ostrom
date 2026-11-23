@@ -158,7 +158,8 @@ test("re-request only the latest change requests from non-author human reviewers
       makeReview("author", "CHANGES_REQUESTED", "old", "2026-11-10T12:00:00Z", "5"),
       makeReview("automation[bot]", "CHANGES_REQUESTED", "old", "2026-11-10T12:00:00Z", "6"),
       { ...makeReview("pending", "CHANGES_REQUESTED", "old", "", "7"), submittedAt: null },
+      makeReview("reviewer-three", "CHANGES_REQUESTED", "old", "2026-11-10T12:00:00Z", "8"),
     ],
   };
-  assert.deepEqual(reviewersToReRequest(evidence), ["reviewer-two"]);
+  assert.deepEqual(reviewersToReRequest(evidence), ["reviewer-three"]);
 });
