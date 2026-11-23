@@ -461,6 +461,36 @@ test("shutdown is bounded when the SDK ignores cancellation and late activity is
   await workers.drain();
 });
 
+test("shutdown ignores a pre-turn GitHub read that settles after the store closes", async () => {
+  const pending = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const github = new FakeGitHub(() => new Date());
+  let delay = false;
+  const { store, runner, workers, ticketId } = fixture({ gh: async (args) => {
+    if (delay && args.some((arg) => arg.includes("/git/matching-refs/"))) {
+      pending.resolve();
+      await release.promise;
+    }
+    return github.gh(args);
+  }, repo: REPO });
+  const { assignmentId } = await workers.dispatch(ticketId);
+  await workers.drain();
+  delay = true;
+  assert.equal(workers.deliver(assignmentId, "follow-up", "Check the head", () => {}), true);
+  await pending.promise;
+  assert.equal(await workers.shutdown(1), false);
+  assert.equal(store.ticketTurns(ticketId).at(-1)?.status, "interrupted");
+  let lateTicketReads = 0;
+  const getTicket = store.getTicket.bind(store);
+  store.getTicket = (id) => { lateTicketReads++; return getTicket(id); };
+  store.close();
+  stores.splice(stores.indexOf(store), 1);
+  release.resolve();
+  await workers.drain();
+  assert.equal(lateTicketReads, 0);
+  assert.equal(runner.sessions[0]!.prompts.length, 1);
+});
+
 test("a stop records interruption now, starts no queued one, and leaves the assignment for recovery", async () => {
   const { store, runner, ticketId, workers, make } = fixture();
   runner.hold = true;

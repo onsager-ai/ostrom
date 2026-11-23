@@ -777,10 +777,10 @@ async function reviewFixture(policy?: MergePolicy) {
     f.evidence.headRefOid = f.commit.oid = f.pull.head.sha = head;
     f.evidence.reviews.nodes = [review({ state: "CHANGES_REQUESTED", head: "head" })];
   };
-  const workerPush = (head: string) => {
+  const workerPush = (head: string, prNumber = 2) => {
     f.store.startWorkerTurn(f.assignment, "review");
     setHead(head);
-    f.store.finishWorkerTurn(f.assignment, "completed", null, undefined, null, undefined, head);
+    f.store.finishWorkerTurn(f.assignment, "completed", null, undefined, null, undefined, { prNumber, sha: head });
   };
   const posts = () => f.github.calls.filter((args) => args.includes("POST") && args.some((arg) => arg.endsWith("/requested_reviewers")));
   const runTurn = async (key: string, duringTurn: () => void) => {
@@ -804,7 +804,7 @@ test("a GitHub PR head that moves across a Worker turn re-requests review", asyn
   const f = await reviewFixture();
   try {
     await f.runTurn("review-1", () => f.setHead("worker-head"));
-    assert.equal(f.store.workerTurnPushedHead(f.assignment, "worker-head"), true);
+    assert.equal(f.store.workerTurnPushedHead(f.assignment, 2, "worker-head"), true);
     assert.deepEqual((await mergePass(f.options())).failed, []);
     assert.deepEqual(f.github.requestedReviewers.get(2), ["reviewer"]);
   } finally { f.store.close(); }
@@ -815,7 +815,7 @@ test("a GitHub PR head unchanged across a Worker turn does not re-request review
   try {
     f.setHead("already-pushed");
     await f.runTurn("review-1", () => {});
-    assert.equal(f.store.workerTurnPushedHead(f.assignment, "already-pushed"), false);
+    assert.equal(f.store.workerTurnPushedHead(f.assignment, 2, "already-pushed"), false);
     assert.deepEqual((await mergePass(f.options())).failed, []);
     assert.deepEqual(f.posts(), []);
   } finally { f.store.close(); }
@@ -827,7 +827,7 @@ test("a pause turn that pushes work in progress does not re-request review after
     f.store.pauseTicket(f.ticket, "operator");
     f.store.resumeTicket(f.ticket); // A queued pause turn can run after its ticket is resumed.
     await f.runTurn("operator-pause-1", () => f.setHead("wip"));
-    assert.equal(f.store.workerTurnPushedHead(f.assignment, "wip"), false);
+    assert.equal(f.store.workerTurnPushedHead(f.assignment, 2, "wip"), false);
     assert.deepEqual((await mergePass(f.options())).failed, []);
     assert.deepEqual(f.posts(), []);
   } finally { f.store.close(); }
@@ -845,7 +845,7 @@ for (const control of ["pause and resume", "stop"]) {
         }
         f.setHead("wip");
       });
-      assert.equal(f.store.workerTurnPushedHead(f.assignment, "wip"), false);
+      assert.equal(f.store.workerTurnPushedHead(f.assignment, 2, "wip"), false);
     } finally { f.store.close(); }
   });
 }
@@ -911,6 +911,17 @@ test("a push outside a Worker turn does not re-request review", async () => {
     f.setHead("outside-head");
     assert.deepEqual((await mergePass(f.options())).failed, []);
     assert.equal(f.store.mergeCandidateForAssignment(f.assignment)?.headSha, "outside-head");
+    assert.deepEqual(f.posts(), []);
+  } finally { f.store.close(); }
+});
+
+test("a replacement PR at the same SHA cannot use the previous PR's head evidence", async () => {
+  const f = await reviewFixture();
+  try {
+    f.workerPush("same-head", 3);
+    assert.equal(f.store.workerTurnPushedHead(f.assignment, 3, "same-head"), true);
+    assert.equal(f.store.ticketPullRequest(f.ticket)?.number, 2);
+    assert.deepEqual((await mergePass(f.options())).failed, []);
     assert.deepEqual(f.posts(), []);
   } finally { f.store.close(); }
 });

@@ -183,6 +183,8 @@ export interface OperatorIntakeItem {
   reason: string | null;
 }
 
+export interface PushedHead { prNumber: number; sha: string; }
+
 export interface WorkerTurn {
   id: number;
   assignmentId: number;
@@ -974,14 +976,14 @@ export class Store {
   finishWorkerTurn(assignmentId: number, status: Exclude<WorkerTurn["status"], "running">,
     usage: { inputTokens: number; cachedInputTokens: number; outputTokens: number } | null,
     observed: { model: string | null; effort: string | null } = { model: null, effort: null }, result: string | null = null,
-    blockedReply?: NewReply, pushedHead: string | null = null): void {
+    blockedReply?: NewReply, pushedHead: PushedHead | null = null): void {
     this.#transaction(() => {
       const { changes } = this.#run(
         `UPDATE turn SET ended_at = ?, status = ?, observed_model = ?, observed_effort = ?,
-         input_tokens = ?, cached_input_tokens = ?, output_tokens = ?, result = ?, pushed_head_sha = ?
+         input_tokens = ?, cached_input_tokens = ?, output_tokens = ?, result = ?, pushed_head_sha = ?, pushed_pr_number = ?
          WHERE assignment_id = ? AND status = 'running'`,
         this.#stamp(), status, observed.model, observed.effort, usage?.inputTokens ?? 0, usage?.cachedInputTokens ?? 0,
-        usage?.outputTokens ?? 0, result, pushedHead, assignmentId,
+        usage?.outputTokens ?? 0, result, pushedHead?.sha ?? null, pushedHead?.prNumber ?? null, assignmentId,
       );
       if (blockedReply !== undefined && Number(changes) === 1) {
         this.recordOutcome(assignmentId, "waiting");
@@ -990,9 +992,9 @@ export class Store {
     });
   }
 
-  workerTurnPushedHead(assignmentId: number, sha: string): boolean {
-    return this.#get("SELECT 1 FROM turn WHERE assignment_id = ? AND status = 'completed' AND pushed_head_sha = ? LIMIT 1",
-      assignmentId, sha) !== undefined;
+  workerTurnPushedHead(assignmentId: number, prNumber: number, sha: string): boolean {
+    return this.#get(`SELECT 1 FROM turn WHERE assignment_id = ? AND status = 'completed'
+      AND pushed_pr_number = ? AND pushed_head_sha = ? LIMIT 1`, assignmentId, prNumber, sha) !== undefined;
   }
 
   /** Session events are activity evidence; recovery must never charge daemon downtime. */

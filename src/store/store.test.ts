@@ -65,6 +65,32 @@ test("migrations apply once and record their version", () => {
   );
 });
 
+test("migration 39 clears obsolete schema-38 head evidence and preserves review request deduplication", () => {
+  const db = database({ enableForeignKeyConstraints: false });
+  db.exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL) STRICT");
+  for (const [index, sql] of migrations.slice(0, 38).entries()) {
+    db.exec(sql);
+    db.prepare("INSERT INTO schema_version VALUES (?, ?)").run(index + 1, "2026-11-23T00:00:00Z");
+  }
+  db.exec(`
+    INSERT INTO source (id, kind, name) VALUES (1, 'github', 'o/r');
+    INSERT INTO thread (id, source_id, kind, number, url) VALUES (1, 1, 'issue', 1, 'https://github.com/o/r/issues/1');
+    INSERT INTO decision (id, thread_id, verdict, reason, decided_at) VALUES (1, 1, 'accept', 'work', '2026-11-23T00:00:00Z');
+    INSERT INTO ticket (id, decision_id, state, opened_at) VALUES (1, 1, 'open', '2026-11-23T00:00:00Z');
+    INSERT INTO assignment (id, ticket_id, state, created_at) VALUES (1, 1, 'pending', '2026-11-23T00:00:00Z');
+    INSERT INTO turn (id, assignment_id, ticket_id, started_at, ended_at, harness, requested_model, kind, status, pushed_head_sha)
+      VALUES (1, 1, 1, '2026-11-23T00:00:00Z', '2026-11-23T00:01:00Z', 'claude', 'm', 'review', 'completed', 'old-head');
+    INSERT INTO review_request VALUES ('o/r', 2, 'old-head', 'reviewer', '2026-11-23T00:02:00Z');
+    PRAGMA foreign_keys = ON;
+  `);
+  const attempt = db.prepare("SELECT * FROM review_request").get();
+
+  assert.equal(migrate(db), migrations.length);
+  assert.equal(db.prepare("SELECT pushed_head_sha FROM turn WHERE id = 1").get()?.["pushed_head_sha"], null);
+  assert.deepEqual(db.prepare("SELECT * FROM review_request").get(), attempt);
+  assert.equal(new Store(db).recordReviewRequest("o/r", 2, "old-head", "reviewer"), false);
+});
+
 test("approval receipt migration preserves existing version-31 receipts and widens the reason constraint", () => {
   const db = database({ enableForeignKeyConstraints: false });
   db.exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL) STRICT");

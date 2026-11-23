@@ -17,7 +17,7 @@ import { appendSessionAnnotationIfChanged } from "../session/annotations.ts";
 import { rolloutContext } from "../session/rollout.ts";
 import type { Effort, Runner, Session, TurnResult } from "../session/runner.ts";
 import { createWorktree } from "../session/worktree.ts";
-import type { Assignment, NewReply, QueuedTurnKind, Store } from "../store/store.ts";
+import type { Assignment, NewReply, PushedHead, QueuedTurnKind, Store } from "../store/store.ts";
 import { pullRequestsForBranch, workerBrief } from "./dispatch.ts";
 
 export interface Dispatched {
@@ -78,7 +78,7 @@ function queuedTurnKind(key: string): QueuedTurnKind {
   return "follow_up";
 }
 
-interface TurnCompletion { result: TurnResult; blocked: boolean; pushedHead: string | null; }
+interface TurnCompletion { result: TurnResult; blocked: boolean; pushedHead: PushedHead | null; }
 
 export class Workers {
   readonly #deps: WorkersDeps;
@@ -562,6 +562,7 @@ export class Workers {
     const verifyDelivery = hasRemote && ["dispatch", "follow_up", "redirect"].includes(kind);
     // Undefined means the read failed or was skipped; null is positive evidence that the ref is absent.
     const before = verifyDelivery ? await this.#deliveryEvidence(id, () => branchHead(gh, repo, branch)) : undefined;
+    if (signal.aborted) throw new Error("Turn cancelled before Worker start");
     const readPulls = hasRemote ? () => this.#deliveryEvidence(id, () => pullRequestsForBranch(gh, repo, branch)) : undefined;
     const beforePulls = !pauseTurn && ticketAllowsRecording() ? await readPulls?.() : undefined;
     if (signal.aborted) throw new Error("Turn cancelled before Worker start");
@@ -581,7 +582,7 @@ export class Workers {
     const pushedHead = !signal.aborted && ticketAllowsRecording() && store.ticketPauseCount(ticketId) === pauseCount &&
       startPrs?.length === 1 && endPrs?.length === 1 && startPr?.headSha !== undefined && endPr?.headSha !== undefined &&
       startPr.number === endPr.number && startPr.headSha !== endPr.headSha
-      ? endPr.headSha : null;
+      ? { prNumber: endPr.number, sha: endPr.headSha } : null;
     return { result, blocked: blocked === true && !signal.aborted, pushedHead };
   }
 

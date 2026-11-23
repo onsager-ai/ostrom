@@ -753,6 +753,8 @@ export const migrations: readonly string[] = [
   ALTER TABLE ticket ADD COLUMN pause_count INTEGER NOT NULL DEFAULT 0;
   UPDATE turn SET pushed_head_sha = NULL WHERE pushed_head_sha IS NOT NULL;
   `,
+  // 40: Review requests require evidence for the same PR as well as the same head.
+  `ALTER TABLE turn ADD COLUMN pushed_pr_number INTEGER CHECK (pushed_pr_number > 0);`,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */
