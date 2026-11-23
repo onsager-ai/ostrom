@@ -27,8 +27,8 @@ export class FakeGitHub {
   readonly issueEvents = new Map<number, Item[]>();
   readonly permissions = new Map<string, string>();
   readonly branchHeads = new Map<string, string>();
-  /** Pull requests served by `pulls?head=`: head branch, number, state and body. */
-  readonly pulls: { branch: string; number: number; state: "open" | "closed" | "merged"; body?: string }[] = [];
+  /** Pull requests served by `pulls?head=`: head branch, number, state, draft flag and body. */
+  readonly pulls: { branch: string; number: number; state: "open" | "closed" | "merged"; draft?: boolean; body?: string }[] = [];
   readonly calls: string[][] = [];
   /** Throw this from the next call whose argv matches. */
   failWhen: ((args: readonly string[]) => Error | undefined) | undefined;
@@ -222,6 +222,7 @@ export class FakeGitHub {
           html_url: this.#threadUrl(pull.number, true),
           body: pull.body ?? "",
           state: pull.state === "open" ? "open" : "closed",
+          draft: pull.draft ?? false,
           merged_at: pull.state === "merged" ? "2026-11-09T12:00:00Z" : null,
         }));
     } else if (route === "issues") items = [...this.issues.values()];

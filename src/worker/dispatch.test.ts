@@ -131,14 +131,14 @@ test("observe repairs a ticket PR body once", async () => {
   assert.equal(github.calls.filter((call) => call[1] === "--method" && call[2] === "PATCH").length, 1);
 });
 
-test("observe subscribes the ticket to the Worker's PRs, once across passes", async () => {
+test("observe subscribes the ticket to the Worker's draft PR, once across passes", async () => {
   const { store, github, ticketId, worker } = fixture();
   const id = worker("sess-1");
   const branch = `ostrom/ticket-${ticketId}-${id}`;
 
   assert.deepEqual((await observe(store, github.gh, REPO)).observed[0]?.pullRequests, []);
 
-  github.pulls.push({ branch, number: 12, state: "open" });
+  github.pulls.push({ branch, number: 12, state: "open", draft: true });
   const first = await observe(store, github.gh, REPO);
   assert.deepEqual(first, {
     observed: [{ assignmentId: id, sessionId: "sess-1", pullRequests: [12], newlySubscribed: [12], outcome: null }],
