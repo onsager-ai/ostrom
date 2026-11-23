@@ -129,6 +129,8 @@ The sandbox matrix in `merging.md` remains a separate, unperformed verification 
 
 Set `OSTROM_WORKER_RULES_FILE` to a file of the machine's house rules (for example its heat
 limits, and that tests run in CI rather than locally). Its text closes every Worker's brief.
+When those rules forbid local generation, the brief tells Workers to open the pull request first
+and commit generated output taken from that pull request's CI.
 
 ## GitHub App identity
 

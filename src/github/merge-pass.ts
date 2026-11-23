@@ -168,7 +168,7 @@ async function consider(options: MergePassOptions, assignmentId: number, prNumbe
 async function reRequestReviews(options: MergePassOptions, assignmentId: number, observation: Observation): Promise<void> {
   const { evidence } = observation;
   const { pr } = evidence;
-  if (options.allowSend === false || !observation.owned || pr.state !== "OPEN" ||
+  if (options.allowSend === false || !observation.owned || pr.state !== "OPEN" || pr.draft ||
       !options.store.assignmentWorkIdle(assignmentId, { ignoreQueuedDispatchedRuns: true }) ||
       !options.store.workerTurnPushedHead(assignmentId, pr.head.sha)) return;
   const { ticketId } = options.store.getAssignment(assignmentId);

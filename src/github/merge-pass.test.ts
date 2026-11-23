@@ -930,6 +930,19 @@ test("a suppressed or unowned review request can be sent in a later eligible pas
   } finally { f.store.close(); }
 });
 
+test("a draft PR keeps its review request eligible until it is ready", async () => {
+  const f = await reviewFixture();
+  try {
+    f.workerPush("new-head");
+    f.evidence.isDraft = true;
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.posts(), []);
+    f.evidence.isDraft = false;
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.github.requestedReviewers.get(2), ["reviewer"]);
+  } finally { f.store.close(); }
+});
+
 test("an already persisted request for the same head and reviewer prevents a replayed POST", async () => {
   const f = await reviewFixture();
   try {

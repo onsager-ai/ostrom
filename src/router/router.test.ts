@@ -433,6 +433,33 @@ test("each outcome gets one reply, and a merged PR ends the assignment and the t
   assert.match(card.body, /^## Ostrom: Done$/m);
 });
 
+test("the Router queues a ready reply once when a draft PR becomes ready", async () => {
+  const s = setup();
+  const store = s.store();
+  const options = { ...s.options(), mergePolicy: { strategy: "human" as const } };
+  s.comment("please fix the typo");
+  await s.poll();
+  const first = await routeCandidates(options);
+  const { assignmentId, branch, ticketId } = first.dispatched[0]!;
+  const draft = { branch, number: 12, state: "open" as const, draft: true };
+  s.github.pulls.push(draft);
+  const replyId = `outcome-a${assignmentId}-pr12-opened`;
+
+  assert.deepEqual((await routeCandidates(options)).outcomes, []);
+  assert.equal(store.hasReply(replyId), false);
+  assert.equal(store.readyReplyId(assignmentId), null);
+
+  draft.draft = false;
+  assert.deepEqual((await routeCandidates(options)).outcomes, [
+    { key: replyId, event: "pr_opened", ticketId, ticketEnded: false },
+  ]);
+  assert.equal(store.readyReplyId(assignmentId), replyId);
+  assert.equal((await routeCandidates(options)).router, null);
+  assert.deepEqual(store.dueReplies().filter((reply) => reply.id.startsWith("outcome-")).map((reply) => reply.body), [
+    "Update: pr_opened\n\nOstrom is waiting for a human merge.",
+  ]);
+});
+
 test("a failed Worker outcome retains its subscribed PR and renders a Failed card", async () => {
   const s = setup();
   s.comment("please fix the typo");

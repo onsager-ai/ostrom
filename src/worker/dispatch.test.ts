@@ -55,14 +55,14 @@ test("the brief is a summary plus pointers and asks for a PR that references the
   assert.match(brief, /explain what prevented delivery/);
   assert.match(brief, /use repository-relative paths/);
   assert.match(brief, /do not narrate your own process or what you did or did not post/);
-  assert.match(brief, /If you start a workflow run on your branch, say it is pending in your reply while it runs/);
-  assert.match(brief, /Do not claim results you have not seen\. Ostrom wakes you when the run finishes/);
+  assert.match(brief, /If you manually dispatch a workflow run on your branch, say it is pending in your reply while it runs/);
+  assert.match(brief, /Do not claim results you have not seen\. Ostrom wakes you when a manually dispatched run finishes/);
   assert.match(brief, /Do not claim CI or merge state; Ostrom reports those/);
   assert.match(brief, new RegExp(`issue #7: https://github.com/${REPO}/issues/7\n`));
   assert.match(brief, new RegExp(`- https://github.com/${REPO}/issues/7#issuecomment-1\n`));
   assert.match(brief, /branch ostrom\/ticket-1-1/);
   assert.match(brief, new RegExp(`pull request\non ${REPO} against main whose description says "Refs #7"`));
-  assert.match(brief, /Open it ready for review, not as a draft/);
+  assert.match(brief, /Open it ready for review\./);
   assert.match(brief, /Ostrom may\nsquash-merge your pull request/);
   assert.match(brief, /do not merge it, enable auto-merge, dismiss reviews, or resolve\nhuman review threads/);
 });
@@ -79,10 +79,18 @@ test("the machine's house rules close the brief when configured, and are absent 
   const context = store.ticketContext(ticketId);
   const withRules = workerBrief(context, "b", "main", "Run tests in CI only.");
   assert.match(withRules, /House rules for this machine, which you must follow:\nRun tests in CI only\./);
-  assert.match(withRules, /If the work needs a change a repository or house rule forbids, say so in the pull request description when you push it: name the rule, the files, and why the change is needed, so the reviewer can decide\.$/);
+  assert.match(withRules, /If the work needs a change a repository or house rule forbids, say so in the pull request description when you push it: name the rule, the files, and why the change is needed, so the reviewer can decide\./);
+  assert.match(withRules, /Open it ready for review unless the generated-file instructions below apply\./);
+  assert.match(withRules, new RegExp([
+    /ensure CI uploads the output or shows the diff, then open the pull request as a draft\./.source,
+    /In the same turn, follow the pull request CI run for the draft's head commit until it finishes\./.source,
+    /Download the generated artifact or apply the diff shown by the check\./.source,
+    /Commit the generated files and push to the same branch before marking the pull request ready for review\.$/.source,
+  ].join("\\s+")));
   const withoutRules = workerBrief(context, "b", "main");
   assert.doesNotMatch(withoutRules, /House rules/);
   assert.doesNotMatch(withoutRules, /repository or house rule forbids/);
+  assert.doesNotMatch(withoutRules, /file can only be produced by a build or generator/);
 });
 
 test("PR body normalization replaces literal newlines, adds one close line and removes duplicate close lines", () => {
@@ -123,14 +131,14 @@ test("observe repairs a ticket PR body once", async () => {
   assert.equal(github.calls.filter((call) => call[1] === "--method" && call[2] === "PATCH").length, 1);
 });
 
-test("observe subscribes the ticket to the Worker's PRs, once across passes", async () => {
+test("observe subscribes the ticket to the Worker's draft PR, once across passes", async () => {
   const { store, github, ticketId, worker } = fixture();
   const id = worker("sess-1");
   const branch = `ostrom/ticket-${ticketId}-${id}`;
 
   assert.deepEqual((await observe(store, github.gh, REPO)).observed[0]?.pullRequests, []);
 
-  github.pulls.push({ branch, number: 12, state: "open" });
+  github.pulls.push({ branch, number: 12, state: "open", draft: true });
   const first = await observe(store, github.gh, REPO);
   assert.deepEqual(first, {
     observed: [{ assignmentId: id, sessionId: "sess-1", pullRequests: [12], newlySubscribed: [12], outcome: null }],
