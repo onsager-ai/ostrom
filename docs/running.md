@@ -43,13 +43,23 @@ a WIP prompt after the current turn finishes; it does not cancel that turn.
 A daemon serves one `OSTROM_REPO`. To run several on one machine, use the template unit
 `contrib/systemd/ostromd@.service`. Instance `ostromd@<name>` reads two files:
 
-- `~/.config/ostrom/<name>.env`: that repository's settings (`OSTROM_REPO`, `OSTROM_DB`, worker,
-  router, budget and merge-policy variables) and `PATH`.
+- `~/.config/ostrom/<name>.env`: that repository's settings, the same variables as the
+  single-daemon `env` file above (including `OSTROM_REPO`, `OSTROM_ALLOWLIST`, `OSTROM_DB` and
+  `OSTROM_STALL_MINUTES`, which startup requires), and `PATH`. Give each instance its own
+  `OSTROM_DB` and worker worktree directory.
 - `~/.config/ostrom/secrets.env`: only the credentials the daemon and its Workers need, shared by
-  every instance. That is `OSTROM_GITHUB_APP_ID` and `OSTROM_GITHUB_APP_KEY_FILE`, plus the Codex
-  provider's key variable if its config uses `env_key` (for example `MAGPIE_API_KEY`). Create it with
-  `install -m 600 /dev/null ~/.config/ostrom/secrets.env` before adding values. Keep unrelated
-  credentials out: Workers inherit the daemon's environment.
+  every instance. With a GitHub App, that is `OSTROM_GITHUB_APP_ID` and `OSTROM_GITHUB_APP_KEY_FILE`
+  (both or neither). Add the Codex provider's key variable if its config uses `env_key` (for
+  example `MAGPIE_API_KEY`), and `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` only if Claude Workers
+  use API-key or gateway authentication. Create the file once with
+  `(umask 077; touch ~/.config/ostrom/secrets.env)`, which never empties an existing file. Keep
+  unrelated credentials out: Workers inherit the daemon's environment.
+
+Each instance sets `XDG_RUNTIME_DIR` to `$XDG_RUNTIME_DIR/ostrom-<name>`, so it gets its own
+operator socket. Point the CLI and dashboard at an instance the same way:
+`XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR/ostrom-tolmap ostrom status`. Without the override they reach the
+single `ostromd.service` daemon. Stop that daemon before running an instance for the same
+repository.
 
 Both files are systemd environment files: one `KEY=VALUE` per line, with no `export` and no shell
 expansion. Then:

@@ -5,6 +5,8 @@ Description=Ostrom background daemon (%i)
 Type=simple
 # One instance per repository: ostromd@<name> reads ~/.config/ostrom/<name>.env.
 # Secrets live in their own mode-0600 file, shared by every instance on this machine.
+# Each instance gets its own runtime directory, so its operator socket doesn't replace another's.
+Environment=XDG_RUNTIME_DIR=%t/ostrom-%i
 EnvironmentFile=%h/.config/ostrom/%i.env
 EnvironmentFile=%h/.config/ostrom/secrets.env
 ExecStart=/usr/bin/env ostromd run --interval 60
