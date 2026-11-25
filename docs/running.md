@@ -50,13 +50,15 @@ A daemon serves one `OSTROM_REPO`. To run several on one machine, use the templa
 - `~/.config/ostrom/secrets.env`: only the credentials the daemon and its Workers need, shared by
   every instance. With a GitHub App, that is `OSTROM_GITHUB_APP_ID` and `OSTROM_GITHUB_APP_KEY_FILE`
   (both or neither). Add the Codex provider's key variable if its config uses `env_key` (for
-  example `MAGPIE_API_KEY`), and `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` only if Claude Workers
-  use API-key or gateway authentication. Create the file once with
-  `(umask 077; touch ~/.config/ostrom/secrets.env)`, which never empties an existing file. Keep
-  unrelated credentials out: Workers inherit the daemon's environment.
+  example `MAGPIE_API_KEY`), and `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` only if a Claude
+  session (Router or Workers) uses API-key or gateway authentication. Create the file once with
+  `(umask 077; touch ~/.config/ostrom/secrets.env)`, which never empties an existing file; run
+  `chmod 600` on a file that already exists. Keep unrelated credentials out: Workers inherit the
+  daemon's environment.
 
 Each instance sets `XDG_RUNTIME_DIR` to `$XDG_RUNTIME_DIR/ostrom-<name>`, so it gets its own
-operator socket. Point the CLI and dashboard at an instance the same way:
+operator socket. Leave `XDG_RUNTIME_DIR` out of both environment files: systemd lets a value there
+override the unit's, and one in the shared file would put every instance back on the same socket. Point the CLI and dashboard at an instance the same way:
 `XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR/ostrom-tolmap ostrom status`. Without the override they reach the
 single `ostromd.service` daemon. Stop that daemon before running an instance for the same
 repository.
