@@ -1,0 +1,17 @@
+[Unit]
+Description=Ostrom background daemon (%i)
+
+[Service]
+Type=simple
+# One instance per repository: ostromd@<name> reads ~/.config/ostrom/<name>.env.
+# Secrets live in their own mode-0600 file, shared by every instance on this machine.
+EnvironmentFile=%h/.config/ostrom/%i.env
+EnvironmentFile=%h/.config/ostrom/secrets.env
+ExecStart=/usr/bin/env ostromd run --interval 60
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
