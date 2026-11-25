@@ -9,7 +9,7 @@ const review = (id: string, state: string, commitOid = "head", author = "alice")
 
 function evidence(): MergeEvidence {
   return {
-    pr: { number: 1, state: "OPEN", draft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", authorLogin: "author", head: { ref: "b", sha: "head", repository: "o/r" }, base: { ref: "main", sha: "base", repository: "o/r" } },
+    pr: { number: 1, state: "OPEN", draft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", authorLogin: "author", head: { ref: "b", sha: "head", repository: "o/r" }, base: { ref: "main", sha: "base", repository: "o/r", rollupState: "SUCCESS" } },
     rollup: { oid: "head", state: "SUCCESS", contexts: [{ __typename: "CheckRun", databaseId: 10, name: "check", status: "COMPLETED", conclusion: "SUCCESS", checkSuite: { databaseId: 1, app: { databaseId: 15368 } } }], associatedPrNumbers: [1], suites: [{ databaseId: 1, status: "COMPLETED", conclusion: "SUCCESS", repository: { nameWithOwner: "o/r" }, matchingPullRequests: { nodes: [{ number: 1 }], pageInfo: { hasNextPage: false } }, workflowRun: { event: "pull_request", runAttempt: 1, workflow: { databaseId: 1 } } }] },
     threads: [], reviews: [], rest: { pull: {}, repository: { allow_squash_merge: true }, protection: {}, rules: [] },
   };
@@ -131,6 +131,19 @@ test("checks and protection requirements are enforced independently of CLEAN", (
   const required = input();
   required.evidence.rest.rules = [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "check", integration_id: 15368 }] } }];
   assert.deepEqual(mergeEligibility(required), { eligible: true });
+});
+
+test("eligibility requires successful CI on the captured base", () => {
+  const value = input();
+  const base = value.evidence.pr.base;
+  base.sha = "0123456789abcdef";
+  value.expected.base = base.sha;
+  for (const [state, label] of [["FAILURE", "failure"], ["PENDING", "pending"], ["EXPECTED", "expected"], [null, "unknown"]] as const) {
+    base.rollupState = state;
+    assert.deepEqual(mergeEligibility(value), { eligible: false, reason: `base main CI is ${label} at 0123456` });
+  }
+  base.rollupState = "SUCCESS";
+  assert.deepEqual(mergeEligibility(value), { eligible: true });
 });
 
 test("newer failed workflow cannot be masked by old success and suite provenance must match this PR", () => {

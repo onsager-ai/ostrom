@@ -29,6 +29,8 @@ test("reader decodes the recorded sandbox GraphQL and pinned REST shapes", async
   };
   const evidence = await readMergeEvidence(gh, "onsager-ai/ostrom-sandbox", 8);
   assert.equal(evidence.pr.head.sha, "fd2d929802c33741c934f5c2acd7c9fc7008e235");
+  assert.equal(evidence.pr.base.sha, "c07944528911f306a9d81d46a9eec784d706d764");
+  assert.equal(evidence.pr.base.rollupState, null); // The base branch has advanced since this PR closed.
   assert.equal(evidence.rollup?.state, "SUCCESS");
   assert.equal(evidence.rollup?.contexts.length, 1);
   assert.equal(evidence.rollup?.suites.length, 3);
@@ -83,6 +85,7 @@ test("reader finishes connections with different page counts without refetching 
     return JSON.stringify({ data: { repository: { pullRequest: {
       number: 1, state: "OPEN", isDraft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", reviewDecision: null, author: { login: "alice" },
       headRefName: "branch", headRefOid: "head", baseRefName: "main", baseRefOid: "base",
+      baseRef: { target: { oid: "base", statusCheckRollup: { state: "SUCCESS" } } },
       reviewThreads: threads, reviews, commits: { nodes: [{ commit: { oid: "head", associatedPullRequests: associated,
         statusCheckRollup: { state: "SUCCESS", contexts }, checkSuites: suites } }] },
     } } } });
@@ -93,6 +96,7 @@ test("reader finishes connections with different page counts without refetching 
   assert.deepEqual(evidence.reviews.map((review) => review.id), ["r1", "r2", "r3"]);
   assert.deepEqual(evidence.reviews.map((review) => [review.body, review.inlineComments]), [["feedback", 2], ["feedback", 2], ["feedback", 2]]);
   assert.deepEqual(evidence.rollup?.associatedPrNumbers, [1]);
+  assert.equal(evidence.pr.base.rollupState, "SUCCESS");
 });
 
 test("real execGh wrapping preserves protection absence and PUT HTTP status without network", async () => {
@@ -136,6 +140,7 @@ test("real execGh wrapping preserves protection absence and PUT HTTP status with
 test("the committed query contains every paginated evidence connection", () => {
   for (const field of ["reviewThreads", "reviews", "contexts", "checkSuites", "associatedPullRequests"]) assert.match(MERGE_EVIDENCE_QUERY, new RegExp(`${field}\\(first: 100`));
   assert.match(MERGE_EVIDENCE_QUERY, /mergeable mergeStateStatus reviewDecision/);
+  assert.match(MERGE_EVIDENCE_QUERY, /baseRef\s*\{\s*target\s*\{\s*oid\s*\.\.\. on Commit \{ statusCheckRollup \{ state \} \}/);
   assert.match(MERGE_EVIDENCE_QUERY, /workflowRun \{ event runAttempt workflow/);
 });
 
@@ -147,7 +152,7 @@ test("re-request only the latest change requests from non-author human reviewers
   const evidence = {
     pr: {
       number: 1, state: "OPEN", draft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", reviewDecision: null,
-      head: { ref: "feature", sha: "new", repository: "o/r" }, base: { ref: "main", sha: "base", repository: "o/r" }, authorLogin: "author",
+      head: { ref: "feature", sha: "new", repository: "o/r" }, base: { ref: "main", sha: "base", repository: "o/r", rollupState: "SUCCESS" }, authorLogin: "author",
     },
     rollup: null, threads: [], rest: { pull: {}, repository: {}, protection: null, rules: null },
     reviews: [
