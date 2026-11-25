@@ -13,6 +13,12 @@
         "headRefOid": "fd2d929802c33741c934f5c2acd7c9fc7008e235",
         "baseRefName": "main",
         "baseRefOid": "c07944528911f306a9d81d46a9eec784d706d764",
+        "baseRef": {
+          "target": {
+            "oid": "f3559c92139ae1b86e85cc566ed4af97fbb19555",
+            "statusCheckRollup": { "state": "SUCCESS" }
+          }
+        },
         "reviewThreads": {
           "nodes": [],
           "pageInfo": {

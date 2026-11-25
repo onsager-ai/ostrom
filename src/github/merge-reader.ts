@@ -28,7 +28,7 @@ export interface MergeEvidence {
     mergeStateStatus: string;
     reviewDecision: string | null;
     head: { ref: string; sha: string; repository: string };
-    base: { ref: string; sha: string; repository: string };
+    base: { ref: string; sha: string; repository: string; rollupState: string | null };
     authorLogin: string | null;
   };
   rollup: { oid: string; state: string | null; contexts: unknown[]; suites: unknown[]; associatedPrNumbers: number[] } | null;
@@ -189,11 +189,17 @@ async function graphql(gh: GhRunner, variables: Record<string, string | number |
 
 function decodePull(row: Json): MergeEvidence["pr"] {
   const author = row["author"] === null ? null : object(row, "author");
+  const baseSha = string(row, "baseRefOid");
+  const baseRef = row["baseRef"] === null ? null : object(row, "baseRef");
+  const baseTarget = baseRef === null || baseRef["target"] === null ? null : object(baseRef, "target");
+  // A closed PR can retain its old base SHA after the branch has advanced.
+  const baseRollup = baseTarget !== null && string(baseTarget, "oid") === baseSha && baseTarget["statusCheckRollup"] !== null
+    ? object(baseTarget, "statusCheckRollup") : null;
   return {
     number: number(row, "number"), state: string(row, "state"), draft: boolean(row, "isDraft"),
     mergeable: string(row, "mergeable"), mergeStateStatus: string(row, "mergeStateStatus"), reviewDecision: nullableString(row, "reviewDecision"),
     head: { ref: string(row, "headRefName"), sha: string(row, "headRefOid"), repository: "" },
-    base: { ref: string(row, "baseRefName"), sha: string(row, "baseRefOid"), repository: "" },
+    base: { ref: string(row, "baseRefName"), sha: baseSha, repository: "", rollupState: baseRollup === null ? null : string(baseRollup, "state") },
     authorLogin: author === null ? null : nullableString(author, "login"),
   };
 }

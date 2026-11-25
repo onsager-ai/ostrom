@@ -13,6 +13,12 @@ query MergeEvidence(
       number state isDraft mergeable mergeStateStatus reviewDecision
       author { login }
       headRefName headRefOid baseRefName baseRefOid
+      baseRef {
+        target {
+          oid
+          ... on Commit { statusCheckRollup { state } }
+        }
+      }
       reviewThreads(first: 100, after: $threadsAfter) {
         nodes { id isResolved }
         pageInfo { hasNextPage endCursor }

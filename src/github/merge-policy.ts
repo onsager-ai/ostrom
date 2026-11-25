@@ -85,6 +85,8 @@ export function mergeEligibility(input: EligibilityInput): { eligible: true } | 
   if (unavailable(evidence.rest.protection) || unavailable(evidence.rest.rules)) return { eligible: false, reason: "branch requirements cannot be established" };
   const requirements = requiredEvidence(input);
   if (requirements !== null) return { eligible: false, reason: requirements };
+  const base = evidence.pr.base;
+  if (base.rollupState !== "SUCCESS") return { eligible: false, reason: `base ${base.ref} CI is ${base.rollupState?.toLowerCase() ?? "unknown"} at ${base.sha.slice(0, 7)}` };
   const effective = effectiveReviews(evidence.reviews);
   if ([...effective.values()].some((review) => review.state === "CHANGES_REQUESTED") || evidence.threads.some((thread) => !thread.resolved) || evidence.pr.reviewDecision === "CHANGES_REQUESTED" || evidence.pr.reviewDecision === "REVIEW_REQUIRED") return { eligible: false, reason: "review requirements are not satisfied" };
   if (input.policy.strategy === "approvals") {

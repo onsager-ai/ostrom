@@ -70,6 +70,7 @@ function fixture(policy: MergePolicy = { strategy: "unattended" }, subscribeToPr
       return JSON.stringify({ data: { repository: { pullRequest: {
         number: 2, state: remote.merged ? "MERGED" : "OPEN", isDraft: false, mergeable: remote.mergeable, mergeStateStatus: remote.mergeStateStatus,
         reviewDecision: "APPROVED", author: { login: "author" }, headRefName: "b", headRefOid: remote.head, baseRefName: remote.base, baseRefOid: remote.baseSha,
+        baseRef: { target: { oid: remote.baseSha, statusCheckRollup: { state: "SUCCESS" } } },
         reviewThreads: connection([]), reviews: connection(remote.reviews), commits: { nodes: [{ commit: {
           oid: remote.head, associatedPullRequests: connection([{ number: 2 }]), statusCheckRollup: { state: "SUCCESS", contexts: connection([check]) },
           checkSuites: connection([{ databaseId: 1, status: "COMPLETED", conclusion: "SUCCESS", repository: { nameWithOwner: "o/r" }, matchingPullRequests: connection([{ number: 2 }]),

@@ -69,6 +69,7 @@ not establish ownership. Human policy skips merge requests entirely. Otherwise a
    matching PR and workflow through GraphQL, as described below. Accept NEUTRAL/SKIPPED contexts
    as GitHub does only alongside that actual successful PR check/workflow. If GitHub evaluates
    required checks on a test merge commit, read its rollup too, tied to this head/base pair. [3][4][6]
+   Merging also waits for successful CI on the base branch's current commit.
 5. No effective submitted CHANGES_REQUESTED review remains, from any reviewer, and no unresolved
    review thread remains, including outdated threads. Read every page. Reduce each reviewer's
    submitted decisive reviews in order: APPROVED replaces their previous request for changes;
