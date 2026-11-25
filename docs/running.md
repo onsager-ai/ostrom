@@ -38,6 +38,45 @@ turn ends at its last recorded session activity (or its start if no later activi
 so daemon downtime does not consume the time budget. Reaching a budget pauses new work and queues
 a WIP prompt after the current turn finishes; it does not cancel that turn.
 
+### One daemon per repository
+
+A daemon serves one `OSTROM_REPO`. To run several on one machine, use the template unit
+`contrib/systemd/ostromd@.service`. Instance `ostromd@<name>` reads two files:
+
+- `~/.config/ostrom/<name>.env`: that repository's settings, the same variables as the
+  single-daemon `env` file above (including `OSTROM_REPO`, `OSTROM_ALLOWLIST`, `OSTROM_DB` and
+  `OSTROM_STALL_MINUTES`, which startup requires), and `PATH`. Give each instance its own
+  `OSTROM_DB` and worker worktree directory.
+- `~/.config/ostrom/secrets.env`: only the credentials the daemon and its Workers need, shared by
+  every instance. With a GitHub App, that is `OSTROM_GITHUB_APP_ID` and `OSTROM_GITHUB_APP_KEY_FILE`
+  (both or neither). Add the Codex provider's key variable if its config uses `env_key` (for
+  example `MAGPIE_API_KEY`), and `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` only if a Claude
+  session (Router or Workers) uses API-key or gateway authentication. Create the file once with
+  `(umask 077; touch ~/.config/ostrom/secrets.env)`, which never empties an existing file; run
+  `chmod 600` on a file that already exists. Keep unrelated credentials out: Workers inherit the
+  daemon's environment.
+
+Each instance sets `XDG_RUNTIME_DIR` to `$XDG_RUNTIME_DIR/ostrom-<name>`, so it gets its own
+operator socket. Leave `XDG_RUNTIME_DIR` out of both environment files: systemd lets a value there
+override the unit's, and one in the shared file would put every instance back on the same socket. Point the CLI and dashboard at an instance the same way:
+`XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR/ostrom-tolmap ostrom status`. Without the override they reach the
+single `ostromd.service` daemon. Stop that daemon before running an instance for the same
+repository.
+
+Both files are systemd environment files: one `KEY=VALUE` per line, with no `export` and no shell
+expansion. Then:
+
+```sh
+cp contrib/systemd/ostromd@.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now ostromd@tolmap
+loginctl enable-linger "$USER"   # start user services at boot, without a login session
+```
+
+Run the daemon as a service, not from an interactive or agent session: a process started inside a
+session is stopped with that session's scope. Check an instance with
+`systemctl --user is-active ostromd@<name>` and read its log with `journalctl --user -u ostromd@<name>`.
+
 Set `OSTROM_CODEX_PROVIDER` to override the operator's Codex `model_provider` for both new
 sessions and resumed turns. Ostrom passes it as the pinned SDK's `config.model_provider`
 (`codex exec --config model_provider=…`); when unset, Codex uses its own configuration.
