@@ -64,6 +64,7 @@ interface T3CodeExchangeOptions {
   code: string;
   verifier: string;
   resource?: string;
+  revocationEndpoint?: string;
 }
 
 async function oauthRequest(url: string | URL, operation: string, body?: URLSearchParams | string): Promise<Response> {
@@ -178,6 +179,15 @@ export async function exchangeAuthorizationCode(
   const token = await oauthJson<{ access_token: string; token_type: string; expires_in: number; scope: string }>(
     tokenEndpoint, "token exchange", body,
   );
+  // The browser approval page lets the owner choose access. Discard an over-scoped grant
+  // at the issuer as well, so a mistaken browser selection leaves no usable credential.
+  if (token.scope !== "orchestration:read" && typeof token.access_token === "string" && token.access_token
+    && options.revocationEndpoint !== undefined) {
+    if (new URL(options.revocationEndpoint).origin !== new URL(tokenEndpoint).origin) {
+      throw new Error("T3 OAuth revocation endpoint is on a different origin");
+    }
+    await revokeOAuthToken(options.revocationEndpoint, token.access_token);
+  }
   if (token.token_type !== "Bearer" || token.scope !== "orchestration:read" ||
       typeof token.access_token !== "string" || !token.access_token ||
       !Number.isFinite(token.expires_in) || token.expires_in < 0) {

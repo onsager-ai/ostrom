@@ -13,6 +13,7 @@ import {
 import type {
   Agent, Budget, Decision, DecisionEvent, DecisionStatus, DecisionVerification, FrictionEntry,
   FrictionStatus, Goal, JsonValue, Lane, LaneStatus, PolicyEvent, PolicyRule, Run, SpendSnapshot,
+  T3HostState, T3PendingWait, T3ThreadPr,
 } from "./types.ts";
 
 export class PlatformValidationError extends Error {}
@@ -53,6 +54,34 @@ export type UpsertSpendSnapshotInput = Pick<SpendSnapshot, "sessionUid" | "sourc
 export type UpsertAgentInput = OptionalFields<Omit<Agent, "updatedAt">, "laneId" | "lastSeenAt">;
 export type UpsertRunInput = OptionalFields<Omit<Run, "updatedAt">,
   "laneId" | "model" | "startedAt" | "completedAt" | "failureCount" | "waitingDetail" | "semonSessionUid">;
+
+export type T3HostUpdate = Pick<T3HostState, "hostId" | "label" | "mcpUrl" | "originNamespace" | "connectionState">
+  & Partial<Omit<T3HostState, "hostId" | "label" | "mcpUrl" | "originNamespace" | "connectionState" | "updatedAt">>;
+export type T3WaitInput = Omit<T3PendingWait, "resolvedAt" | "resolution">;
+export type T3PrInput = Omit<T3ThreadPr, "lastWakeOutcome" | "lastWakeSummary" | "lastWakeAt">;
+export type T3PrWake = Pick<T3ThreadPr, "hostId" | "threadId" | "prHost" | "repository" | "number"> & {
+  outcome: string;
+  summary: string;
+  occurredAt: string;
+  watchEnded: boolean;
+};
+export interface T3ThreadSnapshot {
+  threadId: string;
+  agent: UpsertAgentInput;
+  runs: Omit<UpsertRunInput, "semonSessionUid">[];
+  waits?: T3WaitInput[];
+  prs?: T3PrInput[];
+}
+
+const t3HostColumns = `host_id AS hostId, label, mcp_url AS mcpUrl, origin_namespace AS originNamespace,
+  environment_id AS environmentId, server_version AS serverVersion, token_expires_at AS tokenExpiresAt,
+  connection_state AS connectionState, last_reconciled_at AS lastReconciledAt, last_event_at AS lastEventAt,
+  last_error AS lastError, consecutive_failures AS consecutiveFailures, updated_at AS updatedAt`;
+const t3WaitColumns = `host_id AS hostId, thread_id AS threadId, request_id AS requestId, kind,
+  questions_json AS questions, occurred_at AS occurredAt, resolved_at AS resolvedAt, resolution`;
+const t3PrColumns = `host_id AS hostId, thread_id AS threadId, pr_host AS prHost, repository, number,
+  url, source, state, watching, title, head_branch AS headBranch, base_branch AS baseBranch, is_draft AS isDraft,
+  last_wake_outcome AS lastWakeOutcome, last_wake_summary AS lastWakeSummary, last_wake_at AS lastWakeAt`;
 
 const laneColumns = `id, slug, name, status, owner_agent_id AS ownerAgentId,
   priority_rank AS priorityRank, created_at AS createdAt, updated_at AS updatedAt`;
@@ -644,4 +673,209 @@ export class PlatformStore {
     if (row === null) throw new PlatformNotFoundError(`run ${runId} not found`);
     return runFromRow(row);
   }
+
+  upsertT3HostState(input: T3HostUpdate): T3HostState {
+    const current = this.get<T3HostState>(`SELECT ${t3HostColumns} FROM t3_host_state WHERE host_id = ?`, input.hostId);
+    const state = { environmentId: null, serverVersion: null, tokenExpiresAt: null, lastReconciledAt: null,
+      lastEventAt: null, lastError: null, consecutiveFailures: 0, ...current, ...input };
+    return this.write<T3HostState>(`INSERT INTO t3_host_state (host_id, label, mcp_url, origin_namespace,
+      environment_id, server_version, token_expires_at, connection_state, last_reconciled_at, last_event_at,
+      last_error, consecutive_failures, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (host_id) DO UPDATE SET label = excluded.label, mcp_url = excluded.mcp_url,
+        origin_namespace = excluded.origin_namespace, environment_id = excluded.environment_id,
+        server_version = excluded.server_version, token_expires_at = excluded.token_expires_at,
+        connection_state = excluded.connection_state, last_reconciled_at = excluded.last_reconciled_at,
+        last_event_at = excluded.last_event_at, last_error = excluded.last_error,
+        consecutive_failures = excluded.consecutive_failures, updated_at = excluded.updated_at
+      RETURNING ${t3HostColumns}`, state.hostId, state.label, state.mcpUrl, state.originNamespace,
+    state.environmentId, state.serverVersion, state.tokenExpiresAt, state.connectionState,
+    state.lastReconciledAt, state.lastEventAt, state.lastError, state.consecutiveFailures, this.now());
+  }
+
+  listT3HostStates(): T3HostState[] {
+    return this.all<T3HostState>(`SELECT ${t3HostColumns} FROM t3_host_state ORDER BY host_id`);
+  }
+
+  getT3Cursor(hostId: string, eventType: string): string | null {
+    return this.get<{ cursor: string }>(
+      "SELECT cursor FROM t3_cursor WHERE host_id = ? AND event_type = ?", hostId, eventType)?.cursor ?? null;
+  }
+
+  setT3Cursor(hostId: string, eventType: string, cursor: string | null): void {
+    if (cursor === null) return;
+    this.db.prepare(`INSERT INTO t3_cursor (host_id, event_type, cursor, updated_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT (host_id, event_type) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at
+      WHERE t3_cursor.cursor <> excluded.cursor`).run(hostId, eventType, cursor, this.now());
+  }
+
+  clearT3CursorsForHost(hostId: string): void {
+    this.db.prepare("DELETE FROM t3_cursor WHERE host_id = ?").run(hostId);
+  }
+
+  recordT3Wait(input: T3WaitInput, fromSnapshot = false): void {
+    this.db.prepare(`INSERT INTO t3_pending_wait (host_id, thread_id, request_id, kind, questions_json, occurred_at)
+      VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (host_id, thread_id, request_id) DO UPDATE SET
+        kind = excluded.kind, questions_json = excluded.questions_json,
+        occurred_at = CASE WHEN t3_pending_wait.resolved_at IS NULL
+          THEN min(t3_pending_wait.occurred_at, excluded.occurred_at) ELSE excluded.occurred_at END,
+        resolved_at = NULL, resolution = NULL
+      WHERE t3_pending_wait.resolved_at IS NULL OR (? AND t3_pending_wait.resolution = 'reconciled')`).run(
+      input.hostId, input.threadId, input.requestId, input.kind, encode(input.questions, "questions"), input.occurredAt,
+      Number(fromSnapshot));
+  }
+
+  resolveT3Wait(input: Omit<T3WaitInput, "questions">, resolution: string): void {
+    // Keep a record even if resolution precedes the matching event on its separate stream.
+    this.db.prepare(`INSERT INTO t3_pending_wait (host_id, thread_id, request_id, kind, questions_json,
+      occurred_at, resolved_at, resolution) VALUES (?, ?, ?, ?, 'null', ?, ?, ?)
+      ON CONFLICT (host_id, thread_id, request_id) DO UPDATE SET
+        resolved_at = excluded.resolved_at, resolution = excluded.resolution
+      WHERE t3_pending_wait.resolved_at IS NULL OR t3_pending_wait.resolution = 'reconciled'`).run(
+      input.hostId, input.threadId, input.requestId, input.kind, input.occurredAt, input.occurredAt, resolution);
+  }
+
+  listOpenT3Waits(hostId?: string, threadId?: string): T3PendingWait[] {
+    return this.all<JsonColumns<T3PendingWait, "questions">>(`SELECT ${t3WaitColumns} FROM t3_pending_wait
+      WHERE resolved_at IS NULL AND host_id = coalesce(?, host_id) AND thread_id = coalesce(?, thread_id)
+      ORDER BY occurred_at, host_id, thread_id, request_id`, hostId ?? null, threadId ?? null)
+      .map((row) => ({ ...row, questions: decode(row.questions) }));
+  }
+
+  private upsertT3Pr(pr: T3PrInput): void {
+    this.db.prepare(`INSERT INTO t3_thread_pr (host_id, thread_id, pr_host, repository, number, url, source,
+      state, watching, title, head_branch, base_branch, is_draft) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (host_id, thread_id, pr_host, repository, number) DO UPDATE SET url = excluded.url,
+        source = excluded.source, state = excluded.state, watching = excluded.watching, title = excluded.title,
+        head_branch = excluded.head_branch, base_branch = excluded.base_branch, is_draft = excluded.is_draft`)
+      .run(pr.hostId, pr.threadId, pr.prHost, pr.repository, pr.number, pr.url, pr.source, pr.state,
+        Number(pr.watching), pr.title, pr.headBranch, pr.baseBranch, pr.isDraft === null ? null : Number(pr.isDraft));
+  }
+
+  recordT3PrWake(wake: T3PrWake): void {
+    this.db.prepare(`INSERT INTO t3_thread_pr (host_id, thread_id, pr_host, repository, number, url, source,
+      watching, last_wake_outcome, last_wake_summary, last_wake_at) VALUES (?, ?, ?, ?, ?, '', 'watch', ?, ?, ?, ?)
+      ON CONFLICT (host_id, thread_id, pr_host, repository, number) DO UPDATE SET
+        watching = CASE WHEN ? THEN 0 ELSE t3_thread_pr.watching END,
+        last_wake_outcome = excluded.last_wake_outcome, last_wake_summary = excluded.last_wake_summary,
+        last_wake_at = excluded.last_wake_at
+      WHERE t3_thread_pr.last_wake_at IS NULL OR t3_thread_pr.last_wake_at < excluded.last_wake_at`).run(
+      wake.hostId, wake.threadId, wake.prHost, wake.repository, wake.number, Number(!wake.watchEnded),
+      wake.outcome, wake.summary, wake.occurredAt, Number(wake.watchEnded));
+  }
+
+  listT3ThreadPrs(hostId?: string, threadId?: string): T3ThreadPr[] {
+    type Row = Omit<T3ThreadPr, "watching" | "isDraft"> & { watching: number; isDraft: number | null };
+    return this.all<Row>(`SELECT ${t3PrColumns} FROM t3_thread_pr
+      WHERE host_id = coalesce(?, host_id) AND thread_id = coalesce(?, thread_id)
+      ORDER BY last_wake_at DESC, host_id, thread_id, pr_host, repository, number`, hostId ?? null, threadId ?? null)
+      .map((row) => ({ ...row, watching: row.watching === 1, isDraft: row.isDraft === null ? null : row.isDraft === 1 }));
+  }
+
+  private applyT3Thread(snapshot: T3ThreadSnapshot, observedAt: string): void {
+    const { agent, runs, threadId, waits, prs } = snapshot;
+    this.upsertAgent(agent);
+    for (const run of runs) this.upsertRun(run);
+    // If a previous active run has fallen outside T3's bounded history, stop counting it as live.
+    this.db.prepare(`UPDATE run SET status = 'interrupted', completed_at = ?, updated_at = ?
+      WHERE agent_id = ? AND status IN ('running', 'waiting_input', 'waiting_approval', 'stalled')
+        AND id NOT IN (SELECT value FROM json_each(?))`).run(
+      observedAt, observedAt, agent.id, JSON.stringify(runs.map((run) => run.id)));
+    if (waits !== undefined) {
+      for (const wait of waits) this.recordT3Wait(wait, true);
+      this.db.prepare(`UPDATE t3_pending_wait SET resolved_at = ?, resolution = 'reconciled'
+        WHERE host_id = ? AND thread_id = ? AND resolved_at IS NULL
+          AND request_id NOT IN (SELECT value FROM json_each(?))`).run(
+        observedAt, agent.hostId, threadId, JSON.stringify(waits.map((wait) => wait.requestId)));
+    }
+    if (prs !== undefined) {
+      this.db.prepare("UPDATE t3_thread_pr SET watching = 0 WHERE host_id = ? AND thread_id = ?")
+        .run(agent.hostId, threadId);
+      for (const pr of prs) this.upsertT3Pr(pr);
+    }
+  }
+
+  reconcileT3Host(host: T3HostUpdate, snapshots: T3ThreadSnapshot[], opts: {
+    observedAt: string;
+    listedAgentIds?: string[];
+    listedThreadIds?: string[];
+    anchors?: ReadonlyMap<string, string | null>;
+  }): T3HostState {
+    return this.transaction(() => {
+      const state = this.upsertT3HostState({ ...host, connectionState: "connected", lastReconciledAt: opts.observedAt,
+        lastError: null, consecutiveFailures: 0 });
+      if (opts.anchors !== undefined) {
+        this.clearT3CursorsForHost(host.hostId);
+        for (const [name, cursor] of opts.anchors) this.setT3Cursor(host.hostId, name, cursor);
+      }
+      for (const snapshot of snapshots) this.applyT3Thread(snapshot, opts.observedAt);
+      if (opts.listedAgentIds !== undefined) {
+        const listed = JSON.stringify(opts.listedAgentIds);
+        this.db.prepare(`UPDATE agent SET status = 'offline', updated_at = ?
+          WHERE host_id = ? AND connector_kind = 't3' AND status <> 'offline'
+            AND id NOT IN (SELECT value FROM json_each(?))`).run(opts.observedAt, host.hostId, listed);
+        this.db.prepare(`UPDATE run SET status = 'interrupted', completed_at = ?, updated_at = ?
+          WHERE host_id = ? AND connector_kind = 't3' AND status IN ('running', 'waiting_input', 'waiting_approval', 'stalled')
+            AND agent_id NOT IN (SELECT value FROM json_each(?))`).run(opts.observedAt, opts.observedAt, host.hostId, listed);
+      }
+      if (opts.listedThreadIds !== undefined) {
+        const listed = JSON.stringify(opts.listedThreadIds);
+        this.db.prepare(`UPDATE t3_pending_wait SET resolved_at = ?, resolution = 'reconciled'
+          WHERE host_id = ? AND resolved_at IS NULL AND thread_id NOT IN (SELECT value FROM json_each(?))`)
+          .run(opts.observedAt, host.hostId, listed);
+        this.db.prepare(`UPDATE t3_thread_pr SET watching = 0
+          WHERE host_id = ? AND watching = 1 AND thread_id NOT IN (SELECT value FROM json_each(?))`)
+          .run(host.hostId, listed);
+      }
+      return state;
+    });
+  }
+
+  applyT3Event(hostId: string, eventType: string, cursor: string | null, occurredAt: string,
+    snapshot: T3ThreadSnapshot | undefined, apply: () => void): void {
+    this.transaction(() => {
+      if (snapshot !== undefined) this.applyT3Thread(snapshot, this.now());
+      apply();
+      this.setT3Cursor(hostId, eventType, cursor);
+      this.db.prepare(`UPDATE t3_host_state SET last_event_at = ?, updated_at = ?
+        WHERE host_id = ? AND (last_event_at IS NULL OR last_event_at < ?)`)
+        .run(occurredAt, this.now(), hostId, occurredAt);
+    });
+  }
+
+  markRunStalled(id: string): void {
+    this.db.prepare("UPDATE run SET status = 'stalled', updated_at = ? WHERE id = ? AND status = 'running'")
+      .run(this.now(), id);
+  }
+
+  hasOpenPolicyEvent(ruleCode: string, dedupeKey: string): boolean {
+    return this.get("SELECT 1 FROM policy_event WHERE rule_code = ? AND dedupe_key = ? AND resolved_at IS NULL",
+      ruleCode, dedupeKey) !== null;
+  }
+
+  recordDedupedPolicyEvent(input: RecordPolicyEventInput, key: string, at: string, friction = false): PolicyEvent | null {
+    return this.transaction(() => {
+      const row = this.get<PolicyEventRow>(`INSERT INTO policy_event
+        (id, rule_code, lane_id, summary, detail_json, created_at, dedupe_key) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (rule_code, dedupe_key) WHERE resolved_at IS NULL AND dedupe_key IS NOT NULL DO NOTHING
+        RETURNING ${policyEventColumns}`, newId("pol"), input.ruleCode, input.laneId ?? null, input.summary,
+      encode(input.detail ?? null, "detail"), at, key);
+      if (row === null) return null;
+      if (friction) this.db.prepare(`INSERT INTO friction_entry (id, kind, summary, status, lane_id, rule_code, created_at)
+        VALUES (?, 'policy_break', ?, 'open', ?, ?, ?)`).run(
+        newId("fric"), row.summary, row.laneId, row.ruleCode, at);
+      return { ...row, detail: decode(row.detail) };
+    });
+  }
+
+  resolveInactivePolicyEvents(ruleCode: string, activeKeys: readonly string[], at: string): void {
+    this.db.prepare(`UPDATE policy_event SET resolved_at = ? WHERE rule_code = ? AND resolved_at IS NULL
+      AND dedupe_key IS NOT NULL AND dedupe_key NOT IN (SELECT value FROM json_each(?))`)
+      .run(at, ruleCode, JSON.stringify(activeKeys));
+  }
+
+  listOpenPolicyEvents(): PolicyEvent[] {
+    return this.all<PolicyEventRow>(`SELECT ${policyEventColumns} FROM policy_event WHERE resolved_at IS NULL
+      ORDER BY created_at DESC, rowid DESC`).map((row) => ({ ...row, detail: decode(row.detail) }));
+  }
+
 }

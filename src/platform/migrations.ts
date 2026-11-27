@@ -211,6 +211,68 @@ const migrations = [
     updated_at TEXT NOT NULL
   ) STRICT;
   `,
+  `
+  CREATE TABLE t3_host_state (
+    host_id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    mcp_url TEXT NOT NULL,
+    origin_namespace TEXT,
+    environment_id TEXT,
+    server_version TEXT,
+    token_expires_at TEXT,
+    connection_state TEXT NOT NULL CHECK (connection_state IN ('connecting', 'connected', 'stale', 'auth_expired', 'disconnected')),
+    last_reconciled_at TEXT,
+    last_event_at TEXT,
+    last_error TEXT,
+    consecutive_failures INTEGER NOT NULL CHECK (consecutive_failures >= 0),
+    updated_at TEXT NOT NULL
+  ) STRICT;
+
+  CREATE TABLE t3_cursor (
+    host_id TEXT NOT NULL REFERENCES t3_host_state(host_id),
+    event_type TEXT NOT NULL,
+    cursor TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (host_id, event_type)
+  ) STRICT;
+
+  CREATE TABLE t3_pending_wait (
+    host_id TEXT NOT NULL REFERENCES t3_host_state(host_id),
+    thread_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('user_input', 'approval')),
+    questions_json TEXT NOT NULL CHECK (json_valid(questions_json)),
+    occurred_at TEXT NOT NULL,
+    resolved_at TEXT,
+    resolution TEXT,
+    PRIMARY KEY (host_id, thread_id, request_id)
+  ) STRICT;
+
+  CREATE TABLE t3_thread_pr (
+    host_id TEXT NOT NULL REFERENCES t3_host_state(host_id),
+    thread_id TEXT NOT NULL,
+    pr_host TEXT NOT NULL,
+    repository TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    url TEXT NOT NULL,
+    source TEXT NOT NULL,
+    state TEXT,
+    watching INTEGER NOT NULL CHECK (watching IN (0, 1)),
+    title TEXT,
+    head_branch TEXT,
+    base_branch TEXT,
+    is_draft INTEGER CHECK (is_draft IN (0, 1)),
+    last_wake_outcome TEXT,
+    last_wake_summary TEXT,
+    last_wake_at TEXT,
+    PRIMARY KEY (host_id, thread_id, pr_host, repository, number)
+  ) STRICT;
+
+  ALTER TABLE policy_event ADD COLUMN dedupe_key TEXT;
+  ALTER TABLE policy_event ADD COLUMN resolved_at TEXT;
+  CREATE UNIQUE INDEX policy_event_open_key ON policy_event(rule_code, dedupe_key)
+    WHERE resolved_at IS NULL AND dedupe_key IS NOT NULL;
+  `,
 ];
 
 // Read the version with the writer lock held so simultaneous opens cannot apply the same migration.

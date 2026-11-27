@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ostrom Platform</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f3f5f7; --panel: #fff; --ink: #202a35; --muted: #526171; --line: #d8e0e8; --accent: #175c52; --warn: #8d3028; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #171d23; --panel: #202930; --ink: #e8eff4; --muted: #b0c0cd; --line: #455361; --accent: #92deca; --warn: #ffb6ac; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.5 system-ui, sans-serif; }
+  main { max-width: 1050px; margin: auto; padding: clamp(16px, 4vw, 36px); }
+  header { margin-bottom: 24px; border-bottom: 1px solid var(--line); padding-bottom: 16px; }
+  h1, h2, h3, p { margin: 0; }
+  h1 { font-size: 29px; letter-spacing: -.04em; }
+  h2 { margin-bottom: 10px; font-size: 19px; }
+  h3 { font-size: 16px; }
+  .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+  section { padding: 16px; min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 9px; }
+  .wide { grid-column: 1 / -1; }
+  .row { border-top: 1px solid var(--line); padding: 8px 0; overflow-wrap: anywhere; }
+  .row:last-child { padding-bottom: 0; }
+  .muted, time { color: var(--muted); }
+  #error { color: var(--warn); font-weight: 600; margin-bottom: 14px; }
+  #summary { color: var(--accent); font-weight: 600; }
+  pre { margin: 8px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+  code { overflow-wrap: anywhere; }
+  button, select { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 5px; padding: 2px 8px; }
+  button { margin-left: 8px; cursor: pointer; }
+  @media (max-width: 630px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Ostrom Platform</h1>
+    <p id="summary"></p>
+    <p id="refresh" class="muted" aria-live="polite">Loading…</p>
+  </header>
+  <p id="error" role="alert" hidden></p>
+  <div class="grid">
+    <section><h2>Decision Inbox</h2><div id="decisions"></div></section>
+    <section><h2>Lanes &amp; Goals</h2><div id="lanes"></div></section>
+    <section><h2>Cross-Host Runs &amp; Pending Waits</h2><div id="work"></div></section>
+    <section><h2>Host Health &amp; OAuth Expiry</h2><div id="hosts"></div></section>
+    <section class="wide"><h2>Policy Alerts &amp; Friction</h2><div id="policy"></div></section>
+    <section class="wide">
+      <h2>Digest preview</h2>
+      <label for="window">Window</label>
+      <select id="window"><option>01:00Z</option><option>13:00Z</option><option>weekly</option></select>
+      <pre id="digest"></pre>
+    </section>
+  </div>
+</main>
+<script type="module">
+  const token = new URLSearchParams(location.hash.slice(1)).get("token");
+  history.replaceState(null, "", location.pathname + location.search);
+
+  const byId = (id) => document.getElementById(id);
+  const element = (tag, text, className) => {
+    const node = document.createElement(tag);
+    node.textContent = text;
+    if (className) node.className = className;
+    return node;
+  };
+  function row(title, detail) {
+    const node = element("div", "", "row");
+    node.append(element("h3", title), element("p", detail));
+    return node;
+  }
+  function show(id, nodes) {
+    byId(id).replaceChildren(...(nodes.length ? nodes : [element("p", "None", "muted")]));
+  }
+  async function read(path) {
+    const response = await fetch(path, {
+      headers: { Authorization: `Bearer ${token}` }, cache: "no-store", signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) throw new Error(response.status === 401 ? "Open the dashboard URL printed by the CLI." : `Platform returned HTTP ${response.status}.`);
+    return response.json();
+  }
+
+  function render({ digest, health, friction }) {
+    const { sections } = digest;
+    byId("summary").textContent = digest.summary;
+    show("decisions", sections.decisions.map((decision) => {
+      const node = row(decision.title, `${decision.urgency} · ${decision.category} · ${decision.authority}`);
+      const copy = element("button", "Copy ID");
+      copy.type = "button";
+      copy.onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(decision.id);
+          copy.textContent = "Copied";
+        } catch {
+          copy.textContent = "Select the ID to copy";
+        }
+      };
+      node.append(element("p", decision.recommendation), element("code", decision.id), copy);
+      return node;
+    }));
+    show("lanes", sections.lanes.map((lane) => row(lane.name, lane.goal
+      ? `${lane.goal.statement} · ${lane.goal.metricName} ${lane.goal.metricCurrent ?? "unknown"}/${lane.goal.metricTarget} · ${lane.goal.approvedDecisionId ?? "unapproved"}`
+      : "No weekly goal")));
+    const stalled = new Set(health.stalledRuns.map((run) => run.id));
+    const labels = new Map(health.agents.map((agent) => [agent.id, agent.label]));
+    show("work", [
+      ...health.activeRuns.map((run) => row(labels.get(run.agentId) ?? run.externalRunRef,
+        `${run.hostId} · ${stalled.has(run.id) ? "stalled" : run.status}`)),
+      ...health.waits.map((wait) => row(`${wait.hostId} · ${wait.kind === "approval" ? "Approval" : "User input"}`,
+        Array.isArray(wait.questions) && wait.questions.length
+          ? wait.questions.map((item) => item.question).join(" · ") : wait.requestId)),
+      ...sections.prs.map((pr) => row(`${pr.repository} #${pr.number}`,
+        `${pr.hostId} · ${pr.lastWakeOutcome} · ${pr.lastWakeSummary}`)),
+    ]);
+    const warnings = new Set(health.tokenExpiryWarnings.map((warning) => warning.hostId));
+    show("hosts", health.hosts.map((host) => row(host.label,
+      `${host.connectionState} · ${host.tokenExpiresAt ? `OAuth expires ${host.tokenExpiresAt}` : "No OAuth expiry available"}`
+      + `${warnings.has(host.hostId) ? " · expires within 7 days" : ""}${host.lastError ? ` · ${host.lastError}` : ""}`)));
+    show("policy", [
+      ...sections.policyAlerts.map((alert) => row(alert.ruleCode, alert.summary)),
+      ...friction.map((entry) => row(entry.kind, entry.summary)),
+    ]);
+    byId("digest").textContent = digest.markdown;
+  }
+
+  let refreshed = false;
+  async function refresh() {
+    try {
+      const requests = await Promise.allSettled([
+        read(`/v1/digest?window=${encodeURIComponent(byId("window").value)}`),
+        read("/v1/health/summary"),
+        read("/v1/friction?status=open"),
+      ]);
+      const [digest, health, friction] = requests;
+      for (const response of requests) if (response.status === "rejected") throw response.reason;
+      render({ digest: digest.value, health: health.value, friction: friction.value });
+      byId("error").hidden = true;
+      byId("refresh").textContent = `Updated ${new Date().toLocaleTimeString()} · refreshes every 5 seconds`;
+      refreshed = true;
+    } catch (error) {
+      const label = byId("error");
+      label.textContent = `${refreshed ? "Stale data" : "Dashboard unavailable"}. ${error.message}`;
+      label.hidden = false;
+      byId("refresh").textContent = "Retrying in 5 seconds";
+    } finally {
+      setTimeout(refresh, 5000);
+    }
+  }
+  if (token) void refresh();
+  else {
+    byId("error").textContent = "Open the dashboard URL printed by the CLI.";
+    byId("error").hidden = false;
+    byId("refresh").textContent = "";
+  }
+</script>
+</body>
+</html>
