@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { SemonCliSpendSource } from "./spend.ts";
+import { PlatformStore } from "./store.ts";
+import { SemonCliSpendSource, refreshSpendSnapshots } from "./spend.ts";
 
 const factColumns = [
   "session_uid", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_5m_tokens",
@@ -42,7 +43,7 @@ test("Semon validates schema, resolves exact native identity and loads only the 
     coverage: "partial",
   });
   assert.equal(await source.resolveSessionUid({ ...identity, nativeSessionId: "' OR true --" }), null);
-  assert.deepEqual(await source.getSnapshot("x'; DELETE"), { status: "unavailable", snapshot: null });
+  assert.deepEqual(await source.getSnapshot("x'; DELETE"), { status: "invalid_session", snapshot: null });
   assert.deepEqual(calls[0], ["query", "schema"]);
   assert.equal(calls.length, 3);
 });
@@ -79,4 +80,60 @@ test("Semon supports the released fact schema without billed USD or an as-of tim
   assert.equal(snapshot?.coverage, "complete");
   rows = [];
   assert.equal((await source.getSnapshot("uid")).status, "not_found");
+});
+
+test("refresh links only exact native identities and skips a bad UID before a valid session", async (t) => {
+  const store = PlatformStore.open(":memory:");
+  t.after(() => store.close());
+  const now = "2026-11-27T13:00:00Z";
+  const agent = store.upsertAgent({ id: "worker", role: "worker", hostId: "east", connectorKind: "t3",
+    externalRef: "thread", label: "Worker", status: "idle" });
+  const run = { agentId: agent.id, hostId: "east", connectorKind: "t3", status: "completed", startedAt: now } as const;
+  store.upsertRun({ ...run, id: "a", externalRunRef: "a", semonSessionUid: "unsupported uid" });
+  store.upsertRun({ ...run, id: "b", externalRunRef: "b",
+    semonIdentity: { originNamespace: "east", nativeHarness: "codex", nativeSessionId: "native-1" } });
+  store.upsertRun({ ...run, id: "c", externalRunRef: "native-2", semonSessionUid: "linked" });
+  store.upsertRun({ ...run, id: "d", externalRunRef: "native-1" });
+  store.upsertSpendSnapshot({ source: "semon", sessionUid: "unsupported uid", usdEst: 9, coverage: "complete" });
+  const queries: string[] = [];
+  let fail = false;
+  let omitIdentitySchema = false;
+  let missLinkedSession = false;
+  const makeSource = () => new SemonCliSpendSource("semon", async (_bin, args) => {
+    if (args[1] === "schema") return JSON.stringify(schema(
+      ["dim_session", omitIdentitySchema ? ["session_uid"] : dimColumns], ["fact_session", factColumns]));
+    const sql = args[2] ?? "";
+    queries.push(sql);
+    if (sql.includes("dim_session")) {
+      assert.match(sql, /origin_namespace = 'east' AND native_harness = 'codex' AND native_session_id = 'native-1'/);
+      return JSON.stringify({ truncated: false, rows: [["exact-uid"]] });
+    }
+    if (fail) throw new Error("process unavailable");
+    if (missLinkedSession && sql.includes("'linked'")) return JSON.stringify({ truncated: false, rows: [] });
+    return JSON.stringify({ truncated: false, rows: [[1, 2, 0, 0, 0, 3, null, true, null, null, null]] });
+  });
+  const signal = new AbortController().signal;
+  const source = makeSource();
+  const summary = () => store.summarizeSpend({ scopeKind: "team", scopeId: null, period: "daily", source: "semon" }, now);
+  await refreshSpendSnapshots(store, source, signal);
+  assert.deepEqual(store.listRuns().map((item) => item.semonSessionUid), ["unsupported uid", "exact-uid", "linked", null]);
+  assert.equal(store.getSpendSnapshot("linked")?.usdEst, 3);
+  assert.equal(store.getSpendSnapshot("exact-uid")?.usdEst, 3);
+  assert.equal(summary().staleSnapshotCount, 1);
+  assert.equal(queries.length, 3);
+  missLinkedSession = true;
+  await refreshSpendSnapshots(store, source, signal);
+  assert.equal(summary().staleSnapshotCount, 2);
+  assert.match(queries.at(-1) ?? "", /exact-uid/);
+  fail = true;
+  await refreshSpendSnapshots(store, source, signal);
+  assert.equal(summary().staleSnapshotCount, 3);
+  fail = false;
+  missLinkedSession = false;
+  omitIdentitySchema = true;
+  store.upsertRun({ ...run, id: "e", externalRunRef: "e",
+    semonIdentity: { originNamespace: "east", nativeHarness: "codex", nativeSessionId: "native-3" } });
+  await refreshSpendSnapshots(store, makeSource(), signal);
+  assert.equal(store.listRuns().at(-1)?.semonSessionUid, null);
+  assert.equal(summary().staleSnapshotCount, 1);
 });

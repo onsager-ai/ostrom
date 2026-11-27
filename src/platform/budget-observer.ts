@@ -6,7 +6,9 @@ export function readSpendSummary(store: PlatformStore, filter: SpendSummaryFilte
   const status = summary.snapshotCount === 0 ? "unavailable" as const : "available" as const;
   return {
     ...summary, status, sourceCoverage: summary.coverage,
-    coverage: status === "unavailable" ? null : summary.incompleteCount > 0 || summary.unpricedCount > 0 ? "partial" : "complete",
+    coverage: summary.preferredUsd === null ? "unknown" as const
+      : summary.incompleteCount > 0 || summary.unpricedCount > 0 || summary.incompleteRunCount > 0
+        ? "partial" as const : "complete" as const,
   };
 }
 
@@ -15,8 +17,7 @@ export function readBudgetsAndSpend(store: PlatformStore, now: Date | string) {
     scopeKind: budget.scopeKind, scopeId: budget.scopeId, period: budget.period, source: budget.spendSource,
   }, now) }));
   const team = readSpendSummary(store, { scopeKind: "team", scopeId: null, period: "monthly", source: "semon" }, now);
-  const spend = team.status === "available" ? team : { status: "unavailable" as const };
-  return { budgets, spend };
+  return { budgets, spend: team };
 }
 
 export function evaluateBudgets(store: PlatformStore, now: string, enabled: boolean): PolicyEvent[] {
@@ -28,11 +29,11 @@ export function evaluateBudgets(store: PlatformStore, now: string, enabled: bool
       if (!budget.enabled) continue;
       const { spend } = budget;
       const warning = budget.capUsd * (budget.warnPct / 100);
-      const complete = spend.unpricedCount === 0 && spend.incompleteCount === 0 && spend.snapshotCount > 0;
+      const complete = spend.coverage === "complete";
       for (const [level, threshold] of [["warning", warning], ["cap", budget.capUsd]] as const) {
-        const key = JSON.stringify([budget.id, spend.since, budget.spendSource, level]);
+        const key = JSON.stringify([budget.id, level]);
         if (spend.preferredUsd === null || spend.preferredUsd < threshold) {
-          // Missing prices cannot establish recovery within an active period.
+          // Missing prices cannot establish recovery even after a new period begins.
           if (!complete && store.hasOpenPolicyEvent(ruleCode, key)) keys.push(key);
           continue;
         }

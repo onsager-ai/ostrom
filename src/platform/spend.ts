@@ -2,11 +2,12 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 import type { PlatformStore } from "./store.ts";
-import type { SpendSnapshot } from "./types.ts";
+import { isSemonKey } from "./types.ts";
+import type { SemonSessionIdentity, SpendSnapshot } from "./types.ts";
 
 export type SpendLookup =
   | { status: "available"; snapshot: Readonly<SpendSnapshot> }
-  | { status: "not_found" | "unavailable"; snapshot: null };
+  | { status: "not_found" | "invalid_session" | "unavailable"; snapshot: null };
 
 export interface SpendSource {
   getSnapshot(sessionUid: string): Promise<SpendLookup>;
@@ -17,7 +18,6 @@ export function unavailableSpendSource(): SpendSource {
 }
 
 type SemonRunner = (bin: string, args: string[]) => Promise<string>;
-type SessionIdentity = { originNamespace: string; nativeHarness: string; nativeSessionId: string };
 
 const exec = promisify(execFile);
 const runSemon: SemonRunner = async (bin, args) => {
@@ -30,7 +30,7 @@ const factFields = [
   "usd_est", "reported_usd", "usage_complete",
 ] as const;
 const identityFields = ["origin_namespace", "native_harness", "native_session_id"];
-const safeKey = (key: string) => /^[\w.:@/+=-]{1,256}$/.test(key);
+const invalidSession = { status: "invalid_session", snapshot: null } as const;
 const unavailable = { status: "unavailable", snapshot: null } as const;
 
 interface SemonQuery {
@@ -71,22 +71,32 @@ export class SemonCliSpendSource implements SpendSource {
     return result;
   }
 
-  async resolveSessionUid({ originNamespace, nativeHarness, nativeSessionId }: SessionIdentity): Promise<string | null> {
+  async supportsSessionIdentity(): Promise<boolean> {
+    try {
+      await this.fields("dim_session", ["session_uid", ...identityFields]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async resolveSessionUid({ originNamespace, nativeHarness, nativeSessionId }: SemonSessionIdentity): Promise<string | null> {
     const values = [originNamespace, nativeHarness, nativeSessionId];
-    if (!values.every(safeKey)) return null;
+    if (!values.every(isSemonKey)) return null;
     try {
       await this.fields("dim_session", ["session_uid", ...identityFields]);
       const where = identityFields.map((field, index) => `${field} = '${values[index]}'`).join(" AND ");
       const { rows } = await this.query(`SELECT session_uid FROM dim_session WHERE ${where} LIMIT 2`);
       const uid = rows[0]?.[0];
-      return rows.length === 1 && typeof uid === "string" && safeKey(uid) ? uid : null;
+      return rows.length === 1 && typeof uid === "string" && isSemonKey(uid) ? uid : null;
     } catch {
       return null;
     }
   }
 
   async getSnapshot(sessionUid: string): Promise<SpendLookup> {
-    if (!safeKey(sessionUid)) return unavailable;
+    if (!isSemonKey(sessionUid)) return invalidSession;
+    let result: SemonQuery;
     try {
       const fields = await this.fields("fact_session", ["session_uid", ...factFields]);
       const billed = fields.has("billed_usd") ? "billed_usd" : "NULL";
@@ -95,16 +105,20 @@ export class SemonCliSpendSource implements SpendSource {
           ? "CASE WHEN source_status <> 'complete' OR computation_status <> 'current' THEN 'partial' END"
           : "NULL";
       const asOf = fields.has("as_of") ? "as_of" : "NULL";
-      const result = await this.query(`SELECT ${factFields.join(", ")}, ${billed}, ${coverage}, ${asOf}
+      result = await this.query(`SELECT ${factFields.join(", ")}, ${billed}, ${coverage}, ${asOf}
         FROM fact_session WHERE session_uid = '${sessionUid}' LIMIT 2`);
+    } catch {
+      return unavailable;
+    }
+    try {
       const row = result.rows[0];
       if (row === undefined) return { status: "not_found", snapshot: null };
-      if (result.rows.length !== 1 || row.length !== 11 || typeof row[7] !== "boolean") return unavailable;
+      if (result.rows.length !== 1 || row.length !== 11 || typeof row[7] !== "boolean") return invalidSession;
       const [inputTokens, outputTokens, read, write5m, write1h] = row.slice(0, 5).map(tokenCount);
       const cached = [read, write5m, write1h];
       const cachedTokens = cached.some((count) => count == null) ? null
         : cached.reduce<number>((total, count) => total + (count ?? 0), 0);
-      if (cachedTokens !== null && !Number.isSafeInteger(cachedTokens)) return unavailable;
+      if (cachedTokens !== null && !Number.isSafeInteger(cachedTokens)) return invalidSession;
       return { status: "available", snapshot: {
         sessionUid, source: "semon", inputTokens: inputTokens ?? null, outputTokens: outputTokens ?? null, cachedTokens,
         usdEst: money(row[5]), sourceReportedUsd: money(row[6]), billedUsd: money(row[8]),
@@ -112,7 +126,7 @@ export class SemonCliSpendSource implements SpendSource {
         asOf: metadata(row[10] ?? result.as_of), snapshotId: metadata(result.snapshot_id ?? result.snapshot), observedAt: new Date().toISOString(),
       } };
     } catch {
-      return unavailable;
+      return invalidSession;
     }
   }
 }
@@ -134,12 +148,31 @@ function metadata(value: unknown): string | null {
   return typeof value === "string" ? value : JSON.stringify(value);
 }
 
-export async function refreshSpendSnapshots(store: PlatformStore, source: SpendSource, signal: AbortSignal): Promise<void> {
-  const sessionUids = new Set(store.listRuns().flatMap((run) => run.semonSessionUid === null ? [] : [run.semonSessionUid]));
-  for (const uid of sessionUids) {
+export async function refreshSpendSnapshots(
+  store: PlatformStore, source: SpendSource, signal: AbortSignal,
+): Promise<void> {
+  const runs = store.listRuns();
+  const unlinked = runs.filter((run) => run.semonSessionUid === null && run.semonIdentity !== null);
+  const uids = new Set(runs.flatMap((run) => run.semonSessionUid === null ? [] : [run.semonSessionUid]));
+  if (unlinked.length > 0 && source instanceof SemonCliSpendSource && await source.supportsSessionIdentity()) {
+    for (const run of unlinked) {
+      if (signal.aborted) return;
+      if (run.semonIdentity === null) continue;
+      const uid = await source.resolveSessionUid(run.semonIdentity);
+      if (signal.aborted) return;
+      if (uid !== null && store.linkRunSemonSession(run.id, uid, run.semonIdentity) !== null) uids.add(uid);
+    }
+  }
+  const sessions = [...uids];
+  for (const [index, uid] of sessions.entries()) {
     if (signal.aborted) return;
     const lookup = await source.getSnapshot(uid);
-    if (signal.aborted || lookup.status === "unavailable") return;
+    if (signal.aborted) return;
+    if (lookup.status === "unavailable") {
+      store.markSemonRefreshFailed(sessions.slice(index));
+      return;
+    }
     if (lookup.status === "available") store.upsertSpendSnapshot(lookup.snapshot);
+    else store.markSemonRefreshFailed([uid]);
   }
 }

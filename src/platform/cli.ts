@@ -42,6 +42,7 @@ const usage = `usage: ostrom-platform [--db <path> | --socket <path>] [--json] <
   budget set --scope team|lane|agent [--scope-id ID] --period daily|weekly|monthly
              --cap-usd N --warn-pct N [--source semon|magpie] [--enabled true|false]
   budget list
+  run link-semon <run-id> --session-uid UID
   spend summary [--scope team|lane|agent] [--scope-id ID] [--period daily|weekly|monthly] [--source semon|magpie]
   friction add --kind KIND --summary TEXT [--lane SLUG] [--rule CODE]
   friction list [--status STATUS]
@@ -102,6 +103,7 @@ const commands = new Map<string, { operands: number; flags: string }>([
   ["lane show", { operands: 1, flags: "" }],
   ["goal set", { operands: 1, flags: "statement metric target current unit week plan approved-decision" }],
   ["budget set", { operands: 0, flags: "scope scope-id period cap-usd warn-pct source enabled" }],
+  ["run link-semon", { operands: 1, flags: "session-uid" }],
   ["budget list", { operands: 0, flags: "" }],
   ["spend summary", { operands: 0, flags: "scope scope-id period source" }],
   ["policy list", { operands: 0, flags: "" }],
@@ -247,6 +249,8 @@ async function execute(call: Call, command: string, operand: string, flags: Map<
         spendSource: optional("source") ?? "semon", enabled: enabled !== "false",
       }) };
     }
+    case "run link-semon":
+      return { data: await call("PUT", `/v1/runs/${id}/semon-session`, { sessionUid: required("session-uid") }) };
     case "budget list":
       return { data: await call("GET", "/v1/budgets") };
     case "spend summary":

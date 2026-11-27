@@ -168,6 +168,12 @@ test("registry, policy, friction, budget, agent, and run endpoints use the same 
     externalRunRef: "external-run", status: "completed" });
   assert.deepEqual(await client.request("GET", "/v1/agents"), [agent]);
   assert.deepEqual(await client.request("GET", "/v1/runs"), [run]);
+  const link = "/v1/runs/run/semon-session";
+  await assert.rejects(client.request("PUT", link, { sessionUid: "bad uid" }), { status: 400 });
+  await assert.rejects(client.request("PUT", "/v1/runs/missing/semon-session", { sessionUid: "uid-1" }), { status: 404 });
+  assert.deepEqual(await client.request("PUT", link, { sessionUid: "uid-1" }),
+    { ...store.listRuns()[0], semonSessionUid: "uid-1" });
+  assert.equal(store.listRuns()[0]?.semonSessionUid, "uid-1");
 });
 
 test("the Unix API writes budgets and exposes spend and GitHub PR observations", async (t) => {

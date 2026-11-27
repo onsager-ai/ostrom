@@ -126,6 +126,11 @@ export async function dispatchPlatformRequest(
     if (put) return ok(store.upsertBudget(await body<UpsertBudgetInput>()));
   }
   if (get && route === "/v1/agents") return ok(store.listAgents());
+  const semonLink = /^\/v1\/runs\/([^/]+)\/semon-session$/.exec(route);
+  if (put && semonLink?.[1] !== undefined) {
+    const { sessionUid } = await body<{ sessionUid: string }>();
+    return ok(store.linkRunSemonSession(decodeURIComponent(semonLink[1]), sessionUid));
+  }
   if (get && route === "/v1/runs") return ok(store.listRuns());
   throw new PlatformNotFoundError("route not found");
 }

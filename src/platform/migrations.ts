@@ -278,6 +278,9 @@ const migrations = [
     CHECK (partial_coverage IN (0, 1));
   `,
   `
+  ALTER TABLE run ADD COLUMN semon_identity_json TEXT NOT NULL DEFAULT 'null' CHECK (json_valid(semon_identity_json));
+  ALTER TABLE spend_snapshot ADD COLUMN refresh_failed INTEGER NOT NULL DEFAULT 0 CHECK (refresh_failed IN (0, 1));
+
   CREATE TABLE github_pr_check (
     repository TEXT NOT NULL,
     number INTEGER NOT NULL,

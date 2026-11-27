@@ -162,6 +162,16 @@ export interface Agent {
   updatedAt: string;
 }
 
+export interface SemonSessionIdentity {
+  originNamespace: string;
+  nativeHarness: string;
+  nativeSessionId: string;
+}
+
+export function isSemonKey(value: unknown): value is string {
+  return typeof value === "string" && /^[\w.:@/+=-]{1,256}$/.test(value);
+}
+
 export interface Run {
   id: string;
   agentId: string;
@@ -176,6 +186,7 @@ export interface Run {
   failureCount: number;
   waitingDetail: JsonValue;
   semonSessionUid: string | null;
+  semonIdentity: SemonSessionIdentity | null;
   updatedAt: string;
 }
 

@@ -18,10 +18,13 @@ function data(value: JsonValue): string {
 }
 
 function spendLine(spend: { usdEst: number | null; sourceReportedUsd: number | null; billedUsd: number | null;
-  coverage: string | null; unpricedCount: number; sessionCount: number }): string {
+  coverage: string | null; unpricedCount: number; sessionCount: number; unlinkedRunCount: number;
+  missingSnapshotCount: number; staleSnapshotCount: number }): string {
   return `Estimated USD ${spend.usdEst ?? "unknown"} · Reported USD ${spend.sourceReportedUsd ?? "unknown"} · `
     + `Billed USD ${spend.billedUsd ?? "unknown"} · Coverage ${markdownText(spend.coverage ?? "unknown")} · `
-    + `${spend.unpricedCount} of ${spend.sessionCount} sessions unpriced`;
+    + `${spend.unpricedCount} of ${spend.sessionCount} sessions unpriced · `
+    + `${spend.unlinkedRunCount} unlinked runs · ${spend.missingSnapshotCount} runs missing a snapshot · `
+    + `${spend.staleSnapshotCount} stale snapshots`;
 }
 
 function bullets(lines: string[]): string {

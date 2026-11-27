@@ -17,7 +17,7 @@ function fixture(t: TestContext) {
   const lane = store.createLane({ name: "Platform", slug: "platform" });
   const agent = store.upsertAgent({ id: "worker", label: "Worker", role: "worker", connectorKind: "t3", hostId: "east",
     laneId: lane.id, externalRef: "environment/thread", status: "active" });
-  const addRun = (id: string, semonSessionUid: string, startedAt = "2026-11-27T12:00:00Z") => store.upsertRun({
+  const addRun = (id: string, semonSessionUid: string | null, startedAt = "2026-11-27T12:00:00Z") => store.upsertRun({
     id, agentId: agent.id, laneId: lane.id, connectorKind: "t3", hostId: agent.hostId,
     status: "completed", externalRunRef: id, startedAt, semonSessionUid,
   });
@@ -90,5 +90,33 @@ test("budget warnings and breaches dedupe, survive incomplete recovery, and reso
   save(11);
   assert.equal(read().events.length, 2);
   store.upsertBudget({ ...policy, enabled: false });
+  assert.equal(read().policyAlerts.length, 0);
+});
+
+test("unlinked and missing-snapshot runs keep a budget alert open until spend coverage is complete", (t) => {
+  const { store, addRun } = fixture(t);
+  addRun("one", "uid-a");
+  store.upsertBudget(policy);
+  const save = (sessionUid: string, usdEst: number) =>
+    store.upsertSpendSnapshot({ sessionUid, source: "semon", coverage: "complete", usdEst });
+  const read = () => evaluatePolicyAndHealth(store, { now });
+  save("uid-a", 12);
+  assert.equal(read().policyAlerts.length, 2);
+  addRun("unlinked", null);
+  addRun("missing", "uid-b");
+  save("uid-a", 1);
+  const partial = readSpendSummary(store, filter, now);
+  assert.equal(partial.unlinkedRunCount, 1);
+  assert.equal(partial.missingSnapshotCount, 1);
+  assert.equal(partial.coverage, "partial");
+  assert.equal(read().policyAlerts.length, 2);
+  assert.equal(evaluatePolicyAndHealth(store, { now: "2026-11-30T13:00:00Z" }).policyAlerts.length, 2);
+  store.linkRunSemonSession("unlinked", "uid-a");
+  save("uid-b", 1);
+  store.markSemonRefreshFailed(["uid-a"]);
+  assert.equal(readSpendSummary(store, filter, now).coverage, "partial");
+  assert.equal(read().policyAlerts.length, 2);
+  save("uid-a", 1);
+  assert.equal(readSpendSummary(store, filter, now).coverage, "complete");
   assert.equal(read().policyAlerts.length, 0);
 });

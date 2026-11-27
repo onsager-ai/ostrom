@@ -87,7 +87,9 @@
     if (spend.status === "unavailable") return "Spend unavailable";
     return `Estimated USD ${spend.usdEst ?? "unknown"} · Reported USD ${spend.sourceReportedUsd ?? "unknown"} · `
       + `Billed USD ${spend.billedUsd ?? "unknown"} · Coverage ${spend.coverage ?? "unknown"} · `
-      + `${spend.unpricedCount} of ${spend.sessionCount} sessions unpriced`;
+      + `${spend.unpricedCount} of ${spend.sessionCount} sessions unpriced · `
+      + `${spend.unlinkedRunCount} unlinked runs · ${spend.missingSnapshotCount} runs missing a snapshot · `
+      + `${spend.staleSnapshotCount} stale snapshots`;
   }
 
   function render({ digest, health, friction }) {
