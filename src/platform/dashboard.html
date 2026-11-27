@@ -367,12 +367,20 @@
     if (ms >= minute) return `${Math.floor(ms / minute)} min`;
     return `${Math.floor(ms / second)}s`;
   }
+  function parseTimestamp(iso) {
+    const ms = typeof iso === "string" ? Date.parse(iso) : NaN;
+    return Number.isFinite(ms) ? ms : null;
+  }
   function relativeTime(iso) {
-    const elapsed = Date.now() - Date.parse(iso);
+    const ms = parseTimestamp(iso);
+    if (ms === null) return "unknown time";
+    const elapsed = Date.now() - ms;
     return elapsed < second ? "just now" : `${duration(elapsed)} ago`;
   }
   function relativeExpiry(iso) {
-    const remaining = Date.parse(iso) - Date.now();
+    const ms = parseTimestamp(iso);
+    if (ms === null) return "expiry unknown";
+    const remaining = ms - Date.now();
     return remaining > 0 ? `expires in ${duration(remaining)}`
       : `expired ${relativeTime(iso)}`;
   }
@@ -423,6 +431,28 @@
   }
 
   const hostTones = { connected: "ok", connecting: "run", stale: "warn", auth_expired: "err", disconnected: "err" };
+  function summarizeHosts(hosts) {
+    const now = Date.now();
+    let connected = 0;
+    let degraded = 0;
+    let unknownExpiry = 0;
+    let hostError = false;
+    let soonestExpiry = null;
+    let soonestMs = Infinity;
+    for (const host of hosts) {
+      const expiry = parseTimestamp(host.tokenExpiresAt);
+      const expired = expiry !== null && expiry <= now;
+      if (host.connectionState === "connected") connected++;
+      if (host.connectionState !== "connected" || host.partialCoverage || expiry === null || expired) degraded++;
+      if (expiry === null) unknownExpiry++;
+      if (hostTones[host.connectionState] === "err" || expired) hostError = true;
+      if (expiry !== null && expiry < soonestMs) {
+        soonestMs = expiry;
+        soonestExpiry = host.tokenExpiresAt;
+      }
+    }
+    return { connected, degraded, unknownExpiry, hostError, soonestExpiry };
+  }
   function renderHosts(hosts, agents) {
     const agentsByHost = new Map();
     for (const agent of agents) agentsByHost.set(agent.hostId, (agentsByHost.get(agent.hostId) ?? 0) + 1);
@@ -436,13 +466,15 @@
       const meta = element("div", count(agentsByHost.get(host.hostId) ?? 0, "agent") + " tracked", "host-meta");
       if (host.lastEventAt) meta.append(" · ", timestamp(host.lastEventAt, relativeTime, "event "));
       else if (host.lastReconciledAt) meta.append(" · ", timestamp(host.lastReconciledAt, relativeTime, "reconciled "));
-      const expiry = element("div", "No OAuth expiry available", "host-meta");
-      if (host.tokenExpiresAt) {
+      const expiry = element("div", "OAuth expiry unknown", "host-meta warn-text");
+      const expiryMs = parseTimestamp(host.tokenExpiresAt);
+      if (expiryMs !== null) {
         const time = timestamp(host.tokenExpiresAt, relativeExpiry, "OAuth ");
-        const remaining = Date.parse(host.tokenExpiresAt) - Date.now();
+        const remaining = expiryMs - Date.now();
+        expiry.classList.remove("warn-text");
         if (remaining <= 7 * day) time.classList.add(remaining <= 0 ? "error-text" : "warn-text");
         expiry.replaceChildren(time);
-      }
+      } else if (host.tokenExpiresAt) expiry.title = host.tokenExpiresAt;
       main.append(name, meta, expiry);
       if (host.partialCoverage) main.append(element("p", "Partial coverage · reconciliation reached its thread limit", "row-desc"));
       if (host.lastError) main.append(element("p", host.lastError, "row-desc error-text"));
@@ -473,14 +505,7 @@
     const idleCount = agents.filter((agent) => agent.status === "idle").length;
     const attention = pendingOwnerDecisions.length + waits.length;
     const alertCount = count(policyAlerts.length, "policy alert");
-    const connected = hosts.filter((host) => host.connectionState === "connected").length;
-    const expiries = hosts.map((host) => host.tokenExpiresAt).filter(Boolean);
-    const soonestExpiry = expiries.reduce((soonest, iso) =>
-      !soonest || Date.parse(iso) < Date.parse(soonest) ? iso : soonest, null);
-    const degraded = hosts.filter((host) => host.connectionState !== "connected" || host.partialCoverage
-      || (host.tokenExpiresAt && Date.parse(host.tokenExpiresAt) <= Date.now())).length;
-    const hostError = hosts.some((host) => hostTones[host.connectionState] === "err")
-      || (soonestExpiry && Date.parse(soonestExpiry) <= Date.now());
+    const { connected, degraded, unknownExpiry, hostError, soonestExpiry } = summarizeHosts(hosts);
     const hostTone = hostError ? "err" : degraded ? "warn" : hosts.length ? "ok" : "neutral";
     byId("kpis").replaceChildren(
       kpi("Needs attention", attention, `${count(pendingOwnerDecisions.length, "owner decision")} · ${count(waits.length, "open wait")}`,
@@ -489,9 +514,10 @@
         policyAlerts.length ? pill("Active", "err") : pill("Clear"), policyAlerts.length ? "kpi-alert" : ""),
       kpi("Active runs", activeRuns.length, `${count(agents.length, "agent")} tracked · ${idleCount} idle`,
         activeRuns.length ? pill("Running", "run") : pill("Idle")),
-      kpi("Host health", `${connected} / ${hosts.length}`, degraded ? `${degraded} degraded`
+      kpi("Host health", `${connected} / ${hosts.length}`, degraded
+        ? `${degraded} degraded${unknownExpiry ? ` · ${unknownExpiry} with unknown OAuth expiry` : ""}`
         : soonestExpiry ? timestamp(soonestExpiry, relativeExpiry, "OAuth ")
-        : hosts.length ? "No OAuth expiry available" : "No hosts tracked",
+        : "No hosts tracked",
         pill(hostError ? "Error" : degraded ? "Degraded" : hosts.length ? "Healthy" : "No hosts", hostTone)),
     );
 

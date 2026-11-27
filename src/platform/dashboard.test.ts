@@ -71,6 +71,17 @@ test("serves the loopback page and proxies authenticated GETs only", async () =>
         assert.equal(relativeTime("2026-11-27T12:57:00.000Z"), "3 min ago");
         assert.equal(relativeExpiry("2026-12-27T13:00:00.000Z"), "expires in 30d");
         assert.equal(relativeExpiry("2026-11-25T13:00:00.000Z"), "expired 2d ago");
+        assert.equal(relativeTime("invalid date"), "unknown time");
+        assert.equal(relativeExpiry("invalid date"), "expiry unknown");
+        const validExpiry = "2026-12-27T13:00:00.000Z";
+        const hosts = ["invalid date", null, validExpiry].map((tokenExpiresAt) => ({
+          connectionState: "connected", tokenExpiresAt,
+        }));
+        const hostSummary = summarizeHosts(hosts);
+        assert.equal(hostSummary.degraded, 2);
+        assert.equal(hostSummary.unknownExpiry, 2);
+        assert.equal(hostSummary.hostError, false);
+        assert.equal(hostSummary.soonestExpiry, validExpiry);
         const alerts = [{ summary: "Repeated run failure", ruleCode: "two_failure_stop" }];
         const entry = { ...alerts[0], kind: "policy_break" };
         assert.equal(isEchoedPolicyBreak(entry, alerts), true);
