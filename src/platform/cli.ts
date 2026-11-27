@@ -54,6 +54,8 @@ const usage = `usage: ostrom-platform [--db <path> | --socket <path>] [--json] <
   status-mcp --public-url <https://...> [--socket <path>] [--port 0] [--state-dir <path>]
   status-mcp-approve [--state-dir <path>] [--ttl-sec 600]
   dashboard [--socket <path>] [--port 0]
+            [--public-url <https://...> --token-file <path>
+             [--cf-access-team-domain <https://...> --cf-access-aud <audience>]]
   serve [--socket <path>] [--db <path>] [--hosts-config <path>] [--tokens-dir <path>]
         [--github-poll-ms N] [--semon-bin <path>]
 
@@ -118,7 +120,7 @@ const commands = new Map<string, { operands: number; flags: string }>([
   ["digest", { operands: 0, flags: "window" }],
   ["status-mcp", { operands: 0, flags: "public-url port state-dir" }],
   ["status-mcp-approve", { operands: 0, flags: "state-dir ttl-sec" }],
-  ["dashboard", { operands: 0, flags: "port" }],
+  ["dashboard", { operands: 0, flags: "port public-url token-file cf-access-team-domain cf-access-aud" }],
   ["serve", { operands: 0, flags: "hosts-config tokens-dir github-poll-ms semon-bin" }],
 ]);
 
@@ -461,7 +463,24 @@ export async function runPlatformCli(argv: readonly string[], io: CliIO = {}): P
       if (db !== undefined) throw new UsageError("dashboard requires a Unix socket");
       const port = parseNumber(flags.get("--port"), "port") ?? 0;
       if (!Number.isInteger(port) || port < 0 || port > 65535) throw new UsageError("--port must be an integer from 0 to 65535");
-      const dashboard = await startPlatformDashboard({ socketPath: socket ?? defaultPlatformSocketPath(env), port });
+      const publicUrl = flags.get("--public-url");
+      const tokenFile = flags.get("--token-file");
+      const teamDomain = flags.get("--cf-access-team-domain");
+      const aud = flags.get("--cf-access-aud");
+      if ((publicUrl === undefined) !== (tokenFile === undefined)) {
+        throw new UsageError("--public-url and --token-file must be given together");
+      }
+      if ((teamDomain === undefined) !== (aud === undefined)) {
+        throw new UsageError("--cf-access-team-domain and --cf-access-aud must be given together");
+      }
+      if (teamDomain !== undefined && publicUrl === undefined) {
+        throw new UsageError("--cf-access-team-domain and --cf-access-aud require --public-url");
+      }
+      const dashboard = await startPlatformDashboard({
+        socketPath: socket ?? defaultPlatformSocketPath(env), port,
+        ...(publicUrl === undefined || tokenFile === undefined ? {} : { publicUrl, tokenFile }),
+        ...(teamDomain === undefined || aud === undefined ? {} : { cfAccess: { teamDomain, aud } }),
+      });
       try {
         await waitForShutdown(() => {
           stdout.write(json ? `${JSON.stringify({ url: dashboard.url })}\n` : `${dashboard.url}\n`);

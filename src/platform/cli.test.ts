@@ -183,3 +183,23 @@ test("the CLI entry point serves the requested database and shuts down on SIGTER
   assert.equal(persisted.code, 0, persisted.stderr);
   assert.deepEqual(JSON.parse(persisted.stdout), [lane]);
 });
+
+test("dashboard CLI requires the public and Access options in pairs", async () => {
+  const url = ["--public-url", "https://dashboard.example"];
+  const token = ["--token-file", "dashboard.token"];
+  const team = ["--cf-access-team-domain", "https://team.cloudflareaccess.com"];
+  const aud = ["--cf-access-aud", "dashboard-audience"];
+  for (const [flags, error] of [
+    [url, /--public-url and --token-file must be given together/],
+    [token, /--public-url and --token-file must be given together/],
+    [[...url, ...token, ...team], /--cf-access-team-domain and --cf-access-aud must be given together/],
+    [[...url, ...token, ...aud], /--cf-access-team-domain and --cf-access-aud must be given together/],
+    [[...team, ...aud], /--cf-access-team-domain and --cf-access-aud require --public-url/],
+  ] as const) {
+    const result = await cli(["dashboard", ...flags]);
+    assert.equal(result.code, 2, result.stderr);
+    assert.match(result.stderr, error);
+  }
+  const help = await cli(["--help"]);
+  assert.match(help.stdout, /dashboard[^\n]*\n\s+\[--public-url .* --token-file .*\n\s+\[--cf-access-team-domain .* --cf-access-aud /);
+});
