@@ -518,6 +518,11 @@
       closed: prs.filter((pr) => pr.rollupState === "closed"),
     };
   }
+  let closedPrsOpen = false;
+  function restoreClosedPrsDisclosure(details) {
+    details.open = closedPrsOpen;
+    details.addEventListener("toggle", () => { closedPrsOpen = details.open; });
+  }
 
   function render({ digest, health, friction }) {
     const { decisions, lanes, policyAlerts, prs, githubPrs, spend, budgets } = digest.sections;
@@ -622,6 +627,7 @@
       }).node);
     if (closedGithubPrs.length) {
       const disclosure = element("details");
+      restoreClosedPrsDisclosure(disclosure);
       disclosure.append(element("summary", `Closed PRs (${closedGithubPrs.length})`));
       disclosure.append(...closedGithubPrs.map((pr) => row(pr.repository,
         `${pr.failedChecks}/${pr.totalChecks} failed · ${count(pr.consecutiveFailures, "consecutive failing head")}`, {

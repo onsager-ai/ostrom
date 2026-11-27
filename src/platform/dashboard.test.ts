@@ -50,6 +50,7 @@ test("serves the loopback page and proxies authenticated GETs only", async () =>
       assert.match(page.body, /GitHub PR CI/);
       assert.match(page.body, /Closed PRs \(\$\{closedGithubPrs\.length\}\)/);
       assert.match(page.body, /const disclosure = element\("details"\)/);
+      assert.match(page.body, /restoreClosedPrsDisclosure\(disclosure\)/);
       assert.match(page.body, /Budgets &amp; Spend/);
       assert.match(page.body, /Semon connector not enabled on this host/);
       assert.match(page.body, /No open watched PRs checked yet/);
@@ -108,6 +109,15 @@ test("serves the loopback page and proxies authenticated GETs only", async () =>
         ]);
         assert.equal(groupedPrs.open.map((pr) => pr.number).join(","), "2,3,2");
         assert.equal(groupedPrs.closed.map((pr) => pr.number).join(","), "1");
+        let firstToggle: (() => void) | undefined;
+        const firstDisclosure = { open: false, addEventListener: (name, callback) => { assert.equal(name, "toggle"); firstToggle = callback; } };
+        restoreClosedPrsDisclosure(firstDisclosure);
+        firstDisclosure.open = true;
+        assert(firstToggle);
+        firstToggle();
+        const nextDisclosure = { open: false, addEventListener() {} };
+        restoreClosedPrsDisclosure(nextDisclosure);
+        assert.equal(nextDisclosure.open, true);
       `, {
         assert, URLSearchParams, location: { hash: "", pathname: "/", search: "" },
         history: { replaceState() {} },
