@@ -178,8 +178,8 @@ async function publicOptions(t: TestContext) {
 test("rejects invalid public dashboard configuration and token files", async (t) => {
   const options = await publicOptions(t);
   const { socketPath, tokenFile } = options;
-  await assert.rejects(startPlatformDashboard({ socketPath, publicUrl }), /must be given together/);
-  await assert.rejects(startPlatformDashboard({ socketPath, tokenFile }), /must be given together/);
+  await assert.rejects(startPlatformDashboard({ socketPath, publicUrl }), /requires a token file or Cloudflare Access/);
+  await assert.rejects(startPlatformDashboard({ socketPath, tokenFile }), /requires a public URL/);
   await assert.rejects(startPlatformDashboard({ socketPath, cfAccess: { teamDomain, aud } }), /requires a public URL/);
   for (const invalid of ["http://dashboard.example", `${publicUrl}/path`, `${publicUrl}/path/..`,
     `${publicUrl}?`, `${publicUrl}#`, "https://@dashboard.example"]) {
@@ -201,6 +201,42 @@ test("rejects invalid public dashboard configuration and token files", async (t)
     await writeFile(tokenFile, invalid);
     await assert.rejects(startPlatformDashboard(options), { message: "Dashboard token file must contain 64 lowercase hexadecimal characters" });
   }
+});
+
+test("public dashboard accepts Cloudflare Access alone without a bearer token", async (t) => {
+  const keyPair = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const jwk = { ...keyPair.publicKey.export({ format: "jwk" }), kid: "dashboard" };
+  const nowSec = Date.now() / 1000;
+  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  const input = `${encode({ alg: "RS256", kid: "dashboard" })}.${encode({ iss: teamDomain, aud, exp: nowSec + 3600 })}`;
+  const assertion = `${input}.${sign("RSA-SHA256", Buffer.from(input), keyPair.privateKey).toString("base64url")}`;
+  const options = await publicOptions(t);
+  const store = PlatformStore.open(":memory:");
+  t.after(() => store.close());
+  const api = await startPlatformApiServer({ store, socketPath: options.socketPath });
+  t.after(() => api.close());
+  const dashboard = await startPlatformDashboard({
+    socketPath: options.socketPath,
+    publicUrl: options.publicUrl,
+    cfAccess: { teamDomain, aud, async fetchJwks() { return { keys: [jwk] }; } },
+  });
+  t.after(() => dashboard.close());
+  assert.match(dashboard.url, /^http:\/\/127\.0\.0\.1:\d+\/$/);
+  const url = new URL(dashboard.url);
+  const headers = { host: "dashboard.example", "cf-access-jwt-assertion": assertion };
+  for (const path of ["/", "/v1/hosts"]) {
+    assert.equal((await read(url, path, { host: headers.host })).status, 403);
+    assert.equal((await read(url, path, { ...headers, "cf-access-jwt-assertion": "invalid" })).status, 403);
+  }
+  const page = await read(url, "/", headers);
+  assert.equal(page.status, 200);
+  assert.match(page.body, /<html lang="en" data-auth="proxy">/);
+  const hosts = await read(url, "/v1/hosts", headers);
+  assert.equal(hosts.status, 200);
+  assert.deepEqual(JSON.parse(hosts.body), []);
+  assert.equal((await read(url, "/", { ...headers, host: url.host })).status, 403);
+  assert.equal((await read(url, "/", { ...headers, origin: `${publicUrl}/` })).status, 403);
+  assert.equal((await read(url, "/v1/hosts", headers, "POST")).status, 405);
 });
 
 test("public dashboard enforces proxy headers and keeps the bearer token out of the browser", async (t) => {
