@@ -499,19 +499,47 @@
     return row(title, spendDetail(spend), { badge: available ? pill("ok", "ok") : pill("unavailable", "warn") }).node;
   }
 
+  const highSeverityPolicyRules = new Set(["two_failure_stop", "authority_routing", "budget_exceeded"]);
+  const warningPolicyRules = new Set(["pr_green_ci", "budget_warning"]);
+  function policySeverity(ruleCode) {
+    return warningPolicyRules.has(ruleCode) && !highSeverityPolicyRules.has(ruleCode) ? "warn" : "err";
+  }
+  const goalHasMetric = (goal) => goal.metricName.trim().toLowerCase() !== "unknown";
+  const goalHasWeeklyPlan = (goal) => goal.weeklyPlan != null
+    && !(Array.isArray(goal.weeklyPlan) && goal.weeklyPlan.length === 0);
+  function sortGithubPrs(prs) {
+    const rank = { failure: 0, error: 0, pending: 1, success: 2 };
+    return [...prs].sort((a, b) => (rank[a.rollupState] ?? 3) - (rank[b.rollupState] ?? 3)
+      || a.repository.localeCompare(b.repository) || a.number - b.number);
+  }
+  function partitionGithubPrs(prs) {
+    return {
+      open: sortGithubPrs(prs.filter((pr) => pr.rollupState !== "closed")),
+      closed: prs.filter((pr) => pr.rollupState === "closed"),
+    };
+  }
+  let closedPrsOpen = false;
+  function restoreClosedPrsDisclosure(details) {
+    details.open = closedPrsOpen;
+    details.addEventListener("toggle", () => { closedPrsOpen = details.open; });
+  }
+
   function render({ digest, health, friction }) {
     const { decisions, lanes, policyAlerts, prs, githubPrs, spend, budgets } = digest.sections;
     const { agents, hosts, activeRuns, waits, pendingOwnerDecisions } = health;
     const idleCount = agents.filter((agent) => agent.status === "idle").length;
     const attention = pendingOwnerDecisions.length + waits.length;
     const alertCount = count(policyAlerts.length, "policy alert");
+    const hasHighSeverityAlert = policyAlerts.some((alert) => policySeverity(alert.ruleCode) === "err");
+    const alertTone = policyAlerts.length === 0 ? "neutral" : hasHighSeverityAlert ? "err" : "warn";
     const { connected, degraded, unknownExpiry, hostError, soonestExpiry } = summarizeHosts(hosts);
     const hostTone = hostError ? "err" : degraded ? "warn" : hosts.length ? "ok" : "neutral";
     byId("kpis").replaceChildren(
       kpi("Needs attention", attention, `${count(pendingOwnerDecisions.length, "owner decision")} · ${count(waits.length, "open wait")}`,
         pill(`${attention} open`, attention ? "warn" : "neutral"), attention ? "kpi-warn" : ""),
       kpi("Policy alerts", policyAlerts.length, policyAlerts.length ? `${alertCount} · ${policyAlerts[0].ruleCode}` : "All clear",
-        policyAlerts.length ? pill("Active", "err") : pill("Clear"), policyAlerts.length ? "kpi-alert" : ""),
+        policyAlerts.length ? pill("Active", alertTone) : pill("Clear"),
+        hasHighSeverityAlert ? "kpi-alert" : policyAlerts.length ? "kpi-warn" : ""),
       kpi("Active runs", activeRuns.length, `${count(agents.length, "agent")} tracked · ${idleCount} idle`,
         activeRuns.length ? pill("Running", "run") : pill("Idle")),
       kpi("Host health", `${connected} / ${hosts.length}`, degraded
@@ -521,10 +549,12 @@
         pill(hostError ? "Error" : degraded ? "Degraded" : hosts.length ? "Healthy" : "No hosts", hostTone)),
     );
 
-    byId("policy-meta").replaceChildren(pill(alertCount, policyAlerts.length ? "err" : "neutral"));
+    byId("policy-meta").replaceChildren(pill(alertCount, alertTone));
     show("policy", [
       ...policyAlerts.map((alert) => row(alert.summary, "", {
-        tags: [mono(alert.ruleCode)], badge: pill("Policy alert", "err"), time: timestamp(alert.createdAt),
+        tags: [mono(alert.ruleCode)],
+        badge: pill(alert.ruleCode === "pr_green_ci" ? "CI warning" : warningPolicyRules.has(alert.ruleCode) ? "Warning" : "Policy alert", policySeverity(alert.ruleCode)),
+        time: timestamp(alert.createdAt),
       }).node),
       ...friction.filter((entry) => !isEchoedPolicyBreak(entry, policyAlerts)).map((entry) => row(entry.summary, "", {
         tags: [mono(entry.ruleCode ?? entry.kind)], badge: pill("Friction", "warn"), time: timestamp(entry.createdAt),
@@ -575,21 +605,39 @@
       const statusTone = status === "active" ? "ok" : status === "paused" ? "warn" : "neutral";
       const { node, main } = row(name, goal?.statement ?? "No weekly goal", { badge: pill(status, statusTone) });
       if (goal) {
-        const progress = `${goal.metricCurrent ?? "unknown"}/${goal.metricTarget}`;
-        main.append(element("p", `${goal.metricName} · ${progress}${goal.metricUnit ? " " + goal.metricUnit : ""}`, "row-desc"));
+        if (goalHasMetric(goal)) {
+          const progress = `${goal.metricCurrent ?? "unknown"}/${goal.metricTarget}`;
+          main.append(element("p", `${goal.metricName} · ${progress}${goal.metricUnit ? " " + goal.metricUnit : ""}`, "row-desc"));
+        }
         const approval = element("div", "", "row-actions");
-        approval.append(goal.approvedDecisionId ? mono(goal.approvedDecisionId) : pill("unapproved"));
-        main.append(approval);
+        const hasWeeklyPlan = goalHasWeeklyPlan(goal);
+        if (goal.approvedDecisionId) approval.append(mono(goal.approvedDecisionId));
+        else if (hasWeeklyPlan) approval.append(pill("unapproved"));
+        if (approval.childNodes.length) main.append(approval);
       }
       return node;
     }), "No lanes seeded yet on this host.");
 
     const ciTones = { success: "ok", failure: "err", error: "err", pending: "warn" };
-    byId("github").replaceChildren(...(githubPrs.length ? githubPrs.map((pr) => row(pr.repository,
+    const { open: openGithubPrs, closed: closedGithubPrs } = partitionGithubPrs(githubPrs);
+    const githubNodes = openGithubPrs.map((pr) => row(pr.repository,
       `${pr.failedChecks}/${pr.totalChecks} failed · ${count(pr.consecutiveFailures, "consecutive failing head")}`, {
         tags: [mono(`#${pr.number}`)], badge: pill(pr.rollupState, ciTones[pr.rollupState]),
         time: timestamp(pr.lastCheckedAt, relativeTime, "checked "),
-      }).node) : [row("No open watched PRs checked yet", "", { badge: pill("idle") }).node]));
+      }).node);
+    if (closedGithubPrs.length) {
+      const disclosure = element("details");
+      restoreClosedPrsDisclosure(disclosure);
+      disclosure.append(element("summary", `Closed PRs (${closedGithubPrs.length})`));
+      disclosure.append(...closedGithubPrs.map((pr) => row(pr.repository,
+        `${pr.failedChecks}/${pr.totalChecks} failed · ${count(pr.consecutiveFailures, "consecutive failing head")}`, {
+          tags: [mono(`#${pr.number}`)], badge: pill("closed"),
+          time: timestamp(pr.lastCheckedAt, relativeTime, "checked "),
+        }).node));
+      githubNodes.push(disclosure);
+    }
+    byId("github").replaceChildren(...(githubNodes.length ? githubNodes
+      : [row("No open watched PRs checked yet", "", { badge: pill("idle") }).node]));
     byId("budgets").replaceChildren(
       spendRow("Team monthly", spend),
       ...budgets.map((budget) => spendRow(

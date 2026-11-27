@@ -48,6 +48,9 @@ test("serves the loopback page and proxies authenticated GETs only", async () =>
       assert.doesNotMatch(page.body, /<(?:link|script|img)\b[^>]*https?:\/\//i);
       assert.doesNotMatch(page.body, /\binnerHTML\b/);
       assert.match(page.body, /GitHub PR CI/);
+      assert.match(page.body, /Closed PRs \(\$\{closedGithubPrs\.length\}\)/);
+      assert.match(page.body, /const disclosure = element\("details"\)/);
+      assert.match(page.body, /restoreClosedPrsDisclosure\(disclosure\)/);
       assert.match(page.body, /Budgets &amp; Spend/);
       assert.match(page.body, /Semon connector not enabled on this host/);
       assert.match(page.body, /No open watched PRs checked yet/);
@@ -89,6 +92,32 @@ test("serves the loopback page and proxies authenticated GETs only", async () =>
         assert.equal(isEchoedPolicyBreak({ ...entry, ruleCode: "authority_routing" }, alerts), false);
         assert.equal(isEchoedPolicyBreak({ ...entry, summary: "Other failure" }, alerts), false);
         assert.equal(isEchoedPolicyBreak({ ...entry, kind: "correction" }, alerts), false);
+        assert.equal(goalHasMetric({ metricName: " Unknown " }), false);
+        assert.equal(goalHasMetric({ metricName: "Releases" }), true);
+        assert.equal(goalHasWeeklyPlan({ weeklyPlan: null }), false);
+        assert.equal(goalHasWeeklyPlan({ weeklyPlan: [] }), false);
+        assert.equal(goalHasWeeklyPlan({ weeklyPlan: ["Ship"] }), true);
+        assert.equal(policySeverity("pr_green_ci"), "warn");
+        assert.equal(policySeverity("budget_warning"), "warn");
+        assert.equal(policySeverity("two_failure_stop"), "err");
+        assert.equal(policySeverity("unknown_critical_rule"), "err");
+        const groupedPrs = partitionGithubPrs([
+          { repository: "z/repo", number: 2, rollupState: "success" },
+          { repository: "a/repo", number: 3, rollupState: "pending" },
+          { repository: "a/repo", number: 2, rollupState: "error" },
+          { repository: "a/repo", number: 1, rollupState: "closed" },
+        ]);
+        assert.equal(groupedPrs.open.map((pr) => pr.number).join(","), "2,3,2");
+        assert.equal(groupedPrs.closed.map((pr) => pr.number).join(","), "1");
+        let firstToggle;
+        const firstDisclosure = { open: false, addEventListener: (name, callback) => { assert.equal(name, "toggle"); firstToggle = callback; } };
+        restoreClosedPrsDisclosure(firstDisclosure);
+        firstDisclosure.open = true;
+        assert(firstToggle);
+        firstToggle();
+        const nextDisclosure = { open: false, addEventListener() {} };
+        restoreClosedPrsDisclosure(nextDisclosure);
+        assert.equal(nextDisclosure.open, true);
       `, {
         assert, URLSearchParams, location: { hash: "", pathname: "/", search: "" },
         history: { replaceState() {} },
