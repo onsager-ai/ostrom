@@ -124,7 +124,8 @@ test("refresh links only exact native identities and skips a bad UID before a va
   missLinkedSession = true;
   await refreshSpendSnapshots(store, source, signal);
   assert.equal(summary().staleSnapshotCount, 2);
-  assert.match(queries.at(-1) ?? "", /exact-uid/);
+  assert.deepEqual(queries.slice(3).map((sql) => /FROM fact_session WHERE session_uid = '([^']+)'/.exec(sql)?.[1]),
+    ["exact-uid", "linked"]);
   fail = true;
   await refreshSpendSnapshots(store, source, signal);
   assert.equal(summary().staleSnapshotCount, 3);
