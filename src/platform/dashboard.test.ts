@@ -5,6 +5,7 @@ import type { OutgoingHttpHeaders } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { runInNewContext } from "node:vm";
 
 import { startPlatformApiServer } from "./api.ts";
 import { startPlatformDashboard } from "./dashboard.ts";
@@ -42,13 +43,59 @@ test("serves the loopback page and proxies authenticated GETs only", async () =>
       assert.equal(page.status, 200);
       assert.equal(page.headers["cache-control"], "no-store");
       assert.equal(page.headers["referrer-policy"], "no-referrer");
+      assert.equal(page.headers["content-security-policy"],
+        "default-src 'none'; connect-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'");
+      assert.doesNotMatch(page.body, /<(?:link|script|img)\b[^>]*https?:\/\//i);
+      assert.doesNotMatch(page.body, /\binnerHTML\b/);
       assert.match(page.body, /GitHub PR CI/);
       assert.match(page.body, /Budgets &amp; Spend/);
-      assert.match(page.body, /Spend unavailable/);
+      assert.match(page.body, /Semon connector not enabled on this host/);
+      assert.match(page.body, /No open watched PRs checked yet/);
+      assert.match(page.body, /No lanes or decisions seeded yet on this host\./);
+      assert.match(page.body, /No pending decisions\./);
+      assert.match(page.body, /No lanes seeded yet on this host\./);
+      assert.match(page.body, /No active runs, open waits, or PR wakes\./);
+      assert.match(page.body, /aria-label="Theme"/);
+      for (const theme of ["auto", "light", "dark"]) assert(page.body.includes(`data-theme="${theme}"`));
+      assert.match(page.body, /document\.documentElement\.dataset\.theme/);
       assert.match(page.body, /Estimated USD.*Reported USD/);
       assert.match(page.body, /Billed USD.*Coverage/);
       assert.match(page.body, /history\.replaceState/);
       assert(!page.body.includes("<script>invalid()</script>"));
+
+      const script = /<script type="module">([\s\S]*?)<\/script>/.exec(page.body)?.[1];
+      assert(script);
+      runInNewContext(`${script}
+        Date.now = () => Date.parse("2026-11-27T13:00:00.000Z");
+        assert.equal(relativeTime("2026-11-27T12:59:42.000Z"), "18s ago");
+        assert.equal(relativeTime("2026-11-27T12:57:00.000Z"), "3 min ago");
+        assert.equal(relativeExpiry("2026-12-27T13:00:00.000Z"), "expires in 30d");
+        assert.equal(relativeExpiry("2026-11-25T13:00:00.000Z"), "expired 2d ago");
+        assert.equal(relativeTime("invalid date"), "unknown time");
+        assert.equal(relativeExpiry("invalid date"), "expiry unknown");
+        const validExpiry = "2026-12-27T13:00:00.000Z";
+        const hosts = ["invalid date", null, validExpiry].map((tokenExpiresAt) => ({
+          connectionState: "connected", tokenExpiresAt,
+        }));
+        const hostSummary = summarizeHosts(hosts);
+        assert.equal(hostSummary.degraded, 2);
+        assert.equal(hostSummary.unknownExpiry, 2);
+        assert.equal(hostSummary.hostError, false);
+        assert.equal(hostSummary.soonestExpiry, validExpiry);
+        const alerts = [{ summary: "Repeated run failure", ruleCode: "two_failure_stop" }];
+        const entry = { ...alerts[0], kind: "policy_break" };
+        assert.equal(isEchoedPolicyBreak(entry, alerts), true);
+        assert.equal(isEchoedPolicyBreak({ ...entry, ruleCode: null }, alerts), true);
+        assert.equal(isEchoedPolicyBreak({ ...entry, ruleCode: "authority_routing" }, alerts), false);
+        assert.equal(isEchoedPolicyBreak({ ...entry, summary: "Other failure" }, alerts), false);
+        assert.equal(isEchoedPolicyBreak({ ...entry, kind: "correction" }, alerts), false);
+      `, {
+        assert, URLSearchParams, location: { hash: "", pathname: "/", search: "" },
+        history: { replaceState() {} },
+        localStorage: { getItem: () => null },
+        document: { getElementById: () => ({}), querySelectorAll: () => [] },
+      });
+
       assert.equal((await read(url, "/v1/hosts")).status, 401);
       assert.equal((await read(url, "/v1/unknown")).status, 401);
       assert.equal((await read(url, "/v1/hosts", { authorization: "Bearer " + "0".repeat(64) })).status, 401);
