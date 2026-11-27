@@ -3,10 +3,22 @@
 import { inspect } from "node:util";
 
 import {
+  approveWithPairingCode, buildAuthorizationRequest, defaultT3TokenDirectory,
+  discoverOAuthMetadata, exchangeAuthorizationCode, generatePkcePair, registerOAuthClient,
+  saveToken, waitForLoopbackCallback,
+} from "../connectors/t3/index.ts";
+
+import {
   defaultPlatformDbPath, defaultPlatformSocketPath, dispatchPlatformRequest,
   PlatformApiClient, startPlatformApiServer,
 } from "./api.ts";
+import { defaultHostsConfigPath, loadPlatformHosts } from "./config.ts";
+import type { PlatformT3Host } from "./config.ts";
+import { startPlatformDashboard } from "./dashboard.ts";
+import { isDigestWindow } from "./digest.ts";
+import { evaluatePolicyAndHealth } from "./policy-observer.ts";
 import { PlatformStore } from "./store.ts";
+import { T3HostSupervisor } from "./t3-supervisor.ts";
 import { decisionCategories } from "./types.ts";
 import type { DecisionVerification, Lane } from "./types.ts";
 
@@ -27,7 +39,11 @@ const usage = `usage: ostrom-platform [--db <path> | --socket <path>] [--json] <
   policy list
   friction add --kind KIND --summary TEXT [--lane SLUG] [--rule CODE]
   friction list [--status STATUS]
-  serve [--socket <path>] [--db <path>]
+  auth t3 <host-id> --pairing-code <code> [--hosts-config <path>] [--tokens-dir <path>]
+  status
+  digest [--window 01:00Z|13:00Z|weekly]
+  dashboard [--socket <path>] [--port 0]
+  serve [--socket <path>] [--db <path>] [--hosts-config <path>] [--tokens-dir <path>]
 
 Decision categories: ${decisionCategories.join(", ")}`;
 
@@ -53,7 +69,8 @@ function parse(argv: readonly string[]): { args: string[]; flags: Map<string, st
     } else if (arg.startsWith("--")) {
       const equals = arg.indexOf("=");
       const name = equals < 0 ? arg : arg.slice(0, equals);
-      const value = equals < 0 ? argv[++index] : arg.slice(equals + 1);
+      const value = equals < 0 ? (name === "--browser" ? "" : argv[++index]) : arg.slice(equals + 1);
+      if (name === "--browser" && equals >= 0) throw new UsageError("--browser takes no value");
       if (value === undefined || (equals < 0 && value.startsWith("--"))) {
         throw new UsageError(`${name} requires a value`);
       }
@@ -80,13 +97,19 @@ const commands = new Map<string, { operands: number; flags: string }>([
   ["policy list", { operands: 0, flags: "" }],
   ["friction add", { operands: 0, flags: "kind summary lane rule" }],
   ["friction list", { operands: 0, flags: "status" }],
-  ["serve", { operands: 0, flags: "" }],
+  ["auth t3", { operands: 1, flags: "pairing-code browser hosts-config tokens-dir" }],
+  ["status", { operands: 0, flags: "" }],
+  ["digest", { operands: 0, flags: "window" }],
+  ["dashboard", { operands: 0, flags: "port" }],
+  ["serve", { operands: 0, flags: "hosts-config tokens-dir" }],
 ]);
 
 function validateCommand(args: string[], flags: Map<string, string>): string {
-  const command = args[0] === "serve" ? "serve" : args.slice(0, 2).join(" ");
+  const first = args[0] ?? "";
+  const single = commands.has(first);
+  const command = single ? first : args.slice(0, 2).join(" ");
   const schema = commands.get(command);
-  const operands = command === "serve" ? args.slice(1) : args.slice(2);
+  const operands = args.slice(single ? 1 : 2);
   if (schema === undefined || operands.length !== schema.operands || operands.some((arg) => arg.trim() === "")) {
     throw new UsageError("invalid command or operands");
   }
@@ -143,6 +166,14 @@ async function execute(call: Call, command: string, operand: string, flags: Map<
   };
   const id = encodeURIComponent(operand);
   switch (command) {
+    case "status":
+      return { data: await call("GET", "/v1/health/summary") };
+    case "digest": {
+      const window = optional("window") ?? "01:00Z";
+      if (!isDigestWindow(window)) throw new UsageError("--window must be 01:00Z, 13:00Z or weekly");
+      const digest = await call("GET", withQuery("/v1/digest", { window })) as { markdown: string };
+      return { data: digest, text: digest.markdown };
+    }
     case "decision create":
       return { data: await call("POST", "/v1/decisions", {
         title: required("title"), authority: required("authority"), category: required("category"),
@@ -197,26 +228,84 @@ async function execute(call: Call, command: string, operand: string, flags: Map<
   }
 }
 
-async function serve(dbPath: string, socketPath: string, started: () => void): Promise<void> {
+async function waitForShutdown(start: () => void, tick?: () => void): Promise<void> {
+  const stop = Promise.withResolvers<void>();
+  const onSignal = () => stop.resolve();
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
+  let timer: ReturnType<typeof setInterval> | undefined;
+  try {
+    start();
+    if (tick !== undefined) {
+      tick();
+      timer = setInterval(() => {
+        try {
+          tick();
+        } catch (error) {
+          stop.reject(error);
+        }
+      }, 30_000);
+    }
+    await stop.promise;
+  } finally {
+    clearInterval(timer);
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+  }
+}
+
+async function serve(dbPath: string, socketPath: string, hosts: readonly PlatformT3Host[] | undefined,
+  tokensDir: string, started: () => void): Promise<void> {
   const store = PlatformStore.open(dbPath);
   try {
     const server = await startPlatformApiServer({ store, socketPath });
+    let supervisor: T3HostSupervisor | undefined;
     try {
-      await new Promise<void>((resolve) => {
-        const stop = () => {
-          process.off("SIGINT", stop);
-          process.off("SIGTERM", stop);
-          resolve();
-        };
-        process.once("SIGINT", stop);
-        process.once("SIGTERM", stop);
-        started();
-      });
+      if (hosts !== undefined) supervisor = new T3HostSupervisor(store, hosts, { tokensDir });
+      await waitForShutdown(started, () => { evaluatePolicyAndHealth(store, { now: new Date() }); });
     } finally {
-      await server.close();
+      try {
+        await supervisor?.close();
+      } finally {
+        await server.close();
+      }
     }
   } finally {
     store.close();
+  }
+}
+
+async function authorizeT3(host: PlatformT3Host, pairingCode: string, tokensDir: string) {
+  const { authorizationServer, protectedResource } = await discoverOAuthMetadata(host.mcpUrl);
+  const callback = await waitForLoopbackCallback();
+  const pkce = generatePkcePair();
+  try {
+    const registration = await registerOAuthClient(authorizationServer.registration_endpoint, {
+      clientName: "Ostrom Platform (read-only)", redirectUris: [callback.redirectUri],
+    });
+    const auth = { clientId: registration.client_id, redirectUri: callback.redirectUri,
+      challenge: pkce.challenge, state: pkce.state, resource: protectedResource.resource };
+    const code = callback.waitForResult({ state: pkce.state, issuer: authorizationServer.issuer });
+    // Keep failures before a redirect from leaving an unhandled callback rejection.
+    void code.catch(() => undefined);
+    const { redirectTo } = await approveWithPairingCode(authorizationServer.issuer, {
+      authorization: buildAuthorizationRequest(auth), code: pairingCode,
+    });
+    const redirect = new URL(redirectTo);
+    const expected = new URL(callback.redirectUri);
+    if (redirect.origin !== expected.origin || redirect.pathname !== expected.pathname
+      || redirect.username || redirect.password) throw new Error("T3 returned an unexpected callback");
+    const response = await fetch(redirect, { redirect: "error", signal: AbortSignal.timeout(5_000) });
+    await response.body?.cancel();
+    if (!response.ok) throw new Error("T3 OAuth callback failed");
+    const token = await exchangeAuthorizationCode(authorizationServer.token_endpoint, {
+      clientId: auth.clientId, redirectUri: auth.redirectUri, verifier: pkce.verifier,
+      resource: auth.resource, code: (await code).code,
+    });
+    await saveToken(host.id, token, tokensDir);
+    return { hostId: host.id, access: "read-only", expiresAt: new Date(token.expiresAt).toISOString() };
+  } finally {
+    callback.close();
   }
 }
 
@@ -238,11 +327,46 @@ export async function runPlatformCli(argv: readonly string[], io: CliIO = {}): P
     const command = validateCommand(args, flags);
     if (db?.trim() === "" || socket?.trim() === "") throw new UsageError("database and socket paths must be non-empty");
 
+    const hostsConfig = flags.get("--hosts-config");
+    const explicitTokensDir = flags.get("--tokens-dir");
+    if (hostsConfig?.trim() === "" || explicitTokensDir?.trim() === "") throw new UsageError("host config and token paths must be non-empty");
+
     if (command === "serve") {
       const path = socket ?? defaultPlatformSocketPath(env);
-      await serve(db ?? defaultPlatformDbPath(env), path, () => {
+      const hosts = hostsConfig === undefined ? undefined : await loadPlatformHosts(hostsConfig);
+      await serve(db ?? defaultPlatformDbPath(env), path, hosts, explicitTokensDir ?? defaultT3TokenDirectory(), () => {
         stdout.write(json ? `${JSON.stringify({ socketPath: path })}\n` : `Listening on ${path}\n`);
       });
+      return 0;
+    }
+
+    if (command === "auth t3") {
+      if (db !== undefined || socket !== undefined) throw new UsageError("auth t3 does not use --db or --socket");
+      const pairingCode = flags.get("--pairing-code");
+      if (flags.has("--browser") || !pairingCode?.trim()) {
+        throw new UsageError("T3 v0.1.13 requires --pairing-code <code> to enforce read-only access");
+      }
+      const hosts = await loadPlatformHosts(hostsConfig ?? defaultHostsConfigPath(env));
+      const host = hosts.find((entry) => entry.id === args[2]);
+      if (host === undefined) throw new UsageError("unknown T3 host ID");
+      const result = await authorizeT3(host, pairingCode, explicitTokensDir ?? defaultT3TokenDirectory());
+      stdout.write(json ? `${JSON.stringify(result)}\n`
+        : `Saved read-only authorization for ${result.hostId}. Expires ${result.expiresAt}.\n`);
+      return 0;
+    }
+
+    if (command === "dashboard") {
+      if (db !== undefined) throw new UsageError("dashboard requires a Unix socket");
+      const port = parseNumber(flags.get("--port"), "port") ?? 0;
+      if (!Number.isInteger(port) || port < 0 || port > 65535) throw new UsageError("--port must be an integer from 0 to 65535");
+      const dashboard = await startPlatformDashboard({ socketPath: socket ?? defaultPlatformSocketPath(env), port });
+      try {
+        await waitForShutdown(() => {
+          stdout.write(json ? `${JSON.stringify({ url: dashboard.url })}\n` : `${dashboard.url}\n`);
+        });
+      } finally {
+        await dashboard.close();
+      }
       return 0;
     }
 

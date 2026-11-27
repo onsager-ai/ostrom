@@ -60,10 +60,12 @@ export class T3JsonRpcError extends Error {
 export class T3ToolError extends Error {
   override name = "T3ToolError";
   readonly tool: T3ReadToolName;
+  readonly code: string | undefined;
 
-  constructor(tool: T3ReadToolName, message: string) {
+  constructor(tool: T3ReadToolName, message: string, code?: string) {
     super(message);
     this.tool = tool;
+    this.code = code;
   }
 }
 
@@ -192,7 +194,12 @@ export class T3McpClient {
       params: { name, arguments: wireArgs, _meta: this.#metadata },
     }, signal);
     const text = result.content?.find((item) => item.type === "text")?.text;
-    if (result.isError) throw new T3ToolError(name, text ?? `T3 tool ${name} failed`);
+    if (result.isError) {
+      const details = result.structuredContent;
+      const message = typeof details?.["message"] === "string" ? details["message"] : text;
+      const code = typeof details?.["code"] === "string" ? details["code"] : undefined;
+      throw new T3ToolError(name, message ?? `T3 tool ${name} failed`, code);
+    }
     if (result.resultType === "input_required") {
       throw new T3ToolError(name, `T3 tool ${name} requested client input`);
     }
@@ -315,6 +322,10 @@ export class T3McpClient {
   }
 
   async #readResponse<Result>(response: Response, request: Request): Promise<Result> {
+    if (response.status >= 500) {
+      await response.body?.cancel();
+      throw new Error(`T3 ${request.method} failed with HTTP ${response.status}`);
+    }
     let message: T3RpcResponse<Result> | undefined;
     if (isEventStream(response)) {
       for await (const data of sseData(response)) {

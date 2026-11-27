@@ -178,3 +178,50 @@ export interface Run {
   semonSessionUid: string | null;
   updatedAt: string;
 }
+
+export interface T3HostState {
+  hostId: string;
+  label: string;
+  mcpUrl: string;
+  originNamespace: string | null;
+  environmentId: string | null;
+  serverVersion: string | null;
+  tokenExpiresAt: string | null;
+  connectionState: "connecting" | "connected" | "stale" | "auth_expired" | "disconnected";
+  lastReconciledAt: string | null;
+  lastEventAt: string | null;
+  lastError: string | null;
+  consecutiveFailures: number;
+  partialCoverage: boolean;
+  updatedAt: string;
+}
+
+export interface T3PendingWait {
+  hostId: string;
+  threadId: string;
+  requestId: string;
+  kind: "user_input" | "approval";
+  questions: JsonValue;
+  occurredAt: string;
+  resolvedAt: string | null;
+  resolution: string | null;
+}
+
+export interface T3ThreadPr {
+  hostId: string;
+  threadId: string;
+  prHost: string;
+  repository: string;
+  number: number;
+  url: string;
+  source: string;
+  state: "open" | "closed" | "merged" | null;
+  watching: boolean;
+  title: string | null;
+  headBranch: string | null;
+  baseBranch: string | null;
+  isDraft: boolean | null;
+  lastWakeOutcome: string | null;
+  lastWakeSummary: string | null;
+  lastWakeAt: string | null;
+}

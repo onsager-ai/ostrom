@@ -4,6 +4,8 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 
+import { generateOwnerDigest, isDigestWindow } from "./digest.ts";
+import { readPlatformHealth } from "./policy-observer.ts";
 import { DecisionStateError, PlatformNotFoundError, PlatformValidationError } from "./store.ts";
 import type {
   AnswerDecisionInput, CreateDecisionInput, CreateLaneInput, DecisionFilter, PlatformStore,
@@ -61,6 +63,15 @@ export async function dispatchPlatformRequest(
   const body = async <T extends object>() => objectBody<T>(await readBody());
 
   if (get && route === "/v1/health") return ok({ ok: true });
+  if (get && route === "/v1/hosts") return ok(store.listT3HostStates());
+  if (get && route === "/v1/waits") return ok(store.listOpenT3Waits());
+  if (get && route === "/v1/prs") return ok(store.listT3ThreadPrs());
+  if (get && route === "/v1/health/summary") return ok(readPlatformHealth(store, { now: new Date() }));
+  if (get && route === "/v1/digest") {
+    const window = query.get("window") ?? "01:00Z";
+    if (!isDigestWindow(window)) throw new PlatformValidationError("invalid digest window");
+    return ok(generateOwnerDigest(store, { window, now: new Date() }));
+  }
   if (route === "/v1/decisions") {
     if (get) return ok(store.listDecisions(Object.fromEntries(query) as DecisionFilter));
     if (post) return created(store.createDecision(await body<CreateDecisionInput>()));
