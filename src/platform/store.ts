@@ -76,7 +76,9 @@ export interface T3ThreadSnapshot {
 const t3HostColumns = `host_id AS hostId, label, mcp_url AS mcpUrl, origin_namespace AS originNamespace,
   environment_id AS environmentId, server_version AS serverVersion, token_expires_at AS tokenExpiresAt,
   connection_state AS connectionState, last_reconciled_at AS lastReconciledAt, last_event_at AS lastEventAt,
-  last_error AS lastError, consecutive_failures AS consecutiveFailures, updated_at AS updatedAt`;
+  last_error AS lastError, consecutive_failures AS consecutiveFailures, partial_coverage AS partialCoverage,
+  updated_at AS updatedAt`;
+type T3HostRow = Omit<T3HostState, "partialCoverage"> & { partialCoverage: number };
 const t3WaitColumns = `host_id AS hostId, thread_id AS threadId, request_id AS requestId, kind,
   questions_json AS questions, occurred_at AS occurredAt, resolved_at AS resolvedAt, resolution`;
 const t3PrColumns = `host_id AS hostId, thread_id AS threadId, pr_host AS prHost, repository, number,
@@ -665,6 +667,16 @@ export class PlatformStore {
     return this.all<RunRow>(`SELECT ${runColumns} FROM run ORDER BY id`).map(runFromRow);
   }
 
+  listT3LatestRunRefs(hostId: string): Map<string, string> {
+    const rows = this.all<{ agentId: string; externalRunRef: string }>(`SELECT agentId, externalRunRef FROM (
+      SELECT agent_id AS agentId, external_run_ref AS externalRunRef,
+        row_number() OVER (PARTITION BY agent_id
+          ORDER BY coalesce(started_at, completed_at, updated_at) DESC, completed_at DESC, id DESC) AS rank
+      FROM run WHERE connector_kind = 't3' AND host_id = ?
+    ) WHERE rank = 1`, hostId);
+    return new Map(rows.map(({ agentId, externalRunRef }) => [agentId, externalRunRef]));
+  }
+
   // The caller supplies the exact Semon UID; an external run reference is never used to infer it.
   linkRunSemonSession(runId: string, sessionUid: string): Run {
     nonEmpty(sessionUid, "sessionUid");
@@ -675,25 +687,28 @@ export class PlatformStore {
   }
 
   upsertT3HostState(input: T3HostUpdate): T3HostState {
-    const current = this.get<T3HostState>(`SELECT ${t3HostColumns} FROM t3_host_state WHERE host_id = ?`, input.hostId);
+    const current = this.get<T3HostRow>(`SELECT ${t3HostColumns} FROM t3_host_state WHERE host_id = ?`, input.hostId);
     const state = { environmentId: null, serverVersion: null, tokenExpiresAt: null, lastReconciledAt: null,
-      lastEventAt: null, lastError: null, consecutiveFailures: 0, ...current, ...input };
-    return this.write<T3HostState>(`INSERT INTO t3_host_state (host_id, label, mcp_url, origin_namespace,
+      lastEventAt: null, lastError: null, consecutiveFailures: 0, partialCoverage: false, ...current, ...input };
+    const row = this.write<T3HostRow>(`INSERT INTO t3_host_state (host_id, label, mcp_url, origin_namespace,
       environment_id, server_version, token_expires_at, connection_state, last_reconciled_at, last_event_at,
-      last_error, consecutive_failures, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      last_error, consecutive_failures, partial_coverage, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (host_id) DO UPDATE SET label = excluded.label, mcp_url = excluded.mcp_url,
         origin_namespace = excluded.origin_namespace, environment_id = excluded.environment_id,
         server_version = excluded.server_version, token_expires_at = excluded.token_expires_at,
         connection_state = excluded.connection_state, last_reconciled_at = excluded.last_reconciled_at,
         last_event_at = excluded.last_event_at, last_error = excluded.last_error,
-        consecutive_failures = excluded.consecutive_failures, updated_at = excluded.updated_at
+        consecutive_failures = excluded.consecutive_failures, partial_coverage = excluded.partial_coverage,
+        updated_at = excluded.updated_at
       RETURNING ${t3HostColumns}`, state.hostId, state.label, state.mcpUrl, state.originNamespace,
     state.environmentId, state.serverVersion, state.tokenExpiresAt, state.connectionState,
-    state.lastReconciledAt, state.lastEventAt, state.lastError, state.consecutiveFailures, this.now());
+    state.lastReconciledAt, state.lastEventAt, state.lastError, state.consecutiveFailures, Number(state.partialCoverage), this.now());
+    return { ...row, partialCoverage: row.partialCoverage === 1 };
   }
 
   listT3HostStates(): T3HostState[] {
-    return this.all<T3HostState>(`SELECT ${t3HostColumns} FROM t3_host_state ORDER BY host_id`);
+    return this.all<T3HostRow>(`SELECT ${t3HostColumns} FROM t3_host_state ORDER BY host_id`)
+      .map((row) => ({ ...row, partialCoverage: row.partialCoverage === 1 }));
   }
 
   getT3Cursor(hostId: string, eventType: string): string | null {
@@ -799,13 +814,15 @@ export class PlatformStore {
     listedAgentIds?: string[];
     listedThreadIds?: string[];
     anchors?: ReadonlyMap<string, string | null>;
+    resetCursors?: boolean;
   }): T3HostState {
     return this.transaction(() => {
       const state = this.upsertT3HostState({ ...host, connectionState: "connected", lastReconciledAt: opts.observedAt,
         lastError: null, consecutiveFailures: 0 });
-      if (opts.anchors !== undefined) {
-        this.clearT3CursorsForHost(host.hostId);
-        for (const [name, cursor] of opts.anchors) this.setT3Cursor(host.hostId, name, cursor);
+      if (opts.resetCursors) this.clearT3CursorsForHost(host.hostId);
+      for (const [name, cursor] of opts.anchors ?? []) {
+        if (cursor === null) this.db.prepare("DELETE FROM t3_cursor WHERE host_id = ? AND event_type = ?").run(host.hostId, name);
+        else this.setT3Cursor(host.hostId, name, cursor);
       }
       for (const snapshot of snapshots) this.applyT3Thread(snapshot, opts.observedAt);
       if (opts.listedAgentIds !== undefined) {
@@ -840,6 +857,19 @@ export class PlatformStore {
         WHERE host_id = ? AND (last_event_at IS NULL OR last_event_at < ?)`)
         .run(occurredAt, this.now(), hostId, occurredAt);
     });
+  }
+
+  // Event handling calls this inside applyT3Event's transaction so removal and cursor commit together.
+  markT3ThreadRemoved(hostId: string, threadId: string, agentId: string): void {
+    const now = this.now();
+    this.db.prepare("UPDATE agent SET status = 'offline', updated_at = ? WHERE id = ? AND status <> 'offline'")
+      .run(now, agentId);
+    this.db.prepare(`UPDATE run SET status = 'interrupted', completed_at = ?, updated_at = ?
+      WHERE agent_id = ? AND status IN ('running', 'waiting_input', 'waiting_approval', 'stalled')`).run(now, now, agentId);
+    this.db.prepare(`UPDATE t3_pending_wait SET resolved_at = ?, resolution = 'reconciled'
+      WHERE host_id = ? AND thread_id = ? AND resolved_at IS NULL`).run(now, hostId, threadId);
+    this.db.prepare("UPDATE t3_thread_pr SET watching = 0 WHERE host_id = ? AND thread_id = ? AND watching = 1")
+      .run(hostId, threadId);
   }
 
   markRunStalled(id: string): void {

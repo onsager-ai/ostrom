@@ -1,6 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 
-import { getTokenExpiryStatus, loadToken, T3AuthError, T3McpClient } from "../connectors/t3/index.ts";
+import { getTokenExpiryStatus, loadToken, T3AuthError, T3JsonRpcError, T3McpClient, T3ToolError } from "../connectors/t3/index.ts";
 import type {
   T3MilestoneEvent, T3MilestoneName, T3ThreadListItem, T3ThreadPR,
 } from "../connectors/t3/index.ts";
@@ -23,6 +23,7 @@ interface ReconcileOptions {
   now?: () => Date;
   tokenExpiresAt?: string;
   anchors?: ReadonlyMap<T3MilestoneName, string | null>;
+  resetCursors?: boolean;
   activeOnly?: boolean;
 }
 
@@ -110,9 +111,27 @@ async function readWaits(client: T3McpClient, store: PlatformStore, context: Thr
   return waits;
 }
 
+function isThreadNotFound(error: unknown): boolean {
+  if (error instanceof T3ToolError) {
+    if (error.tool !== "t3_thread_read") return false;
+    if (error.code !== undefined) return error.code === "thread_not_found";
+  } else if (error instanceof T3JsonRpcError) {
+    const data = error.data;
+    if (data && typeof data === "object" && "code" in data) return data.code === "thread_not_found";
+  } else {
+    return false;
+  }
+  return /\bthread_not_found\b|^no such thread\b|^thread\b.*\b(?:not found|no longer available)\b/i.test(error.message);
+}
+
 async function readSnapshot(client: T3McpClient, store: PlatformStore, context: ThreadContext, threadId: string,
-  { details, signal, event }: { details: boolean; signal?: AbortSignal | undefined; event?: T3MilestoneEvent }): Promise<T3ThreadSnapshot> {
-  const result = await client.readThread({ threadId, view: "messages", limit: 5, runLimit, maxCharsPerItem: 256 }, rpcSignal(signal));
+  { details, signal, event }: { details: boolean; signal?: AbortSignal | undefined; event?: T3MilestoneEvent }): Promise<T3ThreadSnapshot | null> {
+  const result = await client.readThread({ threadId, view: "messages", limit: 5, runLimit, maxCharsPerItem: 256 }, rpcSignal(signal))
+    .catch((error: unknown) => {
+      if (isThreadNotFound(error)) return null;
+      throw error;
+    });
+  if (result === null) return null;
   const { thread, recentRuns } = result;
   const relevant = !thread.settled || thread.pendingRequestCount > 0 || thread.activeRunId !== null;
   const waits = (details && relevant) || thread.pendingRequestCount > 0
@@ -191,34 +210,48 @@ export async function reconcileT3HostOnce(client: T3McpClient, store: PlatformSt
   const previousActive = new Set(store.listAgents().filter((agent) =>
     agent.hostId === host.id && (agent.status === "active" || agent.status === "waiting")).map((agent) => agent.id));
   const watched = new Set(store.listT3ThreadPrs(host.id).filter((pr) => pr.watching).map((pr) => pr.threadId));
+  const previousLatest = store.listT3LatestRunRefs(host.id);
+  const idFor = (threadId: string) => agentId(host.id, environment.environmentId, threadId);
   const active = (thread: T3ThreadListItem) => isRunning(thread.status) || thread.status === "waiting";
+  const changed = (thread: T3ThreadListItem) => thread.latestRunId != null
+    && previousLatest.get(idFor(thread.threadId)) !== thread.latestRunId;
   const needsDetail = (thread: T3ThreadListItem) => !thread.settled || active(thread)
     || previousWaits.has(thread.threadId) || watched.has(thread.threadId)
-    || previousActive.has(agentId(host.id, environment.environmentId, thread.threadId));
+    || previousActive.has(idFor(thread.threadId)) || changed(thread);
   const candidates = [...listed.values()].filter(needsDetail).sort((a, b) =>
-    Number(active(b)) - Number(active(a)) || b.updatedAt.localeCompare(a.updatedAt) || a.threadId.localeCompare(b.threadId));
+    Number(active(b)) - Number(active(a)) || Number(changed(b)) - Number(changed(a))
+    || b.updatedAt.localeCompare(a.updatedAt) || a.threadId.localeCompare(b.threadId));
   const selected = candidates.slice(0, threadLimit);
+  const partialCoverage = cursor !== null || selected.length < candidates.length;
   const snapshots: T3ThreadSnapshot[] = [];
   // Small batches keep in-flight calls bounded and wait for outstanding requests on failure.
   for (let index = 0; index < selected.length; index += concurrency) {
-    const batch = await Promise.allSettled(selected.slice(index, index + concurrency).map((thread) =>
-      readSnapshot(client, store, context, thread.threadId, { details: true, signal })));
+    const batch = await Promise.allSettled(selected.slice(index, index + concurrency).map(async ({ threadId }) => ({
+      threadId, snapshot: await readSnapshot(client, store, context, threadId, { details: true, signal }),
+    })));
     const failure = batch.find((result) => result.status === "rejected" && result.reason instanceof T3AuthError)
       ?? batch.find((result) => result.status === "rejected");
     if (failure?.status === "rejected") throw failure.reason;
-    for (const result of batch) if (result.status === "fulfilled") snapshots.push(result.value);
+    for (const result of batch) {
+      if (result.status !== "fulfilled") continue;
+      const { threadId, snapshot } = result.value;
+      if (snapshot === null) listed.delete(threadId);
+      else snapshots.push(snapshot);
+    }
   }
   signal?.throwIfAborted();
   return store.reconcileT3Host({
     ...hostUpdate(host, "connected"), environmentId: environment.environmentId, serverVersion: environment.serverVersion,
     ...(opts.tokenExpiresAt === undefined ? {} : { tokenExpiresAt: opts.tokenExpiresAt }),
+    ...(!opts.activeOnly || partialCoverage ? { partialCoverage } : {}),
   }, snapshots, {
     observedAt: (opts.now?.() ?? new Date()).toISOString(),
     ...(!opts.activeOnly && cursor === null ? {
-      listedAgentIds: [...listed.keys()].map((id) => agentId(host.id, environment.environmentId, id)),
+      listedAgentIds: [...listed.keys()].map(idFor),
       listedThreadIds: [...listed.keys()],
     } : {}),
     ...(opts.anchors === undefined ? {} : { anchors: opts.anchors }),
+    ...(opts.resetCursors === undefined ? {} : { resetCursors: opts.resetCursors }),
   });
 }
 
@@ -290,15 +323,14 @@ export class T3HostSupervisor {
               anchors.set(name, gap.cursor);
               continue;
             }
-            if (reset || store.getT3Cursor(host.id, name) === null) {
+            if (reset || gap?.eventType === name || store.getT3Cursor(host.id, name) === null) {
               const head = await client.pollEvents(name, filter, { signal: rpcSignal(signal), maxEvents: 1 });
               anchors.set(name, head.cursor);
             }
           }
           const state = await reconcileT3HostOnce(client, store, host, {
-            signal, ...(tokenExpiresAt === null ? {} : { tokenExpiresAt }), ...(reset ? { anchors } : {}),
+            signal, ...(tokenExpiresAt === null ? {} : { tokenExpiresAt }), anchors, resetCursors: reset,
           });
-          if (!reset) for (const [name, cursor] of anchors) store.setT3Cursor(host.id, name, cursor);
           reset = false;
           gap = undefined;
           consecutiveFailures = 0;
@@ -314,7 +346,6 @@ export class T3HostSupervisor {
           }
           let lastError = "T3 connection or reconciliation failed";
           if (error instanceof CursorGap) {
-            reset = true;
             gap = error;
             lastError = "T3 event cursor gap";
           } else if (error instanceof StreamUnavailable) {
@@ -372,6 +403,7 @@ export class T3HostSupervisor {
                 if (error instanceof T3AuthError) throw error;
                 throw new StreamUnavailable();
               }).finally(() => clearTimeout(timer));
+              signal.throwIfAborted();
               if (frame.done) throw new StreamUnavailable();
               const item = frame.value;
               if (item.kind === "gap" || (item.kind === "activated" && item.truncated)) {
@@ -428,8 +460,12 @@ async function applyEvent(client: T3McpClient, store: PlatformStore, context: Th
   const hostId = context.host.id;
   const snapshot = threadId === null ? undefined : await readSnapshot(client, store, context, threadId, { details: false, event, signal });
   signal.throwIfAborted();
-  store.applyT3Event(hostId, name, cursor, occurredAt, snapshot, () => {
+  store.applyT3Event(hostId, name, cursor, occurredAt, snapshot ?? undefined, () => {
     if (threadId === null) return;
+    if (snapshot === null) {
+      store.markT3ThreadRemoved(hostId, threadId, agentId(hostId, context.environmentId, threadId));
+      return;
+    }
     switch (event.type) {
       case "thread.input_resolved":
         store.resolveT3Wait({ hostId, threadId, requestId: event.requestId, kind: event.kind, occurredAt }, event.resolution);

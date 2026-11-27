@@ -116,6 +116,7 @@
     const warnings = new Set(health.tokenExpiryWarnings.map((warning) => warning.hostId));
     show("hosts", health.hosts.map((host) => row(host.label,
       `${host.connectionState} · ${host.tokenExpiresAt ? `OAuth expires ${host.tokenExpiresAt}` : "No OAuth expiry available"}`
+      + `${host.partialCoverage ? " · reconciliation reached its thread limit" : ""}`
       + `${warnings.has(host.hostId) ? " · expires within 7 days" : ""}${host.lastError ? ` · ${host.lastError}` : ""}`)));
     show("policy", [
       ...sections.policyAlerts.map((alert) => row(alert.ruleCode, alert.summary)),

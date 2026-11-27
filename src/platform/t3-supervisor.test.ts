@@ -8,12 +8,13 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 
-import { loadToken, saveToken } from "../connectors/t3/index.ts";
+import { loadToken, saveToken, T3McpClient } from "../connectors/t3/index.ts";
 import type { T3MilestoneEvent, T3MilestoneName } from "../connectors/t3/index.ts";
 import { runPlatformCli } from "./cli.ts";
 import { loadPlatformHosts } from "./config.ts";
+import { evaluatePolicyAndHealth } from "./policy-observer.ts";
 import { PlatformStore } from "./store.ts";
-import { T3HostSupervisor } from "./t3-supervisor.ts";
+import { reconcileT3HostOnce, T3HostSupervisor } from "./t3-supervisor.ts";
 
 const time = "2026-11-27T01:00:00.000Z";
 const later = "2026-11-27T01:01:00.000Z";
@@ -22,6 +23,7 @@ const prKey = { host: "forge.example", repository: "org/repo", number: 17 };
 type Rpc = { id: number; method: string; params: {
   name: string; cursor?: string; arguments: { action?: string; requestId?: string; cursor?: number };
 } };
+type FixtureRun = { runId: string; status: string; startedAt: string; completedAt: string; model: string };
 
 function frame(response: ServerResponse, name: string, params: unknown): void {
   const message = { jsonrpc: "2.0", method: "notifications/events/" + name, params };
@@ -34,11 +36,17 @@ async function mockHost(id: string, options: { deny?: number; polling?: boolean 
   let environmentReads = 0;
   let listPages = 0;
   let requests = 0;
+  let threadReads = 0;
+  let settledRuns: FixtureRun[] | undefined;
+  let threadReadFailure: "structured" | "text" | "transient" | undefined;
+  let unboundedList = false;
   let nextEnvironment: Promise<void> | undefined;
   let runStatus = "waiting";
   let watching = true;
   const pending = new Map<string, "user_input" | "approval">([["initial", "user_input"]]);
   const streams = new Map<string, ServerResponse>();
+  const retained: { event: T3MilestoneEvent; position: number }[] = [];
+  const streamOpens: { cursor: string | undefined; name: string }[] = [];
   const polls: { cursor: string | undefined; at: number; name: string }[] = [];
   const cursor = () => "epoch" + epoch + "." + activity;
   const truncated = (value?: string) => value != null && !value.startsWith("epoch" + epoch + ".");
@@ -62,8 +70,16 @@ async function mockHost(id: string, options: { deny?: number; polling?: boolean 
         }
         response.writeHead(200, { "content-type": "text/event-stream" });
         streams.set(name, response);
+        streamOpens.push({ cursor: rpc.params.cursor, name });
         response.once("close", () => { if (streams.get(name) === response) streams.delete(name); });
-        frame(response, "active", { cursor: cursor(), truncated: truncated(rpc.params.cursor), heartbeatMs: 15_000 });
+        const lost = truncated(rpc.params.cursor);
+        const from = Number(rpc.params.cursor?.split(".")[1]);
+        const replay = lost ? [] : retained.filter(({ event, position }) => event.type === name && position > from);
+        frame(response, "active", { cursor: replay.length ? rpc.params.cursor : cursor(), truncated: lost, heartbeatMs: 15_000 });
+        for (const { event, position } of replay) {
+          frame(response, "event", { eventId: event.id, name, timestamp: event.occurredAt,
+            cursor: "epoch" + epoch + "." + position, data: event });
+        }
         return;
       }
       let result: unknown;
@@ -72,8 +88,9 @@ async function mockHost(id: string, options: { deny?: number; polling?: boolean 
         result = { events: [], cursor: cursor(), truncated: truncated(rpc.params.cursor), hasMore: false, nextPollMs: 200 };
       } else {
         let data: unknown;
-        const thread = { threadId: "thread", title: id, status: runStatus, settled: false,
-          relationshipToParent: null, updatedAt: later, activeRunId: runStatus === "completed" ? null : "run",
+        const thread = { threadId: "thread", title: id, status: settledRuns?.[0]?.status ?? runStatus,
+          settled: settledRuns !== undefined, latestRunId: settledRuns?.[0]?.runId ?? "run",
+          relationshipToParent: null, updatedAt: later, activeRunId: settledRuns || runStatus === "completed" ? null : "run",
           pendingRequestCount: pending.size };
         switch (name) {
           case "t3_environment_read":
@@ -83,10 +100,26 @@ async function mockHost(id: string, options: { deny?: number; polling?: boolean 
             break;
           case "t3_thread_list":
             listPages++;
-            data = args.cursor === undefined ? { threads: [], nextCursor: 1 } : { threads: [thread], nextCursor: null };
+            data = unboundedList ? { threads: [], nextCursor: (args.cursor ?? 0) + 1 }
+              : args.cursor === undefined ? { threads: [], nextCursor: 1 } : { threads: [thread], nextCursor: null };
             break;
           case "t3_thread_read":
-            data = { thread, recentRuns: [{ runId: "run", status: runStatus, startedAt: time,
+            threadReads++;
+            if (threadReadFailure !== undefined) {
+              if (threadReadFailure === "transient") {
+                response.writeHead(503, { "content-type": "application/json" }).end(JSON.stringify({
+                  jsonrpc: "2.0", id: rpc.id, error: { code: -32000, data: { code: "thread_not_found" }, message: "Gone" },
+                }));
+                return;
+              }
+              const result = threadReadFailure === "text"
+                ? { isError: true, content: [{ type: "text", text: "Thread thread is no longer available." }] }
+                : { isError: true, content: [], structuredContent: { code: "thread_not_found", message: "Gone" } };
+              response.writeHead(200, { "content-type": "application/json" })
+                .end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result }));
+              return;
+            }
+            data = { thread, recentRuns: settledRuns ?? [{ runId: "run", status: runStatus, startedAt: time,
               completedAt: runStatus === "completed" ? later : null, model: "test" }] };
             break;
           case "t3_pending_request":
@@ -123,16 +156,26 @@ async function mockHost(id: string, options: { deny?: number; polling?: boolean 
     get streamCount() { return streams.size; },
     get environmentReads() { return environmentReads; },
     get listPages() { return listPages; },
+    get threadReads() { return threadReads; },
     get requests() { return requests; },
     polls,
+    streamOpens,
     pending,
     setStatus: (status: string) => { runStatus = status; },
+    setSettledRuns: (runs: FixtureRun[]) => {
+      settledRuns = runs;
+      pending.clear();
+      watching = false;
+    },
+    failThreadRead: (failure: typeof threadReadFailure) => { threadReadFailure = failure; },
+    setUnboundedList: (value: boolean) => { unboundedList = value; },
     pauseEnvironment: (promise: Promise<void>) => { nextEnvironment = promise; },
-    rotate: () => { epoch++; activity = 0; },
+    rotate: () => { epoch++; activity = 0; retained.length = 0; },
     heartbeat: () => { frame(stream("thread.run_settled"), "heartbeat", { cursor: cursor() }); },
     disconnect: () => { for (const response of streams.values()) response.end(); },
     revoke: () => { frame(stream("thread.run_settled"), "error", { error: { code: -32000, message: "Access revoked" } }); },
     gap: () => { frame(stream("thread.run_settled"), "active", { cursor: cursor(), truncated: true, heartbeatMs: 15_000 }); },
+    retain(event: T3MilestoneEvent) { retained.push({ event, position: ++activity }); },
     emit(event: T3MilestoneEvent) {
       activity++;
       if (event.type === "pr.watch_wake" && event.watchEnded) watching = false;
@@ -215,19 +258,26 @@ test("reconciles separate hosts, projects live milestones, and rebuilds after bo
     east.setStatus("waiting");
     east.disconnect();
     await eventually(() => east.polls.some((poll) => poll.cursor?.startsWith("epoch1."))
-      && store.getT3Cursor("east", "thread.run_settled") === "epoch2.0");
+      && (["thread.run_settled", "thread.needs_input", "thread.input_resolved", "pr.watch_wake"] as const)
+        .every((name) => store.getT3Cursor("east", name) === "epoch2.0"));
     assert(east.environmentReads >= 3);
     assert.deepEqual(store.listOpenT3Waits("east").map((wait) => wait.requestId), ["recovered"]);
     assert.equal(store.listRuns().find((item) => item.id === run.id)?.semonSessionUid, "semon-exact");
     assert.equal(store.listT3ThreadPrs("east")[0]?.lastWakeSummary, "Checks passed");
 
     west.pauseEnvironment(hold.promise);
-    west.rotate();
+    const unaffectedCursor = store.getT3Cursor("west", "pr.watch_wake");
+    assert.equal(unaffectedCursor, "epoch1.0");
+    west.retain({ ...envelope("retained-wake"), type: "pr.watch_wake", pullRequests: [prKey],
+      outcome: "completed", summary: "Retained after the gap", watchEnded: false });
     west.gap();
     await eventually(() => west.environmentReads === 2
       && store.listT3HostStates().find((host) => host.hostId === "west")?.connectionState === "stale");
     hold.resolve();
-    await eventually(() => west.streamCount === 4 && store.getT3Cursor("west", "thread.run_settled") === "epoch2.0");
+    await eventually(() => west.streamCount === 4 && store.getT3Cursor("west", "thread.run_settled") === "epoch1.1"
+      && store.listT3ThreadPrs("west")[0]?.lastWakeSummary === "Retained after the gap");
+    assert.deepEqual(west.streamOpens.filter(({ name }) => name === "pr.watch_wake").map(({ cursor }) => cursor),
+      [unaffectedCursor, unaffectedCursor]);
     assert(store.listT3HostStates().every((host) => host.connectionState === "connected" && host.lastError === null));
   } finally {
     hold.resolve();
@@ -236,6 +286,79 @@ test("reconciles separate hosts, projects live milestones, and rebuilds after bo
     await Promise.all([east.close(), west.close(), rm(directory, { recursive: true, force: true })]);
   }
 });
+
+test("reconciles newly settled runs after downtime and reports capped coverage", async () => {
+  const mock = await mockHost("outage");
+  const store = PlatformStore.open(":memory:");
+  try {
+    const client = new T3McpClient(mock.host, "fixture");
+    const run = (runId: string, status: string, minute: string) => ({
+      runId, status, startedAt: "2026-11-27T01:" + minute + ":00.000Z",
+      completedAt: "2026-11-27T01:" + minute + ":01.000Z", model: "test",
+    });
+    const first = run("initial-success", "completed", "01");
+    mock.setSettledRuns([first]);
+    const initial = await reconcileT3HostOnce(client, store, mock.host);
+    assert.equal(initial.partialCoverage, false);
+    assert.deepEqual(store.listRuns().map((item) => item.externalRunRef), [first.runId]);
+    const [failedFirst, failedSecond] = [run("failed-first", "failed", "05"), run("failed-second", "failed", "07")];
+    mock.setSettledRuns([failedSecond, failedFirst, first]);
+    await reconcileT3HostOnce(client, store, mock.host);
+    assert.equal(mock.threadReads, 2);
+    assert.equal(store.listRuns().filter((item) => item.status === "failed").length, 2);
+    const { events } = evaluatePolicyAndHealth(store, { now: later });
+    assert.deepEqual(events.map((event) => event.ruleCode), ["two_failure_stop"]);
+    await reconcileT3HostOnce(client, store, mock.host);
+    assert.equal(mock.threadReads, 2, "unchanged settled threads do not need another detail read");
+
+    mock.setUnboundedList(true);
+    assert.equal((await reconcileT3HostOnce(client, store, mock.host)).partialCoverage, true);
+    assert.equal(store.listT3HostStates()[0]?.partialCoverage, true);
+    assert.equal(store.listAgents()[0]?.status, "idle", "an incomplete listing cannot prove removal");
+    mock.setUnboundedList(false);
+    assert.equal((await reconcileT3HostOnce(client, store, mock.host)).partialCoverage, false);
+  } finally {
+    store.close();
+    await mock.close();
+  }
+});
+
+for (const failure of ["structured", "text", "transient"] as const) {
+  test(`handles ${failure} thread reads on an earlier event`, async () => {
+    const mock = await mockHost("deleted");
+    const directory = await mkdtemp(join(tmpdir(), "ostrom-t3-deleted-"));
+    const store = PlatformStore.open(":memory:");
+    let supervisor: T3HostSupervisor | undefined;
+    const hold = Promise.withResolvers<void>();
+    try {
+      await saveToken(mock.host.id, { accessToken: "fixture", expiresAt: Date.now() + 60_000 }, directory);
+      supervisor = new T3HostSupervisor(store, [mock.host], { tokensDir: directory, retryMs: 10 });
+      await eventually(() => mock.streamCount === 4);
+      assert.equal(store.getT3Cursor(mock.host.id, "thread.run_settled"), "epoch1.0");
+      mock.failThreadRead(failure);
+      mock.emit({ ...envelope("retained-settlement"), type: "thread.run_settled", runId: "run", outcome: "completed" });
+      if (failure === "transient") {
+        mock.pauseEnvironment(hold.promise);
+        await eventually(() => store.listT3HostStates()[0]?.connectionState === "stale" && mock.environmentReads >= 2);
+        assert.equal(store.getT3Cursor(mock.host.id, "thread.run_settled"), "epoch1.0");
+        assert.equal(store.listAgents()[0]?.status, "waiting");
+      } else {
+        await eventually(() => store.getT3Cursor(mock.host.id, "thread.run_settled") === "epoch1.1");
+        assert.equal(store.listAgents()[0]?.status, "offline");
+        assert.equal(store.listRuns()[0]?.status, "interrupted");
+        assert.deepEqual(store.listOpenT3Waits(), []);
+        assert.equal(store.listT3ThreadPrs()[0]?.watching, false);
+        assert.equal(store.listT3HostStates()[0]?.connectionState, "connected");
+        assert.equal(mock.environmentReads, 1, "a missing thread does not reconnect the host");
+      }
+    } finally {
+      await supervisor?.close();
+      hold.resolve();
+      store.close();
+      await Promise.all([mock.close(), rm(directory, { recursive: true, force: true })]);
+    }
+  });
+}
 
 test("stops requests on 401, 403, and revocation, and honors the server polling interval", async () => {
   const mocks = await Promise.all([
@@ -298,7 +421,6 @@ test("auth CLI stores only a read-only OAuth grant and reports its expiry withou
   const widerToken = "fixture-extra-scopes";
   const fixturePairing = "fixture-pairing";
   let scope = "orchestration:read";
-  let revoked = false;
   const server = createServer(async (request, response) => {
     try {
       let input = "";
@@ -333,11 +455,6 @@ test("auth CLI stores only a read-only OAuth grant and reports its expiry withou
           assert.equal(new URLSearchParams(input).get("code"), "fixture-code");
           json({ access_token: scope === "orchestration:read" ? fixtureToken : widerToken, token_type: "Bearer", expires_in: 60, scope });
           break;
-        case "/revoke":
-          assert.equal(new URLSearchParams(input).get("token"), widerToken);
-          revoked = true;
-          response.writeHead(200).end();
-          break;
         default:
           response.writeHead(404).end();
       }
@@ -355,11 +472,11 @@ test("auth CLI stores only a read-only OAuth grant and reports its expiry withou
     const config = join(directory, "hosts.json");
     const tokensDir = join(directory, "tokens");
     await writeFile(config, JSON.stringify({ hosts: [{ id: "local", label: "Local", mcpUrl: origin + "/mcp" }] }));
-    const authorize = async () => {
+    const authorize = async (...options: string[]) => {
       let output = "";
       let errors = "";
       const code = await runPlatformCli(["auth", "t3", "local", "--hosts-config", config, "--tokens-dir", tokensDir,
-        "--pairing-code", fixturePairing, "--json"], {
+        ...options, "--json"], {
         stdout: { write: (text) => { output += text; } },
         stderr: { write: (text) => { errors += text; } },
       });
@@ -368,7 +485,13 @@ test("auth CLI stores only a read-only OAuth grant and reports its expiry withou
       assert(!(output + errors).includes(fixturePairing));
       return { code, output, errors };
     };
-    const good = await authorize();
+    for (const options of [[], ["--browser"], ["--browser", "--pairing-code", fixturePairing]]) {
+      const refused = await authorize(...options);
+      assert.equal(refused.code, 2);
+      assert.equal(refused.output, "");
+      assert.match(refused.errors, /T3 v0\.1\.13 requires --pairing-code <code> to enforce read-only access/);
+    }
+    const good = await authorize("--pairing-code", fixturePairing);
     assert.equal(good.code, 0, good.errors);
     const saved = await loadToken("local", tokensDir);
     assert.equal(saved?.accessToken, fixtureToken);
@@ -376,10 +499,9 @@ test("auth CLI stores only a read-only OAuth grant and reports its expiry withou
       hostId: "local", access: "read-only", expiresAt: new Date(saved!.expiresAt).toISOString(),
     });
     scope += " orchestration:operate";
-    const denied = await authorize();
+    const denied = await authorize("--pairing-code", fixturePairing);
     assert.equal(denied.code, 1);
     assert.match(denied.errors, /read-only bearer token/);
-    assert(revoked);
     assert.deepEqual(await loadToken("local", tokensDir), saved);
   } finally {
     server.close();

@@ -48,7 +48,7 @@ export function readPlatformHealth(store: PlatformStore, {
 }
 
 function runTime(run: Run): string {
-  return run.completedAt ?? run.startedAt ?? run.updatedAt;
+  return run.startedAt ?? run.completedAt ?? "";
 }
 
 export function evaluatePolicyAndHealth(store: PlatformStore, options: HealthOptions & { markStalled?: boolean }) {
@@ -80,16 +80,21 @@ export function evaluatePolicyAndHealth(store: PlatformStore, options: HealthOpt
     }
     for (const agent of store.listAgents()) {
       const settled = settledByAgent.get(agent.id) ?? [];
-      settled.sort((a, b) => runTime(b).localeCompare(runTime(a)) || b.id.localeCompare(a.id));
-      const [latest, previous] = settled;
-      if (latest?.status !== "failed" || previous?.status !== "failed") continue;
-      const key = `agent:${agent.id}`;
-      failureKeys.push(key);
-      const event = store.recordDedupedPolicyEvent({
-        ruleCode: failureRule, laneId: agent.laneId, summary: `${agent.label} failed two consecutive runs`,
-        detail: { agentId: agent.id, runIds: [latest.id, previous.id] },
-      }, key, now, true);
-      if (event !== null) events.push(event);
+      settled.sort((a, b) => runTime(a).localeCompare(runTime(b))
+        || (a.completedAt ?? "").localeCompare(b.completedAt ?? "") || a.id.localeCompare(b.id));
+      let previous: Run | undefined;
+      for (const run of settled) {
+        if (previous?.status === "failed" && run.status === "failed") {
+          const key = `streak:${agent.id}:${run.id}`;
+          failureKeys.push(key);
+          const event = store.recordDedupedPolicyEvent({
+            ruleCode: failureRule, laneId: agent.laneId, summary: `${agent.label} failed two consecutive runs`,
+            detail: { agentId: agent.id, runIds: [previous.id, run.id] },
+          }, key, now, true);
+          if (event !== null) events.push(event);
+        }
+        previous = run;
+      }
     }
   }
 

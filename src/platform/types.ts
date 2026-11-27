@@ -192,6 +192,7 @@ export interface T3HostState {
   lastEventAt: string | null;
   lastError: string | null;
   consecutiveFailures: number;
+  partialCoverage: boolean;
   updatedAt: string;
 }
 

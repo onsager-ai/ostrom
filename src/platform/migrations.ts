@@ -273,6 +273,10 @@ const migrations = [
   CREATE UNIQUE INDEX policy_event_open_key ON policy_event(rule_code, dedupe_key)
     WHERE resolved_at IS NULL AND dedupe_key IS NOT NULL;
   `,
+  `
+  ALTER TABLE t3_host_state ADD COLUMN partial_coverage INTEGER NOT NULL DEFAULT 0
+    CHECK (partial_coverage IN (0, 1));
+  `,
 ];
 
 // Read the version with the writer lock held so simultaneous opens cannot apply the same migration.

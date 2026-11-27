@@ -3,7 +3,7 @@
 import { inspect } from "node:util";
 
 import {
-  approveWithPairingCode, buildAuthorizationRequest, buildAuthorizeUrl, defaultT3TokenDirectory,
+  approveWithPairingCode, buildAuthorizationRequest, defaultT3TokenDirectory,
   discoverOAuthMetadata, exchangeAuthorizationCode, generatePkcePair, registerOAuthClient,
   saveToken, waitForLoopbackCallback,
 } from "../connectors/t3/index.ts";
@@ -39,7 +39,7 @@ const usage = `usage: ostrom-platform [--db <path> | --socket <path>] [--json] <
   policy list
   friction add --kind KIND --summary TEXT [--lane SLUG] [--rule CODE]
   friction list [--status STATUS]
-  auth t3 <host-id> [--pairing-code <code> | --browser] [--hosts-config <path>] [--tokens-dir <path>]
+  auth t3 <host-id> --pairing-code <code> [--hosts-config <path>] [--tokens-dir <path>]
   status
   digest [--window 01:00Z|13:00Z|weekly]
   dashboard [--socket <path>] [--port 0]
@@ -275,8 +275,7 @@ async function serve(dbPath: string, socketPath: string, hosts: readonly Platfor
   }
 }
 
-async function authorizeT3(host: PlatformT3Host, pairingCode: string | undefined, tokensDir: string,
-  instructions: (message: string) => void) {
+async function authorizeT3(host: PlatformT3Host, pairingCode: string, tokensDir: string) {
   const { authorizationServer, protectedResource } = await discoverOAuthMetadata(host.mcpUrl);
   const callback = await waitForLoopbackCallback();
   const pkce = generatePkcePair();
@@ -289,25 +288,19 @@ async function authorizeT3(host: PlatformT3Host, pairingCode: string | undefined
     const code = callback.waitForResult({ state: pkce.state, issuer: authorizationServer.issuer });
     // Keep failures before a redirect from leaving an unhandled callback rejection.
     void code.catch(() => undefined);
-    if (pairingCode !== undefined) {
-      const { redirectTo } = await approveWithPairingCode(authorizationServer.issuer, {
-        authorization: buildAuthorizationRequest(auth), code: pairingCode,
-      });
-      const redirect = new URL(redirectTo);
-      const expected = new URL(callback.redirectUri);
-      if (redirect.origin !== expected.origin || redirect.pathname !== expected.pathname
-        || redirect.username || redirect.password) throw new Error("T3 returned an unexpected callback");
-      const response = await fetch(redirect, { redirect: "error", signal: AbortSignal.timeout(5_000) });
-      await response.body?.cancel();
-      if (!response.ok) throw new Error("T3 OAuth callback failed");
-    } else {
-      const url = buildAuthorizeUrl(authorizationServer.authorization_endpoint, auth);
-      url.searchParams.set("scope", "orchestration:read");
-      instructions(`Open this URL and approve read-only access:\n${url.href}\n`);
-    }
+    const { redirectTo } = await approveWithPairingCode(authorizationServer.issuer, {
+      authorization: buildAuthorizationRequest(auth), code: pairingCode,
+    });
+    const redirect = new URL(redirectTo);
+    const expected = new URL(callback.redirectUri);
+    if (redirect.origin !== expected.origin || redirect.pathname !== expected.pathname
+      || redirect.username || redirect.password) throw new Error("T3 returned an unexpected callback");
+    const response = await fetch(redirect, { redirect: "error", signal: AbortSignal.timeout(5_000) });
+    await response.body?.cancel();
+    if (!response.ok) throw new Error("T3 OAuth callback failed");
     const token = await exchangeAuthorizationCode(authorizationServer.token_endpoint, {
       clientId: auth.clientId, redirectUri: auth.redirectUri, verifier: pkce.verifier,
-      resource: auth.resource, code: (await code).code, revocationEndpoint: authorizationServer.revocation_endpoint,
+      resource: auth.resource, code: (await code).code,
     });
     await saveToken(host.id, token, tokensDir);
     return { hostId: host.id, access: "read-only", expiresAt: new Date(token.expiresAt).toISOString() };
@@ -350,14 +343,13 @@ export async function runPlatformCli(argv: readonly string[], io: CliIO = {}): P
     if (command === "auth t3") {
       if (db !== undefined || socket !== undefined) throw new UsageError("auth t3 does not use --db or --socket");
       const pairingCode = flags.get("--pairing-code");
-      if (pairingCode !== undefined && (pairingCode.trim() === "" || flags.has("--browser"))) {
-        throw new UsageError("choose a non-empty --pairing-code or --browser");
+      if (flags.has("--browser") || !pairingCode?.trim()) {
+        throw new UsageError("T3 v0.1.13 requires --pairing-code <code> to enforce read-only access");
       }
       const hosts = await loadPlatformHosts(hostsConfig ?? defaultHostsConfigPath(env));
       const host = hosts.find((entry) => entry.id === args[2]);
       if (host === undefined) throw new UsageError("unknown T3 host ID");
-      const result = await authorizeT3(host, pairingCode, explicitTokensDir ?? defaultT3TokenDirectory(),
-        (message) => stderr.write(message));
+      const result = await authorizeT3(host, pairingCode, explicitTokensDir ?? defaultT3TokenDirectory());
       stdout.write(json ? `${JSON.stringify(result)}\n`
         : `Saved read-only authorization for ${result.hostId}. Expires ${result.expiresAt}.\n`);
       return 0;
