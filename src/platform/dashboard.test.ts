@@ -109,7 +109,7 @@ test("serves the loopback page and proxies authenticated GETs only", async () =>
         ]);
         assert.equal(groupedPrs.open.map((pr) => pr.number).join(","), "2,3,2");
         assert.equal(groupedPrs.closed.map((pr) => pr.number).join(","), "1");
-        let firstToggle: (() => void) | undefined;
+        let firstToggle;
         const firstDisclosure = { open: false, addEventListener: (name, callback) => { assert.equal(name, "toggle"); firstToggle = callback; } };
         restoreClosedPrsDisclosure(firstDisclosure);
         firstDisclosure.open = true;
