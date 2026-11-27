@@ -31,6 +31,10 @@ function bullets(lines: string[]): string {
   return lines.length === 0 ? "None." : lines.map((line) => `- ${line}`).join("\n");
 }
 
+function count(n: number, singular: string, plural = `${singular}s`): string {
+  return `${n} ${n === 1 ? singular : plural}`;
+}
+
 export function generateOwnerDigest(store: PlatformStore, { window, now }: { window: DigestWindow; now: Date | string }) {
   const generatedAt = new Date(now).toISOString();
   const decisions = pendingDecisions(store);
@@ -53,8 +57,12 @@ export function generateOwnerDigest(store: PlatformStore, { window, now }: { win
     waits: health.waits, prs, policyAlerts, interventionsByDay, openFrictionCount: friction.length,
     topOpenFriction: friction[0] ?? null, budgets, spend, githubPrs,
   };
-  const summary = `${health.pendingOwnerDecisions.length} pending owner decisions · ${health.stalledRuns.length} stalled runs · `
-    + `${health.waits.length} open waits · ${policyAlerts.length} policy alerts`;
+  const summary = [
+    count(health.pendingOwnerDecisions.length, "pending owner decision"),
+    count(health.stalledRuns.length, "stalled run"),
+    count(health.waits.length, "open wait"),
+    count(policyAlerts.length, "policy alert"),
+  ].join(" · ");
   const stalledIds = new Set(health.stalledRuns.map(({ id }) => id));
   const agentLabels = new Map(health.agents.map(({ id, label }) => [id, label]));
   const markdown = [

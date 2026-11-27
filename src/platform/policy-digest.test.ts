@@ -8,6 +8,19 @@ import { PlatformStore } from "./store.ts";
 const now = "2026-11-27T13:00:00.000Z";
 const earlier = "2026-11-27T12:00:00.000Z";
 
+test("pluralizes the counts in the owner digest summary", () => {
+  const store = PlatformStore.open(":memory:", { now: () => now });
+  try {
+    const summary = () => generateOwnerDigest(store, { window: "01:00Z", now }).summary;
+    store.recordPolicyEvent({ ruleCode: "two_failure_stop", summary: "Repeated run failure" });
+    assert.equal(summary(), "0 pending owner decisions · 0 stalled runs · 0 open waits · 1 policy alert");
+    store.recordPolicyEvent({ ruleCode: "authority_routing", summary: "Authority mismatch" });
+    assert.equal(summary(), "0 pending owner decisions · 0 stalled runs · 0 open waits · 2 policy alerts");
+  } finally {
+    store.close();
+  }
+});
+
 test("observes failures and authority mismatches once, reports health, and generates deterministic digests", () => {
   const store = PlatformStore.open(":memory:", { now: () => now });
   try {
