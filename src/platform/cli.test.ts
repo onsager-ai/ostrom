@@ -190,8 +190,8 @@ test("dashboard CLI requires the public and Access options in pairs", async () =
   const team = ["--cf-access-team-domain", "https://team.cloudflareaccess.com"];
   const aud = ["--cf-access-aud", "dashboard-audience"];
   for (const [flags, error] of [
-    [url, /--public-url and --token-file must be given together/],
-    [token, /--public-url and --token-file must be given together/],
+    [url, /--public-url requires --token-file or Cloudflare Access/],
+    [token, /--token-file requires --public-url/],
     [[...url, ...token, ...team], /--cf-access-team-domain and --cf-access-aud must be given together/],
     [[...url, ...token, ...aud], /--cf-access-team-domain and --cf-access-aud must be given together/],
     [[...team, ...aud], /--cf-access-team-domain and --cf-access-aud require --public-url/],
@@ -201,5 +201,29 @@ test("dashboard CLI requires the public and Access options in pairs", async () =
     assert.match(result.stderr, error);
   }
   const help = await cli(["--help"]);
-  assert.match(help.stdout, /dashboard[^\n]*\n\s+\[--public-url .* --token-file .*\n\s+\[--cf-access-team-domain .* --cf-access-aud /);
+  assert.match(help.stdout, /dashboard[^\n]*\n\s+\[--public-url .*\[--token-file .*\]\n\s+\[--cf-access-team-domain .* --cf-access-aud /);
+});
+
+test("dashboard CLI starts with Cloudflare Access and no token file", async (t) => {
+  const script = fileURLToPath(new URL("./cli.ts", import.meta.url));
+  const child = spawn(process.execPath, [script, "dashboard", "--public-url", "https://dashboard.example",
+    "--cf-access-team-domain", "https://team.cloudflareaccess.com", "--cf-access-aud", "dashboard-audience", "--json"],
+  { stdio: ["ignore", "pipe", "pipe"] });
+  const exited = once(child, "exit");
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await exited;
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+  child.stdout.setEncoding("utf8");
+  const ready: unknown = await Promise.race([
+    once(child.stdout, "data").then(([chunk]) => chunk),
+    exited.then(() => { throw new Error(`dashboard exited before listening: ${stderr}`); }),
+  ]);
+  const result = JSON.parse(String(ready)) as { url: string };
+  assert.match(result.url, /^http:\/\/127\.0\.0\.1:\d+\/$/);
+  child.kill("SIGTERM");
+  assert.deepEqual(await exited, [0, null]);
 });

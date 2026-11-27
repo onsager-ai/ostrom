@@ -54,7 +54,7 @@ const usage = `usage: ostrom-platform [--db <path> | --socket <path>] [--json] <
   status-mcp --public-url <https://...> [--socket <path>] [--port 0] [--state-dir <path>]
   status-mcp-approve [--state-dir <path>] [--ttl-sec 600]
   dashboard [--socket <path>] [--port 0]
-            [--public-url <https://...> --token-file <path>
+            [--public-url <https://...> [--token-file <path>]
              [--cf-access-team-domain <https://...> --cf-access-aud <audience>]]
   serve [--socket <path>] [--db <path>] [--hosts-config <path>] [--tokens-dir <path>]
         [--github-poll-ms N] [--semon-bin <path>]
@@ -467,8 +467,8 @@ export async function runPlatformCli(argv: readonly string[], io: CliIO = {}): P
       const tokenFile = flags.get("--token-file");
       const teamDomain = flags.get("--cf-access-team-domain");
       const aud = flags.get("--cf-access-aud");
-      if ((publicUrl === undefined) !== (tokenFile === undefined)) {
-        throw new UsageError("--public-url and --token-file must be given together");
+      if (tokenFile !== undefined && publicUrl === undefined) {
+        throw new UsageError("--token-file requires --public-url");
       }
       if ((teamDomain === undefined) !== (aud === undefined)) {
         throw new UsageError("--cf-access-team-domain and --cf-access-aud must be given together");
@@ -476,10 +476,12 @@ export async function runPlatformCli(argv: readonly string[], io: CliIO = {}): P
       if (teamDomain !== undefined && publicUrl === undefined) {
         throw new UsageError("--cf-access-team-domain and --cf-access-aud require --public-url");
       }
+      if (publicUrl !== undefined && tokenFile === undefined && teamDomain === undefined) {
+        throw new UsageError("--public-url requires --token-file or Cloudflare Access");
+      }
       const dashboard = await startPlatformDashboard({
-        socketPath: socket ?? defaultPlatformSocketPath(env), port,
-        ...(publicUrl === undefined || tokenFile === undefined ? {} : { publicUrl, tokenFile }),
-        ...(teamDomain === undefined || aud === undefined ? {} : { cfAccess: { teamDomain, aud } }),
+        socketPath: socket ?? defaultPlatformSocketPath(env), port, publicUrl, tokenFile,
+        cfAccess: teamDomain === undefined || aud === undefined ? undefined : { teamDomain, aud },
       });
       try {
         await waitForShutdown(() => {

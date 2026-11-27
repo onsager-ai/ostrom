@@ -21,19 +21,23 @@ export async function startPlatformDashboard({ socketPath, port = 0, publicUrl, 
   cfAccess?: CloudflareAccessOptions;
 }) {
   const loopback = "127.0.0.1";
-  if ((publicUrl === undefined) !== (tokenFile === undefined)) {
-    throw new Error("Dashboard public URL and token file must be given together");
+  if (tokenFile !== undefined && publicUrl === undefined) {
+    throw new Error("Dashboard token file requires a public URL");
   }
   const publicOrigin = publicUrl === undefined ? undefined : httpsOrigin(publicUrl, "Dashboard public URL");
   if (cfAccess !== undefined && publicOrigin === undefined) {
     throw new Error("Dashboard Cloudflare Access requires a public URL");
   }
+  if (publicOrigin !== undefined && tokenFile === undefined && cfAccess === undefined) {
+    throw new Error("Dashboard public URL requires a token file or Cloudflare Access");
+  }
   const verifyAccess = cfAccess === undefined ? undefined : cloudflareAccessVerifier(cfAccess);
-  const token = tokenFile === undefined ? randomBytes(32).toString("hex") : readTokenFile(tokenFile);
-  const expectedToken = Buffer.from(token);
+  const token = tokenFile === undefined && publicOrigin === undefined ? randomBytes(32).toString("hex")
+    : tokenFile === undefined ? undefined : readTokenFile(tokenFile);
+  const expectedToken = token === undefined ? undefined : Buffer.from(token);
   const authorized = (authorization: string | undefined) => {
     const supplied = /^Bearer ([0-9a-f]{64})$/.exec(authorization ?? "")?.[1];
-    return supplied !== undefined && timingSafeEqual(Buffer.from(supplied), expectedToken);
+    return supplied !== undefined && expectedToken !== undefined && timingSafeEqual(Buffer.from(supplied), expectedToken);
   };
   let page = await readFile(new URL("./dashboard.html", import.meta.url));
   if (publicOrigin !== undefined) {
@@ -57,7 +61,7 @@ export async function startPlatformDashboard({ socketPath, port = 0, publicUrl, 
       outgoing.setHeader("Allow", "GET");
       return send(outgoing, 405, "Method not allowed");
     }
-    if (publicOrigin !== undefined && !authorized(authorization)) return send(outgoing, 401, "Unauthorized");
+    if (publicOrigin !== undefined && tokenFile !== undefined && !authorized(authorization)) return send(outgoing, 401, "Unauthorized");
     if (verifyAccess !== undefined && !await verifyAccess(incoming.headersDistinct["cf-access-jwt-assertion"])) {
       return send(outgoing, 403, "Forbidden");
     }
