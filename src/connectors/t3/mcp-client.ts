@@ -230,13 +230,13 @@ export class T3McpClient {
     args: T3MilestoneFilter = {},
     { signal, ...window }: PollOptions = {},
   ): Promise<T3PollResult<Name>> {
-    const { events, cursor, truncated, hasMore } = await this.#request<T3EventsPollRpcResult<Name>>({
+    const { events, cursor, truncated, hasMore, nextPollMs } = await this.#request<T3EventsPollRpcResult<Name>>({
       jsonrpc: "2.0",
       id: this.#nextId++,
       method: "events/poll",
       params: { ...window, name, arguments: args, _meta: this.#metadata },
     }, signal);
-    return { events, cursor, truncated, hasMore };
+    return { events, cursor, truncated, hasMore, ...(nextPollMs === undefined ? {} : { nextPollMs }) };
   }
 
   async *streamEvents<Name extends T3MilestoneName>(
@@ -256,6 +256,7 @@ export class T3McpClient {
       throw new Error("T3 events/stream did not return an event stream");
     }
 
+    let activated = false;
     for await (const data of sseData(response)) {
       signal?.throwIfAborted();
       const message = JSON.parse(data) as T3EventsStreamNotification<Name> | T3RpcResponse<unknown>;
@@ -265,8 +266,16 @@ export class T3McpClient {
         return;
       }
       switch (message.method) {
-        case "notifications/events/active":
-          if (message.params.truncated) yield { kind: "gap" };
+        case "notifications/events/active": {
+          const { cursor, truncated } = message.params;
+          // T3 also uses active frames to report gaps after opening the stream.
+          if (!activated || !truncated) yield { kind: "activated", cursor, truncated };
+          activated = true;
+          if (truncated) yield { kind: "gap", cursor };
+          break;
+        }
+        case "notifications/events/heartbeat":
+          yield { kind: "heartbeat", cursor: message.params.cursor };
           break;
         case "notifications/events/event": {
           const { cursor, eventId, timestamp, data: milestone } = message.params;

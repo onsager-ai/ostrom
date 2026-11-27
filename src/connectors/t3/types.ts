@@ -400,6 +400,7 @@ export interface T3PollResult<Name extends T3MilestoneName = T3MilestoneName> {
   cursor: string | null;
   truncated: boolean;
   hasMore: boolean;
+  nextPollMs?: number;
 }
 
 export type T3EventsPollRpcResult<Name extends T3MilestoneName = T3MilestoneName> =
@@ -414,4 +415,6 @@ export type T3EventsStreamNotification<Name extends T3MilestoneName = T3Mileston
 
 export type T3StreamItem<Name extends T3MilestoneName = T3MilestoneName> =
   | { kind: "event"; cursor: string | null; eventId: string; timestamp: string; data: T3EventOccurrence<Name>["data"] }
-  | { kind: "gap" };
+  | { kind: "activated"; cursor: string | null; truncated: boolean }
+  | { kind: "heartbeat"; cursor: string | null }
+  | { kind: "gap"; cursor: string | null };

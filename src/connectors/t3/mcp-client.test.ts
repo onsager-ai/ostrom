@@ -10,6 +10,7 @@ import type {
   T3EventsStreamNotification,
   T3MilestoneEvent,
   T3ReadToolResults,
+  T3StreamItem,
   T3TargetConfig,
 } from "./types.ts";
 
@@ -269,12 +270,13 @@ test("polls a milestone with pagination and truncation information", async (t) =
   const result = { events: [occurrence], cursor: "server.50", truncated: true, hasMore: true };
   const { client, requests } = await mockMcp(t, (rpc, response) => {
     assert.equal(rpc.method, "events/poll");
-    jsonReply(response, rpc.id, { ...result, nextPollMs: 1_000 });
+    jsonReply(response, rpc.id, rpc.params.cursor === "old.1" ? { ...result, nextPollMs: 1_000 } : result);
   });
   const args = { threadIds: ["thread-1"] };
   const options = { cursor: "old.1", maxEvents: 1, maxAgeMs: 5_000 };
   const actual = await client.pollEvents(milestone.type, args, options);
-  assert.deepEqual(actual, result);
+  assert.deepEqual(actual, { ...result, nextPollMs: 1_000 });
+  assert.deepEqual(await client.pollEvents(milestone.type), result);
   assert.equal(actual.events[0]?.data.runId, "run-1");
   assert.deepEqual(requests[0]?.params.arguments, args);
   assert.equal(requests[0]?.params.cursor, options.cursor);
@@ -282,13 +284,18 @@ test("polls a milestone with pagination and truncation information", async (t) =
   assert.equal(requests[0]?.params.maxAgeMs, options.maxAgeMs);
 });
 
+function active(cursor: string | null, truncated: boolean): T3EventsStreamNotification {
+  return { jsonrpc: "2.0", method: "notifications/events/active", params: { cursor, truncated, heartbeatMs: 1_000 } };
+}
+
+function heartbeat(cursor: string | null): T3EventsStreamNotification {
+  return { jsonrpc: "2.0", method: "notifications/events/heartbeat", params: { cursor } };
+}
+
 test("streams SEP-3415 occurrences and reports a gap from truncated activation", async (t) => {
   const notification: T3EventsStreamNotification = {
     jsonrpc: "2.0", method: "notifications/events/event", params: { ...occurrence, cursor: "server.50" },
   };
-  const active = (cursor: string, truncated: boolean): T3EventsStreamNotification => ({
-    jsonrpc: "2.0", method: "notifications/events/active", params: { cursor, truncated, heartbeatMs: 1_000 },
-  });
   const { client, requests } = await mockMcp(t, (rpc, response) => {
     response.writeHead(200, { "content-type": "text/event-stream" });
     response.write(sseFrame(active("server.49", false)));
@@ -296,20 +303,55 @@ test("streams SEP-3415 occurrences and reports a gap from truncated activation",
     response.write(event.slice(0, -1));
     response.write(event.slice(-1));
     response.write(sseFrame(active("server.51", true)));
-    response.write(sseFrame({
-      jsonrpc: "2.0", method: "notifications/events/heartbeat", params: { cursor: "server.51" },
-    }));
+    response.write(sseFrame(heartbeat("server.52")));
     response.end(sseFrame({ jsonrpc: "2.0", id: rpc.id, result: { resultType: "complete" } }));
   });
 
-  const items = await Array.fromAsync(client.streamEvents(milestone.type, {}, { cursor: "server.49", heartbeatMs: 1_000 }));
+  const items: T3StreamItem<typeof milestone.type>[] = [];
+  for await (const item of client.streamEvents(milestone.type, {}, { cursor: "server.48", heartbeatMs: 1_000 })) {
+    items.push(item);
+  }
   assert.deepEqual(items, [
+    { kind: "activated", cursor: "server.49", truncated: false },
     { kind: "event", cursor: "server.50", eventId: occurrence.eventId, timestamp: occurrence.timestamp, data: milestone },
-    { kind: "gap" },
+    { kind: "gap", cursor: "server.51" },
+    { kind: "heartbeat", cursor: "server.52" },
   ]);
   assert.equal(requests[0]?.method, "events/stream");
-  assert.equal(requests[0]?.params.cursor, "server.49");
+  assert.equal(requests[0]?.params.cursor, "server.48");
   assert.equal(requests[0]?.params.heartbeatMs, 1_000);
+});
+
+test("reconnects from the last gap or heartbeat cursor even without a matching event", async (t) => {
+  const { client, requests } = await mockMcp(t, (rpc, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    switch (rpc.params.cursor) {
+      case null:
+        response.write(sseFrame(active("server.1", false)));
+        response.write(sseFrame(active("server.2", true)));
+        break;
+      case "server.2":
+        response.write(sseFrame(active("server.2", false)));
+        response.write(sseFrame(heartbeat("server.3")));
+        break;
+      case "server.3":
+        response.write(sseFrame(active("server.4", false)));
+        break;
+      default:
+        assert.fail("Reconnect used a stale cursor");
+    }
+    response.end();
+  });
+
+  let cursor: string | null = null;
+  for (const expectedCursor of ["server.2", "server.3", "server.4"]) {
+    for await (const item of client.streamEvents(milestone.type, { threadIds: ["thread-1"] }, { cursor })) {
+      assert.notEqual(item.kind, "event");
+      cursor = item.cursor;
+    }
+    assert.equal(cursor, expectedCursor);
+  }
+  assert.deepEqual(requests.map(({ params }) => params.cursor), [null, "server.2", "server.3"]);
 });
 
 test("stream rejects denied access before and after HTTP headers arrive", async (t) => {
@@ -340,7 +382,10 @@ test("aborting a stream closes the response while awaiting an event", async (t) 
   });
   const controller = new AbortController();
   const stream = client.streamEvents(milestone.type, {}, { signal: controller.signal });
-  assert.deepEqual(await stream.next(), { value: { kind: "gap" }, done: false });
+  assert.deepEqual(await stream.next(), {
+    value: { kind: "activated", cursor: "server.1", truncated: true }, done: false,
+  });
+  assert.deepEqual(await stream.next(), { value: { kind: "gap", cursor: "server.1" }, done: false });
   const pending = stream.next();
   controller.abort();
   await assert.rejects(pending, { name: "AbortError" });
