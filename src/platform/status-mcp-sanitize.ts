@@ -2,7 +2,7 @@ import { PlatformApiClient } from "./api.ts";
 import type { generateOwnerDigest, DigestWindow } from "./digest.ts";
 import type { readPlatformHealth } from "./policy-observer.ts";
 import { decisionAuthorities, decisionCategories, decisionUrgencies, laneStatuses } from "./types.ts";
-import type { Decision, Goal, Lane } from "./types.ts";
+import type { Decision, Goal, JsonValue, Lane } from "./types.ts";
 
 type Health = ReturnType<typeof readPlatformHealth>;
 type Digest = ReturnType<typeof generateOwnerDigest>;
@@ -19,29 +19,44 @@ const markdownText = (value: string | null) =>
 
 // Display fields can themselves contain references to the private records. Remove known
 // identifiers and common URL, path, opaque ID and bearer formats before mapping them.
-function textSanitizer(health: Health, digest: Digest, decisions: Decision[]) {
+function textSanitizer(health: Health, digest: Digest, lanes: Lane[], decisions: Decision[]) {
   const denied = new Set<string>();
   const add = (...values: (string | null | undefined)[]) => {
     for (const value of values) if (typeof value === "string" && value.length > 1) denied.add(value.toLowerCase());
   };
+  function addEvidence(value: JsonValue): void {
+    const pending = [value];
+    while (pending.length > 0) {
+      const item = pending.pop();
+      if (typeof item === "string" && item.length >= 4) add(item);
+      else if (item !== null && typeof item === "object") {
+        for (const child of Object.values(item)) pending.push(child);
+      }
+    }
+  }
+  for (const lane of lanes) add(lane.ownerAgentId);
+  for (const lane of digest.sections.lanes) add(lane.ownerAgentId);
   for (const host of health.hosts) {
     add(host.hostId, host.label, host.mcpUrl, host.originNamespace, host.environmentId, host.tokenExpiresAt, host.lastError);
     add(URL.parse(host.mcpUrl)?.hostname);
   }
   for (const agent of health.agents) add(agent.label, agent.id, agent.externalRef);
-  for (const run of health.activeRuns) add(run.externalRunRef, run.semonSessionUid, run.semonIdentity?.nativeSessionId);
+  for (const run of [...health.activeRuns, ...health.stalledRuns]) add(run.externalRunRef, run.semonSessionUid, run.semonIdentity?.nativeSessionId);
   for (const wait of health.waits) add(wait.threadId, wait.requestId);
-  for (const pr of digest.sections.prs) add(pr.threadId, pr.repository, pr.url, pr.title, pr.lastWakeSummary);
+  for (const pr of digest.sections.prs) add(pr.threadId, pr.repository, pr.headBranch, pr.url, pr.title, pr.lastWakeSummary);
   for (const pr of health.githubPrs) add(pr.repository);
-  for (const decision of decisions) add(decision.requestedBy, decision.decidedBy);
+  for (const decision of [...decisions, ...health.pendingOwnerDecisions]) {
+    add(decision.requestedBy, decision.decidedBy);
+    addEvidence(decision.evidence);
+  }
   return (value: string): string => {
     if (typeof value !== "string") return "";
     const lower = value.toLowerCase();
     for (const secret of denied) if (lower.includes(secret)) return "[redacted]";
     return value
-      .replace(/\bbearer\s+\S+|\b(?:gh[pousr]_|sk-|github_pat_)[\w-]+/gi, "[redacted]")
+      .replace(/\b(?:bearer\s+|(?:token|secret)\s*[:=]\s*)\S+|\b(?:gh[pousr]_|sk-|github_pat_)[\w-]+/gi, "[redacted]")
       .replace(/\b[A-Za-z0-9_-]{32,}\b|\b[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}\b/gi, "[redacted]")
-      .replace(/(?:[\w.+-]+@)?(?:[\w-]+\.)+[a-z]{2,}\b|(?:[\w~.-]*\/)+[\w./-]+/gi, "[redacted]");
+      .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s<>]+|(?:[\w.+-]+@)?(?:[\w-]+\.)+[a-z]{2,}\b|(?:[\w~.-]*\/)+[\w./-]+/gi, "[redacted]");
   };
 }
 
@@ -83,7 +98,7 @@ export function createStatusReader(socketPath: string) {
     const [snapshot, rawDigest, lanes, decisions] = await Promise.all([
       health(), digest(window), get<Lane[]>("/v1/lanes"), get<Decision[]>("/v1/decisions?status=pending"),
     ]);
-    const clean = textSanitizer(snapshot, rawDigest, [...decisions, ...rawDigest.sections.decisions]);
+    const clean = textSanitizer(snapshot, rawDigest, lanes, [...decisions, ...rawDigest.sections.decisions]);
     // The list route has no goals. The digest's structured lane records include them.
     const goals = new Map(rawDigest.sections.lanes.map(({ id, goal }) => [id, goal]));
     const slugs = new Map(lanes.map(({ id, slug }) => [id, clean(slug)]));

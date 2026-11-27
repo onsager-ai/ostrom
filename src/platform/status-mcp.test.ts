@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -13,6 +13,10 @@ import { mintStatusApproval, statusPublicOrigin } from "./status-mcp-oauth.ts";
 const publicUrl = "https://status.example.com";
 const redirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
 const verifier = "a".repeat(43);
+async function json<T>(response: Response): Promise<T> {
+  return await response.json() as T;
+}
+
 const challenge = createHash("sha256").update(verifier).digest("base64url");
 
 test("status MCP OAuth, transport and tool discovery", async () => {
@@ -41,7 +45,11 @@ test("status MCP OAuth, transport and tool discovery", async () => {
         scopes_supported: ["status:read"], bearer_methods_supported: ["header"],
       });
     }
-    const metadata = await (await request("/.well-known/oauth-authorization-server")).json();
+    const metadata = await json<{
+      issuer: string; authorization_endpoint: string; token_endpoint: string;
+      registration_endpoint: string; revocation_endpoint: string;
+      code_challenge_methods_supported: string[]; token_endpoint_auth_methods_supported: string[];
+    }>(await request("/.well-known/oauth-authorization-server"));
     assert.equal(metadata.issuer, publicUrl);
     assert.equal(metadata.authorization_endpoint, `${publicUrl}/oauth/authorize`);
     assert.equal(metadata.token_endpoint, `${publicUrl}/oauth/token`);
@@ -56,8 +64,13 @@ test("status MCP OAuth, transport and tool discovery", async () => {
     }
     const registration = await postJson("/oauth/register", { redirect_uris: [redirectUri] });
     assert.equal(registration.status, 201);
-    const { client_id } = await registration.json();
+    const { client_id } = await json<{ client_id: string }>(registration);
     assert.equal(typeof client_id, "string");
+    const secondRegistration = await postJson("/oauth/register", { redirect_uris: [redirectUri] });
+    assert.equal(secondRegistration.status, 201);
+    const secondClient = await json<{ client_id: string }>(secondRegistration);
+    assert.equal(typeof secondClient.client_id, "string");
+    assert.notEqual(secondClient.client_id, client_id);
     const auth = {
       client_id, redirect_uri: redirectUri, response_type: "code", code_challenge: challenge,
       code_challenge_method: "S256", state: 'abc"><script>', resource: `${publicUrl}/mcp`,
@@ -100,7 +113,7 @@ test("status MCP OAuth, transport and tool discovery", async () => {
     assert.equal((await form("/oauth/token", { ...tokenRequest, resource: `${publicUrl}/other` })).status, 400);
     const exchange = await form("/oauth/token", tokenRequest);
     assert.equal(exchange.status, 200);
-    const { access_token: token, token_type, scope, expires_in } = await exchange.json();
+    const { access_token: token, token_type, scope, expires_in } = await json<{ access_token: string; token_type: string; scope: string; expires_in: number }>(exchange);
     assert.equal(token_type, "Bearer");
     assert.equal(scope, "status:read");
     assert.equal(expires_in, 604800);
@@ -120,16 +133,27 @@ test("status MCP OAuth, transport and tool discovery", async () => {
     assert.equal(method.headers.get("referrer-policy"), "no-referrer");
     assert.equal(method.headers.get("x-content-type-options"), "nosniff");
     assert.equal((await postJson("/mcp", "a".repeat(64 * 1024), token)).status, 413);
+    const unsupported = await request("/mcp", {
+      method: "POST", headers: {
+        Authorization: `Bearer ${token}`, "Content-Type": "application/json", "MCP-Protocol-Version": "1900-01-01",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }),
+    });
+    assert.equal(unsupported.status, 400);
+    assert.deepEqual(await unsupported.json(), { error: "unsupported_protocol_version" });
     for (const protocolVersion of ["2025-06-18", "2026-07-28"]) {
-      assert.equal((await (await rpc(token, "initialize", { protocolVersion })).json()).result.protocolVersion, protocolVersion);
+      assert.equal((await json<{ result: { protocolVersion: string } }>(await rpc(token, "initialize", { protocolVersion }))).result.protocolVersion, protocolVersion);
     }
     assert.equal((await postJson("/mcp", { jsonrpc: "2.0", method: "notifications/initialized" }, token)).status, 202);
-    assert.equal((await (await rpc(token, "unknown")).json()).error.code, -32601);
-    assert.equal((await (await rpc(token, "tools/call", { name: "answer_decision" })).json()).error.code, -32602);
-    assert.equal((await (await rpc(token, "tools/call", { name: "read_latest_digest", arguments: { window: "other" } })).json()).error.code, -32602);
-    const unavailable = await (await rpc(token, "tools/call", { name: "status_summary" })).json();
+    const rpcError = async (method: string, params?: unknown) =>
+      (await json<{ error: { code: number } }>(await rpc(token, method, params))).error.code;
+    assert.equal(await rpcError("unknown"), -32601);
+    assert.equal(await rpcError("tools/call", { name: "answer_decision" }), -32602);
+    assert.equal(await rpcError("tools/call", { name: "read_latest_digest", arguments: { window: "other" } }), -32602);
+    const unavailable = await json<{ result: unknown }>(await rpc(token, "tools/call", { name: "status_summary" }));
     assert.deepEqual(unavailable.result, { isError: true, content: [{ type: "text", text: "Platform status unavailable." }] });
-    const { result } = await (await rpc(token, "tools/list")).json();
+    const { result } = await json<{ result: { tools: { name: string; annotations: unknown }[] } }>(
+      await rpc(token, "tools/list"));
     assert.deepEqual(result.tools.map(({ name }: { name: string }) => name),
       ["status_summary", "list_lanes", "list_open_decisions", "read_latest_digest"]);
     for (const tool of result.tools) {
@@ -144,9 +168,8 @@ test("status MCP OAuth, transport and tool discovery", async () => {
     } while (response.status === 200);
     assert.equal(response.status, 429);
     assert.ok(Number(response.headers.get("retry-after")) > 0);
-    assert.equal((await form("/oauth/revoke", { token })).status, 200);
-    assert.equal((await form("/oauth/revoke", { token })).status, 200);
-    assert.equal((await rpc(token, "ping")).status, 401);
+    await server.close();
+    server = await startStatusMcp(config);
     response = await request("/.well-known/oauth-authorization-server");
     await response.text();
     assert.equal(response.status, 200);
@@ -157,6 +180,13 @@ test("status MCP OAuth, transport and tool discovery", async () => {
     }
     assert.equal(response.status, 429);
     assert.ok(Number(response.headers.get("retry-after")) > 0);
+    assert.equal((await rpc(token, "ping")).status, 200);
+    assert.equal((await rpc("x".repeat(43), "ping")).status, 429);
+    await server.close();
+    server = await startStatusMcp(config);
+    assert.equal((await form("/oauth/revoke", { token })).status, 200);
+    assert.equal((await form("/oauth/revoke", { token })).status, 200);
+    assert.equal((await rpc(token, "ping")).status, 401);
   } finally {
     await server.close();
     rmSync(root, { recursive: true, force: true });
@@ -177,6 +207,34 @@ test("public origins and approval CLI", async () => {
       stdout: { write: (text) => { printed += text; } },
     }), 0);
     assert.match(printed, /^[A-Za-z0-9_-]{43}\n$/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+test("OAuth state rejects symlinked database files and corrupt signing keys", async () => {
+  const root = mkdtempSync(join(tmpdir(), "ostrom-status-state-"));
+  const stateDir = join(root, "oauth");
+  const statePath = join(stateDir, "oauth.sqlite");
+  const target = join(root, "target");
+  const config = { publicUrl, stateDir, socketPath: join(root, "missing.sock") };
+  try {
+    mkdirSync(stateDir, { mode: 0o700 });
+    writeFileSync(target, "untouched", { mode: 0o600 });
+    symlinkSync(target, statePath);
+    assert.throws(() => mintStatusApproval(stateDir), /state file/);
+    assert.equal(readFileSync(target, "utf8"), "untouched");
+    unlinkSync(statePath);
+    const server = await startStatusMcp(config);
+    await server.close();
+    const db = new DatabaseSync(statePath);
+    try {
+      db.prepare("UPDATE signing_key SET key = ?").run("x".repeat(43));
+    } finally {
+      db.close();
+    }
+    await assert.rejects(startStatusMcp(config), /Invalid Status MCP signing key/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -164,10 +164,13 @@ export async function startStatusMcp({ publicUrl, socketPath, stateDir, port = 0
       throw new RequestError(405);
     }
     if (request.headers.origin !== undefined && request.headers.origin !== origin) throw new RequestError(403);
-    // Treat the socket peer as the IP. A local reverse proxy shares one IP budget.
-    const ipRetry = limit(`ip:${request.socket.remoteAddress ?? ""}`, 120);
-    if (ipRetry) {
-      response.setHeader("Retry-After", ipRetry);
+    const token = url.pathname === "/mcp" ? oauth.authenticate(request.headers.authorization) : undefined;
+    // A reverse proxy shares one anonymous IP budget. Authenticated reads have their own budget.
+    const retry = token === undefined
+      ? limit(`ip:${request.socket.remoteAddress ?? ""}`, 120)
+      : limit(`token:${token}`, 60);
+    if (retry) {
+      response.setHeader("Retry-After", retry);
       throw new RequestError(429);
     }
     switch (url.pathname) {
@@ -177,15 +180,13 @@ export async function startStatusMcp({ publicUrl, socketPath, stateDir, port = 0
       case "/.well-known/oauth-authorization-server":
         return json(response, 200, oauth.serverMetadata);
       case "/mcp": {
-        const token = oauth.authenticate(request.headers.authorization);
         if (!token) {
           response.setHeader("WWW-Authenticate", `Bearer resource_metadata="${origin}${resourceMetadataPath}"`);
           throw new RequestError(401);
         }
-        const tokenRetry = limit(`token:${token}`, 60);
-        if (tokenRetry) {
-          response.setHeader("Retry-After", tokenRetry);
-          throw new RequestError(429);
+        const version = request.headers["mcp-protocol-version"];
+        if (version !== undefined && (typeof version !== "string" || !versions.includes(version))) {
+          return json(response, 400, { error: "unsupported_protocol_version" });
         }
         const raw = await readBody(request, "application/json");
         let value: unknown;

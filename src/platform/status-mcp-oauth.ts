@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { closeSync, lstatSync, mkdirSync, openSync } from "node:fs";
+import { closeSync, constants, lstatSync, mkdirSync, openSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
@@ -36,7 +36,15 @@ function openState(stateDir: string): DatabaseSync {
     throw new Error("Status MCP state directory must be owned by the current user with mode 0700");
   }
   const path = join(stateDir, "oauth.sqlite");
-  closeSync(openSync(path, "a", 0o600));
+  if (lstatSync(path, { throwIfNoEntry: false }) === undefined) {
+    const { O_CREAT, O_EXCL, O_NOFOLLOW, O_RDWR } = constants;
+    try {
+      closeSync(openSync(path, O_CREAT | O_EXCL | O_NOFOLLOW | O_RDWR, 0o600));
+    } catch (error) {
+      // The CLI and server can initialize the same directory concurrently.
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  }
   const file = lstatSync(path);
   if (!file.isFile() || file.uid !== directory.uid || (file.mode & 0o777) !== 0o600) {
     throw new Error("Status MCP state file must be owned by the current user with mode 0600");
@@ -90,7 +98,12 @@ function htmlAttribute(value: string): string {
 export function createStatusOAuth(origin: string, stateDir: string, redirectAllowlist: readonly string[] = redirects) {
   const db = openState(stateDir);
   db.prepare("INSERT OR IGNORE INTO signing_key VALUES (1, ?)").run(secret());
-  const key = String(db.prepare("SELECT key FROM signing_key WHERE id = 1").get()?.["key"]);
+  const key = db.prepare("SELECT key FROM signing_key WHERE id = 1").get()?.["key"];
+  if (typeof key !== "string" || !secretPattern.test(key) ||
+      Buffer.from(key, "base64url").toString("base64url") !== key) {
+    db.close();
+    throw new Error("Invalid Status MCP signing key");
+  }
   const resource = `${origin}/mcp`;
   const codes = new Map<string, { request: Authorization; expires: number }>();
   const signature = (payload: string) => createHmac("sha256", key).update(payload).digest("base64url");
@@ -103,8 +116,8 @@ export function createStatusOAuth(origin: string, stateDir: string, redirectAllo
     const [payload, mac, extra] = clientId.split(".");
     if (!payload || !mac || extra !== undefined || !secretPattern.test(mac) ||
         !timingSafeEqual(Buffer.from(mac), Buffer.from(signature(payload))) || !allowedRedirect(uri)) return false;
-    const uris = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as string[];
-    return uris.includes(uri);
+    const { uris } = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { uris: string[] };
+    return Array.isArray(uris) && uris.includes(uri);
   }
   function checkAuthorization(params: URLSearchParams): Authorization | undefined {
     const request = {
@@ -147,7 +160,7 @@ export function createStatusOAuth(origin: string, stateDir: string, redirectAllo
           (body["grant_types"] !== undefined && JSON.stringify(body["grant_types"]) !== '["authorization_code"]') ||
           (body["response_types"] !== undefined && JSON.stringify(body["response_types"]) !== '["code"]') ||
           (body["scope"] !== undefined && body["scope"] !== scope)) return invalid("invalid_client_metadata");
-      const payload = Buffer.from(JSON.stringify(uris)).toString("base64url");
+      const payload = Buffer.from(JSON.stringify({ nonce: randomBytes(12).toString("base64url"), uris })).toString("base64url");
       return { status: 201, body: {
         client_id: `${payload}.${signature(payload)}`, redirect_uris: uris, token_endpoint_auth_method: "none",
         grant_types: ["authorization_code"], response_types: ["code"], scope,
