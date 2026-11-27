@@ -8,12 +8,12 @@ import { migrate } from "./migrations.ts";
 import {
   agentRoles, agentStatuses, budgetPeriods, budgetScopes, connectorKinds, decisionAuthorities,
   decisionCategories, decisionStatuses, decisionUrgencies, frictionKinds, frictionStatuses,
-  laneStatuses, runStatuses, spendSources,
+  isSemonKey, laneStatuses, runStatuses, spendSources,
 } from "./types.ts";
 import type {
   Agent, Budget, Decision, DecisionEvent, DecisionStatus, DecisionVerification, FrictionEntry,
   FrictionStatus, Goal, JsonValue, Lane, LaneStatus, PolicyEvent, PolicyRule, Run, SpendSnapshot,
-  T3HostState, T3PendingWait, T3ThreadPr,
+  GitHubPrCheck, GitHubPrObservation, SemonSessionIdentity, SpendSummaryFilter, T3HostState, T3PendingWait, T3ThreadPr,
 } from "./types.ts";
 
 export class PlatformValidationError extends Error {}
@@ -53,7 +53,7 @@ export type UpsertBudgetInput = OptionalFields<Omit<Budget, "updatedAt">, "id" |
 export type UpsertSpendSnapshotInput = Pick<SpendSnapshot, "sessionUid" | "source"> & Partial<Omit<SpendSnapshot, "sessionUid" | "source">>;
 export type UpsertAgentInput = OptionalFields<Omit<Agent, "updatedAt">, "laneId" | "lastSeenAt">;
 export type UpsertRunInput = OptionalFields<Omit<Run, "updatedAt">,
-  "laneId" | "model" | "startedAt" | "completedAt" | "failureCount" | "waitingDetail" | "semonSessionUid">;
+  "laneId" | "model" | "startedAt" | "completedAt" | "failureCount" | "waitingDetail" | "semonSessionUid" | "semonIdentity">;
 
 export type T3HostUpdate = Pick<T3HostState, "hostId" | "label" | "mcpUrl" | "originNamespace" | "connectionState">
   & Partial<Omit<T3HostState, "hostId" | "label" | "mcpUrl" | "originNamespace" | "connectionState" | "updatedAt">>;
@@ -76,7 +76,8 @@ export interface T3ThreadSnapshot {
 const t3HostColumns = `host_id AS hostId, label, mcp_url AS mcpUrl, origin_namespace AS originNamespace,
   environment_id AS environmentId, server_version AS serverVersion, token_expires_at AS tokenExpiresAt,
   connection_state AS connectionState, last_reconciled_at AS lastReconciledAt, last_event_at AS lastEventAt,
-  last_error AS lastError, consecutive_failures AS consecutiveFailures, partial_coverage AS partialCoverage,
+  last_error AS lastError, consecutive_failures AS consecutiveFailures,
+  partial_coverage AS partialCoverage,
   updated_at AS updatedAt`;
 type T3HostRow = Omit<T3HostState, "partialCoverage"> & { partialCoverage: number };
 const t3WaitColumns = `host_id AS hostId, thread_id AS threadId, request_id AS requestId, kind,
@@ -111,7 +112,7 @@ const agentColumns = `id, role, lane_id AS laneId, connector_kind AS connectorKi
 const runColumns = `id, agent_id AS agentId, lane_id AS laneId, connector_kind AS connectorKind,
   host_id AS hostId, external_run_ref AS externalRunRef, status, model, started_at AS startedAt,
   completed_at AS completedAt, failure_count AS failureCount, waiting_detail_json AS waitingDetail,
-  semon_session_uid AS semonSessionUid, updated_at AS updatedAt`;
+  semon_session_uid AS semonSessionUid, semon_identity_json AS semonIdentity, updated_at AS updatedAt`;
 
 type JsonColumns<T, K extends keyof T> = Omit<T, K> & Record<K, string>;
 type DecisionRow = JsonColumns<Decision, "evidence" | "options" | "answer">;
@@ -120,7 +121,7 @@ type DecisionEventRow = JsonColumns<DecisionEvent, "detail">;
 type PolicyRuleRow = JsonColumns<Omit<PolicyRule, "enabled"> & { enabled: number }, "params">;
 type PolicyEventRow = JsonColumns<PolicyEvent, "detail">;
 type BudgetRow = Omit<Budget, "enabled"> & { enabled: number };
-type RunRow = JsonColumns<Run, "waitingDetail">;
+type RunRow = JsonColumns<Run, "waitingDetail" | "semonIdentity">;
 
 function newId(prefix: string): string {
   return `${prefix}_${randomBytes(6).toString("hex")}`;
@@ -194,7 +195,7 @@ function goalFromRow(row: GoalRow): Goal {
 }
 
 function runFromRow(row: RunRow): Run {
-  return { ...row, waitingDetail: decode(row.waitingDetail) };
+  return { ...row, waitingDetail: decode(row.waitingDetail), semonIdentity: JSON.parse(row.semonIdentity) as Run["semonIdentity"] };
 }
 
 function weekOf(iso: string): string {
@@ -596,7 +597,7 @@ export class PlatformStore {
       ON CONFLICT (session_uid) DO UPDATE SET source = excluded.source, input_tokens = excluded.input_tokens,
         output_tokens = excluded.output_tokens, cached_tokens = excluded.cached_tokens, usd_est = excluded.usd_est,
         source_reported_usd = excluded.source_reported_usd, billed_usd = excluded.billed_usd,
-        coverage = excluded.coverage, snapshot_id = excluded.snapshot_id, as_of = excluded.as_of, observed_at = excluded.observed_at
+        coverage = excluded.coverage, snapshot_id = excluded.snapshot_id, as_of = excluded.as_of, observed_at = excluded.observed_at, refresh_failed = 0
       RETURNING ${spendColumns}`, input.sessionUid, input.source, input.inputTokens ?? null, input.outputTokens ?? null,
     input.cachedTokens ?? null, input.usdEst ?? null, input.sourceReportedUsd ?? null, input.billedUsd ?? null,
     input.coverage ?? null, input.snapshotId ?? null, input.asOf ?? null, input.observedAt ?? this.now());
@@ -604,6 +605,63 @@ export class PlatformStore {
 
   getSpendSnapshot(sessionUid: string): SpendSnapshot | null {
     return this.get<SpendSnapshot>(`SELECT ${spendColumns} FROM spend_snapshot WHERE session_uid = ?`, sessionUid);
+  }
+
+  markSemonRefreshFailed(sessionUids: readonly string[]): void {
+    this.db.prepare(`UPDATE spend_snapshot SET refresh_failed = 1
+      WHERE source = 'semon' AND session_uid IN (SELECT value FROM json_each(?))`)
+      .run(JSON.stringify(sessionUids));
+  }
+
+  summarizeSpend(filter: SpendSummaryFilter, now: Date | string) {
+    const { scopeKind, scopeId, period, source } = filter;
+    choice(scopeKind, budgetScopes, "scopeKind");
+    choice(period, budgetPeriods, "period");
+    choice(source, spendSources, "source");
+    if (scopeKind !== "team") nonEmpty(scopeId, "scopeId");
+    else if (scopeId !== null) throw new PlatformValidationError("team spend does not accept scopeId");
+
+    const until = new Date(now).toISOString();
+    const start = new Date(`${until.slice(0, 10)}T00:00:00Z`);
+    if (period === "weekly") start.setUTCDate(start.getUTCDate() - ((start.getUTCDay() + 6) % 7));
+    if (period === "monthly") start.setUTCDate(1);
+    const since = start.toISOString();
+
+    return { ...filter, since, until, ...this.write<{
+      sessionCount: number; snapshotCount: number; unpricedCount: number; incompleteCount: number;
+      unlinkedRunCount: number; missingSnapshotCount: number; staleSnapshotCount: number; incompleteRunCount: number;
+      usdEst: number | null; sourceReportedUsd: number | null; billedUsd: number | null;
+      preferredUsd: number | null; estimatedCount: number; reportedCount: number; billedCount: number;
+      coverage: string | null;
+    }>(`WITH scoped_runs AS (
+      SELECT semon_session_uid AS uid, julianday(started_at) AS started_at
+      FROM run WHERE (? = 'team' OR (? = 'lane' AND lane_id = ?) OR (? = 'agent' AND agent_id = ?))
+    ), sessions AS (
+      SELECT uid, min(started_at) AS started_at FROM scoped_runs WHERE uid IS NOT NULL GROUP BY uid
+    ), run_coverage AS (
+      SELECT count(*) FILTER (WHERE r.uid IS NULL) AS unlinked,
+        count(*) FILTER (WHERE r.uid IS NOT NULL AND snapshot.session_uid IS NULL) AS missing,
+        count(DISTINCT r.uid) FILTER (WHERE snapshot.refresh_failed = 1) AS stale,
+        count(*) FILTER (WHERE snapshot.coverage IS NOT 'complete' OR snapshot.refresh_failed = 1
+          OR coalesce(snapshot.billed_usd, snapshot.source_reported_usd, snapshot.usd_est) IS NULL) AS incomplete
+      FROM scoped_runs r LEFT JOIN spend_snapshot snapshot ON snapshot.session_uid = r.uid AND snapshot.source = ?
+      WHERE r.started_at BETWEEN julianday(?) AND julianday(?)
+    )
+    SELECT count(*) AS sessionCount, count(s.session_uid) AS snapshotCount,
+      (SELECT unlinked FROM run_coverage) AS unlinkedRunCount,
+      (SELECT missing FROM run_coverage) AS missingSnapshotCount,
+      (SELECT stale FROM run_coverage) AS staleSnapshotCount,
+      (SELECT incomplete FROM run_coverage) AS incompleteRunCount,
+      count(*) FILTER (WHERE coalesce(billed_usd, source_reported_usd, usd_est) IS NULL) AS unpricedCount,
+      count(*) FILTER (WHERE s.coverage IS NOT 'complete' OR s.refresh_failed = 1) AS incompleteCount,
+      sum(usd_est) AS usdEst, sum(source_reported_usd) AS sourceReportedUsd, sum(billed_usd) AS billedUsd,
+      sum(coalesce(billed_usd, source_reported_usd, usd_est)) AS preferredUsd,
+      count(*) FILTER (WHERE billed_usd IS NULL AND source_reported_usd IS NULL AND usd_est IS NOT NULL) AS estimatedCount,
+      count(*) FILTER (WHERE billed_usd IS NULL AND source_reported_usd IS NOT NULL) AS reportedCount,
+      count(billed_usd) AS billedCount, group_concat(DISTINCT s.coverage) AS coverage
+    FROM sessions LEFT JOIN spend_snapshot s ON s.session_uid = sessions.uid AND s.source = ?
+    WHERE sessions.started_at >= julianday(?) AND sessions.started_at <= julianday(?)`,
+    scopeKind, scopeKind, scopeId, scopeKind, scopeId, source, since, until, source, since, until) };
   }
 
   upsertAgent(input: UpsertAgentInput): Agent {
@@ -640,26 +698,39 @@ export class PlatformStore {
     optionalText(input.startedAt, "startedAt");
     optionalText(input.completedAt, "completedAt");
     if (input.semonSessionUid != null) nonEmpty(input.semonSessionUid, "semonSessionUid");
+    const identity = input.semonIdentity;
+    if (identity != null && (!isSemonKey(identity.originNamespace) || !isSemonKey(identity.nativeHarness)
+      || !isSemonKey(identity.nativeSessionId))) throw new PlatformValidationError("invalid Semon session identity");
+    const identityJson = identity == null ? "null" : JSON.stringify({
+      originNamespace: identity.originNamespace, nativeHarness: identity.nativeHarness, nativeSessionId: identity.nativeSessionId,
+    });
     const failures = input.failureCount === undefined ? 0 : input.failureCount;
     number(failures, "failureCount", { integer: true, min: 0 });
     this.validateLane(input.laneId);
     const row = this.write<RunRow>(`INSERT INTO run (id, agent_id, lane_id, connector_kind, host_id, external_run_ref,
-      status, model, started_at, completed_at, failure_count, waiting_detail_json, semon_session_uid, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      status, model, started_at, completed_at, failure_count, waiting_detail_json, semon_session_uid, semon_identity_json, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (id) DO UPDATE SET agent_id = excluded.agent_id, lane_id = excluded.lane_id,
         connector_kind = excluded.connector_kind, host_id = excluded.host_id, external_run_ref = excluded.external_run_ref,
         status = excluded.status, model = excluded.model, started_at = excluded.started_at,
         completed_at = excluded.completed_at, failure_count = excluded.failure_count,
         waiting_detail_json = excluded.waiting_detail_json, updated_at = excluded.updated_at,
+        semon_identity_json = CASE
+          WHEN ? THEN excluded.semon_identity_json
+          WHEN run.connector_kind = excluded.connector_kind AND run.host_id = excluded.host_id
+            AND run.external_run_ref = excluded.external_run_ref THEN run.semon_identity_json
+          ELSE 'null'
+        END,
         semon_session_uid = CASE
           WHEN ? THEN excluded.semon_session_uid
           WHEN run.connector_kind = excluded.connector_kind AND run.host_id = excluded.host_id
-            AND run.external_run_ref = excluded.external_run_ref THEN run.semon_session_uid
+            AND run.external_run_ref = excluded.external_run_ref
+            AND (? = 0 OR run.semon_identity_json = excluded.semon_identity_json) THEN run.semon_session_uid
         END
       RETURNING ${runColumns}`, input.id, input.agentId, input.laneId ?? null, input.connectorKind, input.hostId,
     input.externalRunRef, input.status, input.model ?? null, input.startedAt ?? null, input.completedAt ?? null,
     failures, encode(input.waitingDetail ?? null, "waitingDetail"), input.semonSessionUid ?? null,
-    this.now(), input.semonSessionUid === undefined ? 0 : 1);
+    identityJson, this.now(), Number(identity !== undefined), Number(input.semonSessionUid !== undefined), Number(identity !== undefined));
     return runFromRow(row);
   }
 
@@ -678,12 +749,20 @@ export class PlatformStore {
   }
 
   // The caller supplies the exact Semon UID; an external run reference is never used to infer it.
-  linkRunSemonSession(runId: string, sessionUid: string): Run {
-    nonEmpty(sessionUid, "sessionUid");
+  linkRunSemonSession(runId: string, sessionUid: string): Run;
+  linkRunSemonSession(runId: string, sessionUid: string, expectedIdentity: SemonSessionIdentity): Run | null;
+  linkRunSemonSession(runId: string, sessionUid: string, expectedIdentity?: SemonSessionIdentity): Run | null {
+    if (expectedIdentity === undefined && (!/^[\w.:@/+=,[\]"\\-]{1,4096}$/.test(runId) || runId === "." || runId === "..")) {
+      throw new PlatformValidationError("invalid run ID");
+    }
+    if (!isSemonKey(sessionUid)) throw new PlatformValidationError("invalid Semon session UID");
+    // Auto-linking uses a compare-and-set so an in-flight lookup cannot overwrite a verified link.
+    const expected = expectedIdentity === undefined ? null : JSON.stringify(expectedIdentity);
     const row = this.get<RunRow>(`UPDATE run SET semon_session_uid = ?, updated_at = ?
-      WHERE id = ? RETURNING ${runColumns}`, sessionUid, this.now(), runId);
-    if (row === null) throw new PlatformNotFoundError(`run ${runId} not found`);
-    return runFromRow(row);
+      WHERE id = ? AND (? IS NULL OR (semon_session_uid IS NULL AND semon_identity_json = ?))
+      RETURNING ${runColumns}`, sessionUid, this.now(), runId, expected, expected);
+    if (row === null && expectedIdentity === undefined) throw new PlatformNotFoundError(`run ${runId} not found`);
+    return row === null ? null : runFromRow(row);
   }
 
   upsertT3HostState(input: T3HostUpdate): T3HostState {
@@ -754,6 +833,48 @@ export class PlatformStore {
       WHERE resolved_at IS NULL AND host_id = coalesce(?, host_id) AND thread_id = coalesce(?, thread_id)
       ORDER BY occurred_at, host_id, thread_id, request_id`, hostId ?? null, threadId ?? null)
       .map((row) => ({ ...row, questions: decode(row.questions) }));
+  }
+
+  listGitHubPrTargets(): { repository: string; number: number; watching: boolean }[] {
+    return this.all<{ repository: string; number: number; watching: number }>(`SELECT lower(repository) AS repository,
+      number, max(watching) AS watching FROM t3_thread_pr WHERE lower(pr_host) = 'github.com'
+      AND (state = 'open' OR (state IS NULL AND watching = 1))
+      GROUP BY lower(repository), number ORDER BY lower(repository), number`)
+      .map((row) => ({ ...row, watching: row.watching === 1 }));
+  }
+
+  listGitHubPrChecks(): GitHubPrCheck[] {
+    return this.all<GitHubPrCheck>(`SELECT repository, number, head_sha AS headSha, rollup_state AS rollupState,
+      total_checks AS totalChecks, failed_checks AS failedChecks, consecutive_failures AS consecutiveFailures,
+      failure_streak AS failureStreak,
+      last_checked_at AS lastCheckedAt, last_error AS lastError, updated_at AS updatedAt
+      FROM github_pr_check ORDER BY repository, number`);
+  }
+
+  recordGitHubPrCheck(repository: string, number: number, check: GitHubPrObservation): void {
+    this.transaction(() => {
+      const prior = this.get<{ failingHeads: string; failureStreak: number }>(`SELECT failing_heads_json AS failingHeads,
+        failure_streak AS failureStreak
+        FROM github_pr_check WHERE repository = ? AND number = ?`, repository, number);
+      const heads = check.rollupState === "success" || check.rollupState === "closed" || prior === null
+        ? new Set<string>() : new Set(JSON.parse(prior.failingHeads) as string[]);
+      let streak = prior?.failureStreak ?? 0;
+      if (check.rollupState === "failure" && check.headSha !== null) {
+        if (heads.size === 0) streak++;
+        heads.add(check.headSha);
+      }
+      const now = this.now();
+      this.db.prepare(`INSERT INTO github_pr_check (repository, number, head_sha, rollup_state, total_checks,
+        failed_checks, consecutive_failures, failure_streak, failing_heads_json, last_checked_at, last_error, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (repository, number) DO UPDATE SET
+        head_sha = coalesce(excluded.head_sha, github_pr_check.head_sha), rollup_state = excluded.rollup_state,
+        total_checks = excluded.total_checks, failed_checks = excluded.failed_checks,
+        consecutive_failures = excluded.consecutive_failures, failure_streak = excluded.failure_streak,
+        failing_heads_json = excluded.failing_heads_json,
+        last_checked_at = excluded.last_checked_at, last_error = excluded.last_error, updated_at = excluded.updated_at`)
+        .run(repository, number, check.headSha, check.rollupState, check.totalChecks, check.failedChecks,
+          heads.size, streak, JSON.stringify([...heads]), now, check.rollupState === "error" ? "GitHub PR checks unavailable" : null, now);
+    });
   }
 
   private upsertT3Pr(pr: T3PrInput): void {

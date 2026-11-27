@@ -167,7 +167,7 @@ test("raw SQLite rejects mutation of decided fields and replacement or mutation 
   const reopened = PlatformStore.open(path);
   t.after(() => reopened.close());
   assert.equal(reopened.getDecision(original.id)?.status, "superseded");
-  assert.equal(reopened.listPolicyRules().length, 5);
+  assert.equal(reopened.listPolicyRules().length, 6);
 });
 
 test("a failed event insert rolls back decision creation and answer", (t) => {
@@ -246,9 +246,9 @@ test("seeded policy rules observe, and the friction count uses UTC days and owne
   const store = memory(t, () => now);
   const rules = store.listPolicyRules();
   assert.deepEqual(rules.map(({ code }) => code), [
-    "authority_routing", "host_limits", "pr_green_ci", "registered_automation_only", "two_failure_stop",
+    "authority_routing", "budget_cap", "host_limits", "pr_green_ci", "registered_automation_only", "two_failure_stop",
   ]);
-  assert.ok(rules.every((rule) => rule.mode === "observe" && rule.enabled && rule.sourceRef.startsWith("team-policy.md")));
+  assert.ok(rules.every((rule) => rule.mode === "observe" && rule.enabled && (rule.sourceRef.startsWith("team-policy.md") || rule.code === "budget_cap")));
   const policyEvent = store.recordPolicyEvent({ ruleCode: "host_limits", summary: "Thermal gate reached", detail: { code: 75 } });
   assert.deepEqual(store.listPolicyEvents({ ruleCode: "host_limits" }), [policyEvent]);
   assert.deepEqual(store.listPolicyEvents({ ruleCode: "two_failure_stop" }), []);

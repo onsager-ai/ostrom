@@ -26,7 +26,7 @@ Under this management core sit pluggable **connectors**—starting read-only wit
             └───────────────────────────▲──────────────────────────────┘
                                         │ normalized facts (read-only first)
    ┌──────────────┬───────────────┬─────┴─────────┬──────────────┬──────────────┐
-   │ T3 Connector │ Semon Adapter │ GitHub App    │ Magpie / Kiro│ Antigravity /│
+   │ T3 Connector │ Semon Adapter │ GitHub CLI    │ Magpie / Kiro│ Antigravity /│
    │ (/mcp, M0)   │ (ASI spend,M3)│ (PR/CI, M3)   │ (post-M3)    │ Codex (later)│
    └──────────────┴───────────────┴───────────────┴──────────────┴──────────────┘
 ```
@@ -75,6 +75,12 @@ Agreed against `onsager-ai/semon@4dd600fc/docs/design/asi-store.md`:
 - Read `fact_session` per qualified session or `fact_step` exclusive rows for windows; never sum both and never count copied rows.
 - Verified materialized ASI data currently resides on `hp-code-2` (not `t3-sg`), and the Fly pilot is on hold. Therefore M1–M2 expose a read-only `SpendSource` interface returning `unavailable` until a scoped aggregate-only handoff from `hp-code-2` is approved (no general SQL/Viewer owner token or raw logs in Ostrom).
 
+M3 enables GitHub polling with `serve --github-poll-ms 60000`. It reads open or watched GitHub.com PRs using the operator's existing `gh` credentials and reports polling errors as unavailable checks. The observer does not change GitHub state. A PR with no checks stays pending.
+
+Enable Semon with `serve --semon-bin <path>` only against the authorized aggregate source. The adapter queries `fact_session` for run-linked Semon UIDs. Exact native-session lookup is available only when the required identity columns are exposed in `dim_session`. A missing match or ambiguous result leaves the run unlinked. The T3 run projection lacks native provider session IDs. A trusted operator can attest an independently verified link with `run link-semon <run-id> --session-uid <uid>`.
+
+Budget windows start at UTC midnight, Monday for weekly budgets and the first of the month for monthly budgets. A session is counted once per scope, in the window of its earliest linked run with a start time in that scope. Session totals are attributed to that window. For each session, caps and warnings use billed USD if known, then source-reported USD, then estimated USD. The evaluator records the count of sessions using each metric and leaves all three original totals separately visible. With incomplete coverage, a known total can trigger an alert, but a lower subtotal leaves an existing alert open until coverage is complete or the budget is disabled. Unlinked runs, missing prices, and failed refreshes count against coverage. A failed refresh preserves the last available snapshot with stale coverage.
+
 ## 6. Milestones and verification
 
 All typechecks (`npm run typecheck`) and tests (`npm test`) run in GitHub Actions CI only—never locally. Every milestone ships through a PR with green CI and an independent Worker diff review; stop and escalate after two CI failures.
@@ -82,5 +88,5 @@ All typechecks (`npm run typecheck`) and tests (`npm test`) run in GitHub Action
 - **M0 (2026-11-27):** Read-only T3 connector (`src/connectors/t3/`)—MCP client, SEP-3415 poll/stream, PKCE OAuth, `0600` token store, CI tests.
 - **M1 (2026-11-28):** `docs/platform.md`, 7-entity SQLite store (`src/platform/store.ts`), Decision Inbox + Lane/Goal/Policy/Budget Unix-socket API (`src/platform/api.ts`) and CLI (`ostrom-platform`), CI tests. Deliver exact 3-host OAuth approval steps to Chief PM upon merge.
 - **M2 (2026-11-29 — First Live Demo on `t3-sg`):** T3 connector supervisor (3 hosts + restart/gap reconciliation), Policy Observer (`two_failure_stop`, authority routing, friction log), Health/Stall checks (absorbing Sentinel), 01:00Z/13:00Z Digest generator, loopback + SSH-tunnel static UI, and `ostrom-platform.service`.
-- **M3 (2026-11-30 – 12-01):** GitHub App connector (PR/CI failure counts), Semon Spend adapter (once scoped aggregate handoff is approved), budget caps/alerts, soak ahead of 12-02 review.
+- **M3 (2026-11-30 – 12-01):** GitHub CLI connector (PR/CI failure counts), Semon Spend adapter (once scoped aggregate handoff is approved), budget caps/alerts, soak ahead of 12-02 review.
 - **M4 (post-12-02, gated on Chief PM approval):** Write paths (webhook alerts, controlled sends, `gate` policy mode) plus Magpie, Kiro, Antigravity, and Codex connectors.

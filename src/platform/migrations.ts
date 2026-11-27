@@ -277,6 +277,30 @@ const migrations = [
   ALTER TABLE t3_host_state ADD COLUMN partial_coverage INTEGER NOT NULL DEFAULT 0
     CHECK (partial_coverage IN (0, 1));
   `,
+  `
+  ALTER TABLE run ADD COLUMN semon_identity_json TEXT NOT NULL DEFAULT 'null' CHECK (json_valid(semon_identity_json));
+  ALTER TABLE spend_snapshot ADD COLUMN refresh_failed INTEGER NOT NULL DEFAULT 0 CHECK (refresh_failed IN (0, 1));
+
+  CREATE TABLE github_pr_check (
+    repository TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    head_sha TEXT,
+    rollup_state TEXT NOT NULL CHECK (rollup_state IN ('pending', 'success', 'failure', 'error', 'closed')),
+    total_checks INTEGER NOT NULL,
+    failed_checks INTEGER NOT NULL,
+    consecutive_failures INTEGER NOT NULL,
+    failure_streak INTEGER NOT NULL,
+    failing_heads_json TEXT NOT NULL CHECK (json_valid(failing_heads_json)),
+    last_checked_at TEXT NOT NULL,
+    last_error TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (repository, number)
+  ) STRICT;
+
+  INSERT INTO policy_rule (id, code, source_ref, mode, params_json, enabled, updated_at)
+  VALUES ('budget_cap', 'budget_cap', 'docs/platform.md §5', 'observe', '{}', 1,
+    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+  `,
 ];
 
 // Read the version with the writer lock held so simultaneous opens cannot apply the same migration.

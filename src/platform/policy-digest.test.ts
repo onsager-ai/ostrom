@@ -61,7 +61,8 @@ test("observes failures and authority mismatches once, reports health, and gener
     assert.equal(digest.sections.openFrictionCount, 3);
     assert.equal(digest.sections.interventionsByDay.length, 7);
     assert.deepEqual(digest.sections.interventionsByDay.at(-1), { day: "2026-11-27", count: 1 });
-    assert.deepEqual(digest.sections.spend, { status: "unavailable" });
+    assert.equal(digest.sections.spend.status, "unavailable");
+    assert.equal(digest.sections.spend.coverage, "unknown");
     for (const entry of ["owner-now", "Ship updates weekly", "unapproved", "stalled", "authority_routing", "two_failure_stop",
       "Open friction items: 3", "Spend: unavailable", "Continue?", "CI passed"]) assert(digest.markdown.includes(entry), entry);
 
