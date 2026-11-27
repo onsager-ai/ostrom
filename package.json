@@ -9,6 +9,7 @@
   },
   "bin": {
     "ostrom": "src/cli/main.ts",
+    "ostrom-platform": "src/platform/cli.ts",
     "ostromd": "src/ostromd/main.ts"
   },
   "scripts": {
