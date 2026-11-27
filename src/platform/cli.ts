@@ -7,6 +7,7 @@ import {
   PlatformApiClient, startPlatformApiServer,
 } from "./api.ts";
 import { PlatformStore } from "./store.ts";
+import { decisionCategories } from "./types.ts";
 import type { DecisionVerification, Lane } from "./types.ts";
 
 const usage = `usage: ostrom-platform [--db <path> | --socket <path>] [--json] <command>
@@ -26,7 +27,9 @@ const usage = `usage: ostrom-platform [--db <path> | --socket <path>] [--json] <
   policy list
   friction add --kind KIND --summary TEXT [--lane SLUG] [--rule CODE]
   friction list [--status STATUS]
-  serve [--socket <path>] [--db <path>]`;
+  serve [--socket <path>] [--db <path>]
+
+Decision categories: ${decisionCategories.join(", ")}`;
 
 type Call = (method: "GET" | "POST" | "PUT", path: string, body?: unknown) => Promise<unknown>;
 type Result = { data: unknown; exitCode?: number; text?: string };

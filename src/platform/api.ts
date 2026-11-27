@@ -1,5 +1,4 @@
-import { chmodSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { chmodSync, lstatSync, mkdirSync } from "node:fs";
 import { createServer, request as httpRequest } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { homedir } from "node:os";
@@ -50,15 +49,16 @@ function objectBody<T extends object>(body: unknown): T {
 export async function dispatchPlatformRequest(
   store: PlatformStore, method: string | undefined, path: string, readBody: () => Promise<unknown>,
 ): Promise<{ status: number; body: unknown }> {
-  const url = new URL(path, "http://localhost");
+  // Split the query before decoding identifiers so dot segments reach store validation.
+  const separator = path.indexOf("?");
+  const route = separator === -1 ? path : path.slice(0, separator);
+  const query = new URLSearchParams(separator === -1 ? "" : path.slice(separator + 1));
   const get = method === "GET";
   const post = method === "POST";
   const put = method === "PUT";
   const ok = (body: unknown) => ({ status: 200, body });
   const created = (body: unknown) => ({ status: 201, body });
   const body = async <T extends object>() => objectBody<T>(await readBody());
-  const query = url.searchParams;
-  const route = url.pathname;
 
   if (get && route === "/v1/health") return ok({ ok: true });
   if (route === "/v1/decisions") {
@@ -76,6 +76,9 @@ export async function dispatchPlatformRequest(
       return ok(entry);
     }
     if (post && (action === "answer" || action === "decide")) {
+      // M1 reserves the 0700-directory/0600 write socket and direct SQLite access for the
+      // operator/Chief PM OS account. decidedBy is an attestation. Derive caller identity
+      // before allowing Manager writes from other principals.
       return ok(store.answerDecision(id, await body<AnswerDecisionInput>()));
     }
     if (post && action === "supersede") return ok(store.supersedeDecision(id, await body<SupersedeDecisionInput>()));
@@ -146,8 +149,7 @@ function sqliteStatus(error: Error): number | undefined {
 
 function apiError(error: unknown): PlatformApiError {
   if (error instanceof PlatformApiError) return error;
-  if (error instanceof PlatformValidationError || error instanceof SyntaxError || error instanceof URIError
-    || (error instanceof TypeError && "code" in error && error.code === "ERR_INVALID_URL")) {
+  if (error instanceof PlatformValidationError || error instanceof SyntaxError || error instanceof URIError) {
     return new PlatformApiError(400, error.message);
   }
   if (error instanceof PlatformNotFoundError) return new PlatformApiError(404, error.message);
@@ -167,7 +169,14 @@ export async function startPlatformApiServer({ store, socketPath }: {
   store: PlatformStore;
   socketPath: string;
 }): Promise<PlatformApiServer> {
-  await mkdir(dirname(socketPath), { recursive: true, mode: 0o700 });
+  const parent = dirname(socketPath);
+  mkdirSync(parent, { recursive: true, mode: 0o700 });
+  const stat = lstatSync(parent);
+  const uid = process.getuid?.();
+  if (stat.isSymbolicLink() || !stat.isDirectory() || (stat.mode & 0o077) !== 0
+    || (uid !== undefined && stat.uid !== uid)) {
+    throw new PlatformValidationError("socket parent must be a private directory owned by the current user");
+  }
   const server = createServer(async (request, response) => {
     try {
       const result = await dispatchPlatformRequest(store, request.method, request.url ?? "/", () => requestBody(request));

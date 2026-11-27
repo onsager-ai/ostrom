@@ -1,5 +1,5 @@
 export const decisionAuthorities = ["owner", "chief_pm"] as const;
-export const decisionCategories = ["spending", "credentials", "infra_network", "release", "direction", "policy_exception", "weekly_plan", "routine"] as const;
+export const decisionCategories = ["spending", "credentials", "infra_network", "release", "direction", "policy_exception", "weekly_plan", "owner_action", "routine"] as const;
 export const decisionUrgencies = ["incident", "blocking_today", "digest"] as const;
 export const decisionStatuses = ["pending", "approved", "rejected", "superseded", "expired"] as const;
 export const policyRuleModes = ["observe", "gate"] as const;

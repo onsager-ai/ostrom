@@ -57,8 +57,8 @@ for (const transport of ["db", "socket"]) {
     const lane = await call<Lane>("lane", "create", "--slug", "platform", "--name", "Platform", "--priority", "2");
     assert.equal(lane.priorityRank, 2);
     assert.deepEqual(await call<Lane[]>("lane", "list"), [lane]);
-    const create = (title: string) => call<Decision>("decision", "create",
-      "--title", title, "--authority", "owner", "--urgency", "blocking_today", "--category", "weekly_plan",
+    const create = (title: string, category: Decision["category"] = "weekly_plan") => call<Decision>("decision", "create",
+      "--title", title, "--authority", "owner", "--urgency", "blocking_today", "--category", category,
       "--recommendation", "Proceed", "--requested-by", "manager", "--lane", "platform",
       "--evidence", '{"count":2}', "--options", '["Proceed", "Wait"]');
     const pending = await create("Approve the plan");
@@ -103,6 +103,12 @@ for (const transport of ["db", "socket"]) {
     store.expireDecision(expired.id, { actor: "manager" });
     await verify(expired.id, "expired", 1);
     assert.equal((await run("decision", "answer", replacement.id, "--status", "approved", "--by", "owner", "--answer", "OK")).code, 1);
+
+    const ownerAction = await create("Approve a new campaign", "owner_action");
+    assert.equal(ownerAction.category, "owner_action");
+    await verify(ownerAction.id, "pending", 1);
+    await call<Decision>("decision", "answer", ownerAction.id, "--status", "approved", "--by", "owner", "--answer", "Proceed");
+    await verify(ownerAction.id, "approved", 0);
 
     assert.equal((await call<PolicyRule[]>("policy", "list")).length, 5);
     const friction = await call<FrictionEntry>("friction", "add", "--kind", "owner_intervention", "--summary", "Clarified scope",

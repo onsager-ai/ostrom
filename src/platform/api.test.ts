@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync } from "node:fs";
 import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -89,6 +89,26 @@ test("the Unix socket is private, and the decision API returns 201, 404, and 409
   assert.equal((await client.request<Decision>("POST", "/v1/decisions/replacement/decide", answer)).status, "approved");
 });
 
+test("the Unix server rejects public and symlinked socket parents before it binds", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "ostrom-api-parent-"));
+  const store = PlatformStore.open(":memory:");
+  t.after(() => {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const publicParent = join(directory, "public");
+  mkdirSync(publicParent);
+  chmodSync(publicParent, 0o755);
+  const publicSocket = join(publicParent, "api.sock");
+  await assert.rejects(startPlatformApiServer({ store, socketPath: publicSocket }), /socket parent must be a private directory/);
+  assert.equal(existsSync(publicSocket), false);
+
+  const symlink = join(directory, "linked");
+  symlinkSync(directory, symlink);
+  await assert.rejects(startPlatformApiServer({ store, socketPath: join(symlink, "api.sock") }));
+  assert.equal(existsSync(join(directory, "api.sock")), false);
+});
+
 test("invalid JSON, values, and oversized bodies return JSON errors", async (t) => {
   const { socketPath, client, store } = await fixture(t);
   const bad = await rawPost(socketPath, "/v1/decisions", "[");
@@ -99,6 +119,10 @@ test("invalid JSON, values, and oversized bodies return JSON errors", async (t) 
   await assert.rejects(client.request("POST", "/v1/decisions", { ...entry, laneId: "missing" }), { status: 400 });
   await assert.rejects(client.request("GET", "/v1/decisions?status=unknown"), { status: 400 });
   await assert.rejects(client.request("GET", "/v1/decisions/%"), { status: 400 });
+  for (const segment of [".", "..", "%2E%2E", "one%2Ftwo"]) {
+    await assert.rejects(client.request("GET", `/v1/decisions/${segment}/verify`), { status: 400 });
+    await assert.rejects(client.request("GET", `/v1/lanes/${segment}`), { status: 400 });
+  }
   const bytes = 1024 * 1024 + 1;
   for (const result of [
     await rawPost(socketPath, "/v1/decisions", undefined, bytes),

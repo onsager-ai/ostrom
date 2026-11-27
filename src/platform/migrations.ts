@@ -17,7 +17,7 @@ const migrations = [
     id TEXT PRIMARY KEY,
     lane_id TEXT REFERENCES lane(id),
     authority TEXT NOT NULL CHECK (authority IN ('owner', 'chief_pm')),
-    category TEXT NOT NULL CHECK (category IN ('spending', 'credentials', 'infra_network', 'release', 'direction', 'policy_exception', 'weekly_plan', 'routine')),
+    category TEXT NOT NULL CHECK (category IN ('spending', 'credentials', 'infra_network', 'release', 'direction', 'policy_exception', 'weekly_plan', 'owner_action', 'routine')),
     urgency TEXT NOT NULL CHECK (urgency IN ('incident', 'blocking_today', 'digest')),
     title TEXT NOT NULL,
     evidence_json TEXT NOT NULL CHECK (json_valid(evidence_json)),

@@ -69,6 +69,21 @@ test("decisions validate input, persist evidence, filter the inbox, and record t
   assert.deepEqual(store.listDecisions({ status: "approved" }), []);
 });
 
+test("decision IDs and lane slugs reject dot segments, separators, and other unsafe values", (t) => {
+  const store = memory(t);
+  for (const id of [".", "..", "one/two", "one\\two", "one two", "a".repeat(129)]) {
+    assert.throws(() => store.createDecision(decisionInput(id)), PlatformValidationError);
+    assert.throws(() => store.getDecision(id), PlatformValidationError);
+    assert.throws(() => store.createLane({ slug: id, name: "Product" }), PlatformValidationError);
+    assert.throws(() => store.getLaneBySlug(id), PlatformValidationError);
+  }
+  const id = "Product.2026_w48-1";
+  assert.equal(store.createDecision(decisionInput(id)).id, id);
+  const lane = store.createLane({ slug: id, name: "Product" });
+  assert.deepEqual(store.getLaneBySlug(id), { ...lane });
+  assert.deepEqual(store.listLanes(), [{ ...lane }]);
+});
+
 test("decisions are answered once and verification allows only an active approval", (t) => {
   const store = memory(t);
   const original = store.createDecision(decisionInput("dec_original"));
@@ -169,7 +184,7 @@ test("a failed event insert rolls back decision creation and answer", (t) => {
   assert.deepEqual(store.listDecisionEvents(original.id).map(({ kind }) => kind), ["created"]);
 });
 
-test("lane goals are tracked by week and supplied approvals must be approved", (t) => {
+test("weekly goal approvals must be approved for the right category, lane, and plan", (t) => {
   const store = memory(t);
   const lane = store.createLane({ slug: "product", name: "Product", priorityRank: 2 });
   const other = store.createLane({ slug: "ops", name: "Operations", priorityRank: 1 });
@@ -182,6 +197,11 @@ test("lane goals are tracked by week and supplied approvals must be approved", (
   const rejected = store.createDecision(decisionInput());
   const expires = store.createDecision(decisionInput());
   const superseded = store.createDecision(decisionInput());
+  const wrongLane = store.createDecision({ ...decisionInput(), laneId: other.id });
+  const wrongCategory = store.createDecision({ ...decisionInput(), laneId: lane.id, category: "release" });
+  const approve = (id: string) => store.answerDecision(id, { status: "approved", decidedBy: "owner", answer: "yes" });
+  approve(wrongLane.id);
+  approve(wrongCategory.id);
   store.answerDecision(rejected.id, { status: "rejected", decidedBy: "owner", answer: null });
   store.expireDecision(expires.id, { actor: "lead" });
   store.supersedeDecision(superseded.id, { supersededById: approved.id, actor: "lead" });
@@ -189,10 +209,14 @@ test("lane goals are tracked by week and supplied approvals must be approved", (
   for (const id of [approved.id, rejected.id, expires.id, superseded.id, "missing"]) {
     assert.throws(() => store.setGoal({ ...goal, approvedDecisionId: id }), PlatformValidationError);
   }
+  for (const id of [wrongLane.id, wrongCategory.id]) {
+    assert.throws(() => store.setGoal({ ...goal, approvedDecisionId: id }), /must approve a weekly plan for this lane or the team/);
+  }
   assert.deepEqual(store.listGoals(), []);
 
-  store.answerDecision(approved.id, { status: "approved", decidedBy: "owner", answer: "yes" });
-  const current = store.setGoal({ ...goal, metricCurrent: 0, approvedDecisionId: approved.id, weeklyPlan: ["Test", "Ship"] });
+  approve(approved.id);
+  const plan = { ...goal, approvedDecisionId: approved.id, weeklyPlan: ["Test", "Ship"] };
+  const current = store.setGoal({ ...plan, metricCurrent: 0 });
   assert.equal(current.weekStart, "2026-11-23");
   assert.equal(current.approvedDecisionId, approved.id);
   assert.equal(current.metricCurrent, 0);
@@ -200,7 +224,20 @@ test("lane goals are tracked by week and supplied approvals must be approved", (
   assert.deepEqual(store.listGoals(lane.id), [current]);
   const earlier = store.setGoal({ ...goal, weekStart: "2026-11-16" });
   assert.deepEqual(store.listGoals(lane.id), [current, earlier]);
-  assert.equal(store.setGoal({ ...goal, metricCurrent: 1 }).id, current.id);
+  assert.deepEqual(store.setGoal({ ...plan, metricCurrent: 1 }), { ...current, metricCurrent: 1 });
+  for (const update of [{ statement: "Ship two releases." }, { weeklyPlan: ["Ship"] }]) {
+    assert.throws(() => store.setGoal({ ...plan, ...update }), /a changed weekly plan requires a new approval/);
+    assert.equal(store.getLatestGoal(lane.id)?.approvedDecisionId, approved.id);
+  }
+  const cleared = store.setGoal({ ...goal, weeklyPlan: ["Ship"] });
+  assert.equal(cleared.id, current.id);
+  assert.equal(cleared.approvedDecisionId, null);
+  assert.equal(store.getLatestGoal(lane.id)?.approvedDecisionId, null);
+
+  const fresh = store.createDecision({ ...decisionInput(), laneId: lane.id });
+  approve(fresh.id);
+  assert.equal(store.setGoal({ ...goal, weeklyPlan: ["Review", "Ship"], approvedDecisionId: fresh.id }).approvedDecisionId, fresh.id);
+  assert.equal(store.setGoal({ ...goal, weeklyPlan: ["Ship"], approvedDecisionId: null }).approvedDecisionId, null);
   assert.throws(() => store.setGoal({ ...goal, weekStart: "2026-02-30" }), PlatformValidationError);
 });
 
@@ -245,7 +282,8 @@ test("unpriced spend stays null and Semon session UIDs stay separate from runtim
     id: "agent-1", role: "manager", connectorKind: "t3", hostId: "host-1", externalRef: "thread-1",
     label: "Manager", status: "active",
   });
-  assert.deepEqual(store.listAgents(), [agent]);
+  assert.equal(Object.getPrototypeOf(agent), Object.prototype);
+  assert.deepEqual(store.listAgents(), [{ ...agent }]);
   const input = {
     id: "run-1", agentId: agent.id, connectorKind: "t3", hostId: "host-1", externalRunRef: "t3-run-1",
     status: "waiting_input", waitingDetail: { reason: "Decision pending" },

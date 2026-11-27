@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+import { isDeepStrictEqual } from "node:util";
 
 import { migrate } from "./migrations.ts";
 import {
@@ -100,6 +101,13 @@ function nonEmpty(value: unknown, field: string): asserts value is string {
   }
 }
 
+function pathIdentifier(value: unknown, field: string): void {
+  // Starting with a letter or number excludes dot segments. The remaining characters exclude separators.
+  if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value)) {
+    throw new PlatformValidationError(`invalid ${field}: expected 1–128 letters, numbers, dots, underscores or hyphens, starting with a letter or number`);
+  }
+}
+
 function optionalText(value: unknown, field: string): void {
   if (value !== undefined && value !== null && typeof value !== "string") {
     throw new PlatformValidationError(`${field} must be text`);
@@ -194,13 +202,14 @@ export class PlatformStore {
     return new Date(this.clock().valueOf()).toISOString();
   }
 
-  // Every SELECT lists its columns explicitly. Only the checked schema is read into these row types.
+  // Every query lists its columns explicitly. Copy SQLite's null-prototype rows at this boundary.
   private get<T>(sql: string, ...args: SQLInputValue[]): T | null {
-    return (this.db.prepare(sql).get(...args) as unknown as T | undefined) ?? null;
+    const row = this.db.prepare(sql).get(...args);
+    return row === undefined ? null : { ...row } as unknown as T;
   }
 
   private all<T>(sql: string, ...args: SQLInputValue[]): T[] {
-    return this.db.prepare(sql).all(...args) as unknown as T[];
+    return this.db.prepare(sql).all(...args).map((row) => ({ ...row }) as unknown as T);
   }
 
   private write<T>(sql: string, ...args: SQLInputValue[]): T {
@@ -240,7 +249,7 @@ export class PlatformStore {
     choice(input.category, decisionCategories, "category");
     choice(input.urgency, decisionUrgencies, "urgency");
     const id = input.id === undefined ? newId("dec") : input.id;
-    nonEmpty(id, "id");
+    pathIdentifier(id, "decision ID");
     const time = this.now();
     return this.transaction(() => {
       this.validateLane(input.laneId);
@@ -256,6 +265,9 @@ export class PlatformStore {
     });
   }
 
+  // M1 trusts the operator/Chief PM OS account with the private write socket (0700/0600)
+  // and direct SQLite access. decidedBy is an operator attestation. Derive caller identity
+  // before allowing Manager writes from other principals.
   answerDecision(id: string, input: AnswerDecisionInput): Decision {
     choice(input.status, ["approved", "rejected"], "status");
     nonEmpty(input.decidedBy, "decidedBy");
@@ -275,7 +287,7 @@ export class PlatformStore {
 
   supersedeDecision(id: string, input: SupersedeDecisionInput): Decision {
     nonEmpty(input.actor, "actor");
-    nonEmpty(input.supersededById, "supersededById");
+    pathIdentifier(input.supersededById, "replacement decision ID");
     optionalText(input.rationale, "rationale");
     if (input.supersededById === id) throw new PlatformValidationError("a decision cannot supersede itself");
     return this.transaction(() => {
@@ -310,6 +322,7 @@ export class PlatformStore {
   }
 
   getDecision(id: string): Decision | null {
+    pathIdentifier(id, "decision ID");
     const row = this.get<DecisionRow>(`SELECT ${decisionColumns} FROM decision WHERE id = ?`, id);
     return row === null ? null : decisionFromRow(row);
   }
@@ -328,6 +341,7 @@ export class PlatformStore {
   }
 
   listDecisionEvents(decisionId: string): DecisionEvent[] {
+    pathIdentifier(decisionId, "decision ID");
     return this.all<DecisionEventRow>(`SELECT id, decision_id AS decisionId, kind, actor,
       detail_json AS detail, created_at AS createdAt FROM decision_event WHERE decision_id = ? ORDER BY id`,
     decisionId).map((row) => ({ ...row, detail: decode(row.detail) }));
@@ -345,10 +359,7 @@ export class PlatformStore {
   }
 
   createLane(input: CreateLaneInput): Lane {
-    nonEmpty(input.slug, "slug");
-    if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(input.slug)) {
-      throw new PlatformValidationError("slug must use lowercase letters, numbers, and single hyphens");
-    }
+    pathIdentifier(input.slug, "lane slug");
     nonEmpty(input.name, "name");
     const id = input.id === undefined ? newId("lane") : input.id;
     const status = input.status === undefined ? "active" : input.status;
@@ -364,6 +375,7 @@ export class PlatformStore {
   }
 
   getLaneBySlug(slug: string): Lane | null {
+    pathIdentifier(slug, "lane slug");
     return this.get<Lane>(`SELECT ${laneColumns} FROM lane WHERE slug = ?`, slug);
   }
 
@@ -401,12 +413,25 @@ export class PlatformStore {
     if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== week) {
       throw new PlatformValidationError("weekStart must be a valid date");
     }
+    const weeklyPlan = encode(input.weeklyPlan ?? null, "weeklyPlan");
+    const metricUnit = input.metricUnit ?? null;
+    const approvedDecisionId = input.approvedDecisionId ?? null;
     return this.transaction(() => {
       this.validateLane(input.laneId);
-      if (input.approvedDecisionId != null) {
-        nonEmpty(input.approvedDecisionId, "approvedDecisionId");
-        if (this.getDecision(input.approvedDecisionId)?.status !== "approved") {
-          throw new PlatformValidationError(`decision ${input.approvedDecisionId} must be approved`);
+      if (approvedDecisionId !== null) {
+        const decision = this.getDecision(approvedDecisionId);
+        if (decision?.status !== "approved") {
+          throw new PlatformValidationError(`decision ${approvedDecisionId} must be approved`);
+        }
+        if (decision.category !== "weekly_plan" || (decision.laneId !== null && decision.laneId !== input.laneId)) {
+          throw new PlatformValidationError(`decision ${approvedDecisionId} must approve a weekly plan for this lane or the team`);
+        }
+        const previous = this.get<GoalRow>(`SELECT ${goalColumns} FROM goal WHERE lane_id = ? AND week_start = ?`, input.laneId, week);
+        if (previous?.approvedDecisionId === approvedDecisionId
+          && (previous.statement !== input.statement || previous.metricName !== input.metricName
+            || previous.metricUnit !== metricUnit || previous.metricTarget !== input.metricTarget
+            || !isDeepStrictEqual(decode(previous.weeklyPlan), decode(weeklyPlan)))) {
+          throw new PlatformValidationError("a changed weekly plan requires a new approval");
         }
       }
       const row = this.write<GoalRow>(`INSERT INTO goal (id, lane_id, statement, metric_name, metric_unit,
@@ -417,9 +442,8 @@ export class PlatformStore {
           metric_current = excluded.metric_current, metric_target = excluded.metric_target,
           weekly_plan_json = excluded.weekly_plan_json, approved_decision_id = excluded.approved_decision_id,
           updated_at = excluded.updated_at
-        RETURNING ${goalColumns}`, id, input.laneId, input.statement, input.metricName, input.metricUnit ?? null,
-      input.metricCurrent ?? null, input.metricTarget, week, encode(input.weeklyPlan ?? null, "weeklyPlan"),
-      input.approvedDecisionId ?? null, time);
+        RETURNING ${goalColumns}`, id, input.laneId, input.statement, input.metricName, metricUnit,
+      input.metricCurrent ?? null, input.metricTarget, week, weeklyPlan, approvedDecisionId, time);
       return goalFromRow(row);
     });
   }
