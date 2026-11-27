@@ -19,6 +19,8 @@ import { pollGitHubPrs } from "./github-observer.ts";
 import { SemonCliSpendSource, refreshSpendSnapshots } from "./spend.ts";
 import { isDigestWindow } from "./digest.ts";
 import { evaluatePolicyAndHealth } from "./policy-observer.ts";
+import { startStatusMcp } from "./status-mcp.ts";
+import { defaultStatusStateDir, mintStatusApproval, statusPublicOrigin } from "./status-mcp-oauth.ts";
 import { PlatformStore } from "./store.ts";
 import { T3HostSupervisor } from "./t3-supervisor.ts";
 import { decisionCategories } from "./types.ts";
@@ -49,6 +51,8 @@ const usage = `usage: ostrom-platform [--db <path> | --socket <path>] [--json] <
   auth t3 <host-id> --pairing-code <code> [--hosts-config <path>] [--tokens-dir <path>]
   status
   digest [--window 01:00Z|13:00Z|weekly]
+  status-mcp --public-url <https://...> [--socket <path>] [--port 0] [--state-dir <path>]
+  status-mcp-approve [--state-dir <path>] [--ttl-sec 600]
   dashboard [--socket <path>] [--port 0]
   serve [--socket <path>] [--db <path>] [--hosts-config <path>] [--tokens-dir <path>]
         [--github-poll-ms N] [--semon-bin <path>]
@@ -112,6 +116,8 @@ const commands = new Map<string, { operands: number; flags: string }>([
   ["auth t3", { operands: 1, flags: "pairing-code browser hosts-config tokens-dir" }],
   ["status", { operands: 0, flags: "" }],
   ["digest", { operands: 0, flags: "window" }],
+  ["status-mcp", { operands: 0, flags: "public-url port state-dir" }],
+  ["status-mcp-approve", { operands: 0, flags: "state-dir ttl-sec" }],
   ["dashboard", { operands: 0, flags: "port" }],
   ["serve", { operands: 0, flags: "hosts-config tokens-dir github-poll-ms semon-bin" }],
 ]);
@@ -416,6 +422,38 @@ export async function runPlatformCli(argv: readonly string[], io: CliIO = {}): P
       const result = await authorizeT3(host, pairingCode, explicitTokensDir ?? defaultT3TokenDirectory());
       stdout.write(json ? `${JSON.stringify(result)}\n`
         : `Saved read-only authorization for ${result.hostId}. Expires ${result.expiresAt}.\n`);
+      return 0;
+    }
+
+    if (command === "status-mcp" || command === "status-mcp-approve") {
+      if (db !== undefined || (command === "status-mcp-approve" && socket !== undefined)) {
+        throw new UsageError("unexpected database or socket option");
+      }
+      const stateDir = flags.get("--state-dir") ?? defaultStatusStateDir(env);
+      if (!stateDir.trim()) throw new UsageError("--state-dir requires a non-empty path");
+      if (command === "status-mcp-approve") {
+        const ttl = parseNumber(flags.get("--ttl-sec"), "ttl-sec") ?? 600;
+        if (!Number.isInteger(ttl) || ttl < 1 || ttl > 600) throw new UsageError("--ttl-sec must be an integer from 1 to 600");
+        const code = mintStatusApproval(stateDir, ttl);
+        stdout.write(json ? `${JSON.stringify({ code })}\n` : `${code}\n`);
+        return 0;
+      }
+      const port = parseNumber(flags.get("--port"), "port") ?? 0;
+      if (!Number.isInteger(port) || port < 0 || port > 65535) throw new UsageError("--port must be an integer from 0 to 65535");
+      let publicUrl: string;
+      try {
+        publicUrl = statusPublicOrigin(flags.get("--public-url") ?? "");
+      } catch (error) {
+        throw new UsageError((error as Error).message);
+      }
+      const server = await startStatusMcp({ publicUrl, socketPath: socket ?? defaultPlatformSocketPath(env), stateDir, port });
+      try {
+        await waitForShutdown(() => {
+          stdout.write(json ? `${JSON.stringify({ url: server.url })}\n` : `${server.url}\n`);
+        });
+      } finally {
+        await server.close();
+      }
       return 0;
     }
 
