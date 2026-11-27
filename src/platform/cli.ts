@@ -480,8 +480,10 @@ export async function runPlatformCli(argv: readonly string[], io: CliIO = {}): P
         throw new UsageError("--public-url requires --token-file or Cloudflare Access");
       }
       const dashboard = await startPlatformDashboard({
-        socketPath: socket ?? defaultPlatformSocketPath(env), port, publicUrl, tokenFile,
-        cfAccess: teamDomain === undefined || aud === undefined ? undefined : { teamDomain, aud },
+        socketPath: socket ?? defaultPlatformSocketPath(env), port,
+        ...(publicUrl !== undefined ? { publicUrl } : {}),
+        ...(tokenFile !== undefined ? { tokenFile } : {}),
+        ...(teamDomain !== undefined && aud !== undefined ? { cfAccess: { teamDomain, aud } } : {}),
       });
       try {
         await waitForShutdown(() => {

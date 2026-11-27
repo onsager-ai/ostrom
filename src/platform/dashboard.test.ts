@@ -216,8 +216,8 @@ test("public dashboard accepts Cloudflare Access alone without a bearer token", 
   const api = await startPlatformApiServer({ store, socketPath: options.socketPath });
   t.after(() => api.close());
   const dashboard = await startPlatformDashboard({
-    ...options,
-    tokenFile: undefined,
+    socketPath: options.socketPath,
+    publicUrl: options.publicUrl,
     cfAccess: { teamDomain, aud, async fetchJwks() { return { keys: [jwk] }; } },
   });
   t.after(() => dashboard.close());
