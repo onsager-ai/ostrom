@@ -326,7 +326,8 @@
   </details>
 </main>
 <script type="module">
-  const token = new URLSearchParams(location.hash.slice(1)).get("token");
+  const proxyAuth = document.documentElement.dataset.auth === "proxy";
+  const token = proxyAuth ? null : new URLSearchParams(location.hash.slice(1)).get("token");
   history.replaceState(null, "", location.pathname + location.search);
 
   const byId = (id) => document.getElementById(id);
@@ -338,8 +339,9 @@
   };
   async function read(path) {
     const response = await fetch(path, {
-      headers: { Authorization: `Bearer ${token}` }, cache: "no-store", signal: AbortSignal.timeout(10_000),
+      headers: proxyAuth ? {} : { Authorization: `Bearer ${token}` }, cache: "no-store", signal: AbortSignal.timeout(10_000),
     });
+    if (proxyAuth && (response.status === 401 || response.status === 403)) throw new Error("Dashboard authorization failed.");
     if (!response.ok) throw new Error(response.status === 401 ? "Open the dashboard URL printed by the CLI." : `Platform returned HTTP ${response.status}.`);
     return response.json();
   }
@@ -714,7 +716,7 @@
   }
   windowSelect.onclick = (event) => event.stopPropagation();
   windowSelect.onchange = () => {
-    if (!token) return;
+    if (!token && !proxyAuth) return;
     byId("copy-digest").disabled = true;
     byId("copy-digest").textContent = "Copy Markdown";
     byId("digest").textContent = "Loading digest…";
@@ -725,7 +727,7 @@
     event.stopPropagation();
     void copyText(event.currentTarget, byId("digest").textContent);
   };
-  if (token) {
+  if (token || proxyAuth) {
     void refresh();
     setInterval(updateRefreshTime, 1000);
   } else {
