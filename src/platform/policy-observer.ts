@@ -1,3 +1,4 @@
+import { evaluateBudgets, readBudgetsAndSpend } from "./budget-observer.ts";
 import type { PlatformStore } from "./store.ts";
 import type { Decision, Run } from "./types.ts";
 
@@ -41,7 +42,11 @@ export function readPlatformHealth(store: PlatformStore, {
       ? [{ hostId: host.hostId, expiresAt: host.tokenExpiresAt, remainingMs }] : [];
   });
   return {
-    hosts, agents, activeRuns, stalledRuns, tokenExpiryWarnings, waits: store.listOpenT3Waits(),
+    hosts, agents, activeRuns, stalledRuns, tokenExpiryWarnings,
+    githubPrs: store.listGitHubPrChecks(),
+    policyAlerts: store.listOpenPolicyEvents(),
+    ...readBudgetsAndSpend(store, now),
+    waits: store.listOpenT3Waits(),
     unhealthyHosts: hosts.filter((host) => ["stale", "disconnected", "auth_expired"].includes(host.connectionState)),
     pendingOwnerDecisions: pendingDecisions(store).filter((decision) => decision.authority === "owner"),
   };
@@ -53,11 +58,12 @@ function runTime(run: Run): string {
 
 export function evaluatePolicyAndHealth(store: PlatformStore, options: HealthOptions & { markStalled?: boolean }) {
   const now = new Date(options.now).toISOString();
-  const enabled = new Set(store.listPolicyRules().filter((rule) => rule.enabled).map((rule) => rule.code));
+  const enabled = new Set(store.listPolicyRules().filter((rule) => rule.enabled && rule.mode === "observe").map((rule) => rule.code));
   const failureRule = "two_failure_stop";
   const authorityRule = "authority_routing";
   const failureKeys: string[] = [];
   const authorityKeys: string[] = [];
+  const ciKeys: string[] = [];
   const events = [];
 
   if (enabled.has(failureRule)) {
@@ -117,6 +123,38 @@ export function evaluatePolicyAndHealth(store: PlatformStore, options: HealthOpt
     }
   }
 
+  const ciRule = "pr_green_ci";
+  const targets = new Map(store.listGitHubPrTargets().map((pr) => [`${pr.repository}#${pr.number}`, pr]));
+  for (const pr of store.listGitHubPrChecks()) {
+    const name = `${pr.repository}#${pr.number}`;
+    const target = targets.get(name);
+    if (target === undefined || pr.rollupState === "closed") continue;
+    const key = `github:${name}`;
+    const detail = { ...pr };
+    const streakKey = `${key}:${pr.failureStreak}`;
+    if (enabled.has(failureRule) && pr.consecutiveFailures >= 2
+      && (target.watching || store.hasOpenPolicyEvent(failureRule, streakKey))) {
+      failureKeys.push(streakKey);
+      const event = store.recordDedupedPolicyEvent({
+        ruleCode: failureRule, summary: `${name} failed CI on consecutive heads`, detail,
+      }, streakKey, now, true);
+      if (event !== null) events.push(event);
+    }
+    if (enabled.has(ciRule) && (
+      pr.rollupState === "failure" || pr.rollupState === "error"
+      || (pr.rollupState === "pending" && store.hasOpenPolicyEvent(ciRule, key))
+    )) {
+      ciKeys.push(key);
+      if (pr.rollupState !== "pending") {
+        const event = store.recordDedupedPolicyEvent({
+          ruleCode: ciRule, summary: `${name} CI ${pr.rollupState === "error" ? "could not be checked" : "failed"}`, detail,
+        }, key, now);
+        if (event !== null) events.push(event);
+      }
+    }
+  }
+  store.resolveInactivePolicyEvents(ciRule, ciKeys, now);
+  events.push(...evaluateBudgets(store, now, enabled.has("budget_cap")));
   store.resolveInactivePolicyEvents(failureRule, failureKeys, now);
   store.resolveInactivePolicyEvents(authorityRule, authorityKeys, now);
   const health = readPlatformHealth(store, options);

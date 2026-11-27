@@ -17,6 +17,13 @@ function data(value: JsonValue): string {
   return markdownText(JSON.stringify(value));
 }
 
+function spendLine(spend: { usdEst: number | null; sourceReportedUsd: number | null; billedUsd: number | null;
+  coverage: string | null; unpricedCount: number; sessionCount: number }): string {
+  return `Estimated USD ${spend.usdEst ?? "unknown"} · Reported USD ${spend.sourceReportedUsd ?? "unknown"} · `
+    + `Billed USD ${spend.billedUsd ?? "unknown"} · Coverage ${markdownText(spend.coverage ?? "unknown")} · `
+    + `${spend.unpricedCount} of ${spend.sessionCount} sessions unpriced`;
+}
+
 function bullets(lines: string[]): string {
   return lines.length === 0 ? "None." : lines.map((line) => `- ${line}`).join("\n");
 }
@@ -27,8 +34,7 @@ export function generateOwnerDigest(store: PlatformStore, { window, now }: { win
   const lanes = store.listLanes().map((lane) => ({ ...lane, goal: store.getLatestGoal(lane.id) }));
   const health = readPlatformHealth(store, { now });
   const prs = store.listT3ThreadPrs().filter((pr) => pr.lastWakeAt !== null);
-  const policyAlerts = store.listOpenPolicyEvents().filter((event) =>
-    event.ruleCode === "two_failure_stop" || event.ruleCode === "authority_routing");
+  const { policyAlerts, githubPrs, budgets, spend } = health;
   const friction = store.listFriction({ status: "open" });
   const days = window === "weekly" ? 7 : 2;
   const today = Date.parse(`${generatedAt.slice(0, 10)}T00:00:00Z`);
@@ -42,7 +48,7 @@ export function generateOwnerDigest(store: PlatformStore, { window, now }: { win
   const sections = {
     decisions, lanes, agents: health.agents, activeRuns: health.activeRuns, stalledRuns: health.stalledRuns,
     waits: health.waits, prs, policyAlerts, interventionsByDay, openFrictionCount: friction.length,
-    topOpenFriction: friction[0] ?? null, budgets: store.listBudgets(), spend: { status: "unavailable" as const },
+    topOpenFriction: friction[0] ?? null, budgets, spend, githubPrs,
   };
   const summary = `${health.pendingOwnerDecisions.length} pending owner decisions · ${health.stalledRuns.length} stalled runs · `
     + `${health.waits.length} open waits · ${policyAlerts.length} policy alerts`;
@@ -70,14 +76,18 @@ export function generateOwnerDigest(store: PlatformStore, { window, now }: { win
     "### PR watch wakes",
     bullets(prs.map((pr) => `${markdownText(pr.hostId)} · ${markdownText(pr.repository)} #${pr.number} · `
       + `${markdownText(pr.lastWakeOutcome ?? "")} · ${markdownText(pr.lastWakeSummary ?? "")}`)),
+    "### GitHub PR CI",
+    bullets(githubPrs.map((pr) => `${markdownText(pr.repository)} #${pr.number} · ${pr.rollupState} · `
+      + `${pr.failedChecks}/${pr.totalChecks} failed · ${pr.consecutiveFailures} consecutive failing heads · ${pr.lastCheckedAt}`)),
     "## Policy Alerts & Friction",
     bullets(policyAlerts.map((event) => `${event.ruleCode} · ${markdownText(event.summary)}`)),
     `Open friction items: ${friction.length}. Top open item: ${markdownText(friction[0]?.summary ?? "None")}.`,
     `Owner interventions by day: ${interventionsByDay.map(({ day, count }) => `${day} (${count})`).join(", ")}.`,
     "## Budgets & Spend",
     bullets(sections.budgets.map((budget) => `${budget.scopeKind} ${markdownText(budget.scopeId ?? "")} · `
-      + `${budget.period} cap USD ${budget.capUsd}${budget.enabled ? "" : " · disabled"}`)),
-    "Spend: unavailable.",
+      + `${budget.period} cap USD ${budget.capUsd}${budget.enabled ? "" : " · disabled"} · `
+      + (budget.spend.status === "available" ? spendLine(budget.spend) : "Spend unavailable"))),
+    spend.status === "available" ? `Team monthly · ${spendLine(spend)}` : "Spend: unavailable.",
   ].join("\n\n");
   return { generatedAt, window, summary, markdown, sections };
 }

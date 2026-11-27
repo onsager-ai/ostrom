@@ -45,6 +45,8 @@
     <section><h2>Lanes &amp; Goals</h2><div id="lanes"></div></section>
     <section><h2>Cross-Host Runs &amp; Pending Waits</h2><div id="work"></div></section>
     <section><h2>Host Health &amp; OAuth Expiry</h2><div id="hosts"></div></section>
+    <section><h2>GitHub PR CI</h2><div id="github"></div></section>
+    <section><h2>Budgets &amp; Spend</h2><div id="budgets"></div></section>
     <section class="wide"><h2>Policy Alerts &amp; Friction</h2><div id="policy"></div></section>
     <section class="wide">
       <h2>Digest preview</h2>
@@ -81,6 +83,13 @@
     return response.json();
   }
 
+  function spendDetail(spend) {
+    if (spend.status === "unavailable") return "Spend unavailable";
+    return `Estimated USD ${spend.usdEst ?? "unknown"} · Reported USD ${spend.sourceReportedUsd ?? "unknown"} · `
+      + `Billed USD ${spend.billedUsd ?? "unknown"} · Coverage ${spend.coverage ?? "unknown"} · `
+      + `${spend.unpricedCount} of ${spend.sessionCount} sessions unpriced`;
+  }
+
   function render({ digest, health, friction }) {
     const { sections } = digest;
     byId("summary").textContent = digest.summary;
@@ -112,6 +121,15 @@
           ? wait.questions.map((item) => item.question).join(" · ") : wait.requestId)),
       ...sections.prs.map((pr) => row(`${pr.repository} #${pr.number}`,
         `${pr.hostId} · ${pr.lastWakeOutcome} · ${pr.lastWakeSummary}`)),
+    ]);
+    show("github", sections.githubPrs.map((pr) => row(`${pr.repository} #${pr.number}`,
+      `${pr.rollupState} · ${pr.failedChecks}/${pr.totalChecks} failed · ${pr.consecutiveFailures} consecutive failing heads`
+        + ` · Checked ${pr.lastCheckedAt}`)));
+    show("budgets", [
+      row("Team monthly", spendDetail(sections.spend)),
+      ...sections.budgets.map((budget) => row(
+        `${budget.scopeKind} ${budget.scopeId ?? ""} · ${budget.period} cap USD ${budget.capUsd}${budget.enabled ? "" : " · disabled"}`,
+        spendDetail(budget.spend))),
     ]);
     const warnings = new Set(health.tokenExpiryWarnings.map((warning) => warning.hostId));
     show("hosts", health.hosts.map((host) => row(host.label,

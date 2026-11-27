@@ -13,7 +13,7 @@ import {
 import type {
   Agent, Budget, Decision, DecisionEvent, DecisionStatus, DecisionVerification, FrictionEntry,
   FrictionStatus, Goal, JsonValue, Lane, LaneStatus, PolicyEvent, PolicyRule, Run, SpendSnapshot,
-  T3HostState, T3PendingWait, T3ThreadPr,
+  GitHubPrCheck, GitHubPrObservation, SpendSummaryFilter, T3HostState, T3PendingWait, T3ThreadPr,
 } from "./types.ts";
 
 export class PlatformValidationError extends Error {}
@@ -76,7 +76,8 @@ export interface T3ThreadSnapshot {
 const t3HostColumns = `host_id AS hostId, label, mcp_url AS mcpUrl, origin_namespace AS originNamespace,
   environment_id AS environmentId, server_version AS serverVersion, token_expires_at AS tokenExpiresAt,
   connection_state AS connectionState, last_reconciled_at AS lastReconciledAt, last_event_at AS lastEventAt,
-  last_error AS lastError, consecutive_failures AS consecutiveFailures, partial_coverage AS partialCoverage,
+  last_error AS lastError, consecutive_failures AS consecutiveFailures,
+      failure_streak AS failureStreak, partial_coverage AS partialCoverage,
   updated_at AS updatedAt`;
 type T3HostRow = Omit<T3HostState, "partialCoverage"> & { partialCoverage: number };
 const t3WaitColumns = `host_id AS hostId, thread_id AS threadId, request_id AS requestId, kind,
@@ -606,6 +607,43 @@ export class PlatformStore {
     return this.get<SpendSnapshot>(`SELECT ${spendColumns} FROM spend_snapshot WHERE session_uid = ?`, sessionUid);
   }
 
+  summarizeSpend(filter: SpendSummaryFilter, now: Date | string) {
+    const { scopeKind, scopeId, period, source } = filter;
+    choice(scopeKind, budgetScopes, "scopeKind");
+    choice(period, budgetPeriods, "period");
+    choice(source, spendSources, "source");
+    if (scopeKind !== "team") nonEmpty(scopeId, "scopeId");
+    else if (scopeId !== null) throw new PlatformValidationError("team spend does not accept scopeId");
+
+    const until = new Date(now).toISOString();
+    const start = new Date(`${until.slice(0, 10)}T00:00:00Z`);
+    if (period === "weekly") start.setUTCDate(start.getUTCDate() - ((start.getUTCDay() + 6) % 7));
+    if (period === "monthly") start.setUTCDate(1);
+    const since = start.toISOString();
+
+    return { ...filter, since, until, ...this.write<{
+      sessionCount: number; snapshotCount: number; unpricedCount: number; incompleteCount: number;
+      usdEst: number | null; sourceReportedUsd: number | null; billedUsd: number | null;
+      preferredUsd: number | null; estimatedCount: number; reportedCount: number; billedCount: number;
+      coverage: string | null;
+    }>(`WITH sessions AS (
+      SELECT semon_session_uid AS uid, min(julianday(started_at)) AS started_at FROM run WHERE semon_session_uid IS NOT NULL
+        AND (? = 'team' OR (? = 'lane' AND lane_id = ?) OR (? = 'agent' AND agent_id = ?))
+      GROUP BY semon_session_uid
+    )
+    SELECT count(*) AS sessionCount, count(s.session_uid) AS snapshotCount,
+      count(*) FILTER (WHERE coalesce(billed_usd, source_reported_usd, usd_est) IS NULL) AS unpricedCount,
+      count(*) FILTER (WHERE s.coverage IS NOT 'complete') AS incompleteCount,
+      sum(usd_est) AS usdEst, sum(source_reported_usd) AS sourceReportedUsd, sum(billed_usd) AS billedUsd,
+      sum(coalesce(billed_usd, source_reported_usd, usd_est)) AS preferredUsd,
+      count(*) FILTER (WHERE billed_usd IS NULL AND source_reported_usd IS NULL AND usd_est IS NOT NULL) AS estimatedCount,
+      count(*) FILTER (WHERE billed_usd IS NULL AND source_reported_usd IS NOT NULL) AS reportedCount,
+      count(billed_usd) AS billedCount, group_concat(DISTINCT s.coverage) AS coverage
+    FROM sessions LEFT JOIN spend_snapshot s ON s.session_uid = sessions.uid AND s.source = ?
+    WHERE sessions.started_at >= julianday(?) AND sessions.started_at <= julianday(?)`,
+    scopeKind, scopeKind, scopeId, scopeKind, scopeId, source, since, until) };
+  }
+
   upsertAgent(input: UpsertAgentInput): Agent {
     nonEmpty(input.id, "id");
     nonEmpty(input.hostId, "hostId");
@@ -754,6 +792,48 @@ export class PlatformStore {
       WHERE resolved_at IS NULL AND host_id = coalesce(?, host_id) AND thread_id = coalesce(?, thread_id)
       ORDER BY occurred_at, host_id, thread_id, request_id`, hostId ?? null, threadId ?? null)
       .map((row) => ({ ...row, questions: decode(row.questions) }));
+  }
+
+  listGitHubPrTargets(): { repository: string; number: number; watching: boolean }[] {
+    return this.all<{ repository: string; number: number; watching: number }>(`SELECT lower(repository) AS repository,
+      number, max(watching) AS watching FROM t3_thread_pr WHERE lower(pr_host) = 'github.com'
+      AND (state = 'open' OR (state IS NULL AND watching = 1))
+      GROUP BY lower(repository), number ORDER BY lower(repository), number`)
+      .map((row) => ({ ...row, watching: row.watching === 1 }));
+  }
+
+  listGitHubPrChecks(): GitHubPrCheck[] {
+    return this.all<GitHubPrCheck>(`SELECT repository, number, head_sha AS headSha, rollup_state AS rollupState,
+      total_checks AS totalChecks, failed_checks AS failedChecks, consecutive_failures AS consecutiveFailures,
+      failure_streak AS failureStreak,
+      last_checked_at AS lastCheckedAt, last_error AS lastError, updated_at AS updatedAt
+      FROM github_pr_check ORDER BY repository, number`);
+  }
+
+  recordGitHubPrCheck(repository: string, number: number, check: GitHubPrObservation): void {
+    this.transaction(() => {
+      const prior = this.get<{ failingHeads: string; failureStreak: number }>(`SELECT failing_heads_json AS failingHeads,
+        failure_streak AS failureStreak
+        FROM github_pr_check WHERE repository = ? AND number = ?`, repository, number);
+      const heads = check.rollupState === "success" || check.rollupState === "closed" || prior === null
+        ? new Set<string>() : new Set(JSON.parse(prior.failingHeads) as string[]);
+      let streak = prior?.failureStreak ?? 0;
+      if (check.rollupState === "failure" && check.headSha !== null) {
+        if (heads.size === 0) streak++;
+        heads.add(check.headSha);
+      }
+      const now = this.now();
+      this.db.prepare(`INSERT INTO github_pr_check (repository, number, head_sha, rollup_state, total_checks,
+        failed_checks, consecutive_failures, failure_streak, failing_heads_json, last_checked_at, last_error, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (repository, number) DO UPDATE SET
+        head_sha = coalesce(excluded.head_sha, github_pr_check.head_sha), rollup_state = excluded.rollup_state,
+        total_checks = excluded.total_checks, failed_checks = excluded.failed_checks,
+        consecutive_failures = excluded.consecutive_failures, failure_streak = excluded.failure_streak,
+        failing_heads_json = excluded.failing_heads_json,
+        last_checked_at = excluded.last_checked_at, last_error = excluded.last_error, updated_at = excluded.updated_at`)
+        .run(repository, number, check.headSha, check.rollupState, check.totalChecks, check.failedChecks,
+          heads.size, streak, JSON.stringify([...heads]), now, check.rollupState === "error" ? "GitHub PR checks unavailable" : null, now);
+    });
   }
 
   private upsertT3Pr(pr: T3PrInput): void {

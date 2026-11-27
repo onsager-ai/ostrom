@@ -15,6 +15,8 @@ import {
 import { defaultHostsConfigPath, loadPlatformHosts } from "./config.ts";
 import type { PlatformT3Host } from "./config.ts";
 import { startPlatformDashboard } from "./dashboard.ts";
+import { pollGitHubPrs } from "./github-observer.ts";
+import { SemonCliSpendSource, refreshSpendSnapshots } from "./spend.ts";
 import { isDigestWindow } from "./digest.ts";
 import { evaluatePolicyAndHealth } from "./policy-observer.ts";
 import { PlatformStore } from "./store.ts";
@@ -37,6 +39,10 @@ const usage = `usage: ostrom-platform [--db <path> | --socket <path>] [--json] <
   goal set <slug> --statement TEXT --metric NAME --target N [--current N] [--unit TEXT]
                   [--week YYYY-MM-DD] [--plan JSON] [--approved-decision ID]
   policy list
+  budget set --scope team|lane|agent [--scope-id ID] --period daily|weekly|monthly
+             --cap-usd N --warn-pct N [--source semon|magpie] [--enabled true|false]
+  budget list
+  spend summary [--scope team|lane|agent] [--scope-id ID] [--period daily|weekly|monthly] [--source semon|magpie]
   friction add --kind KIND --summary TEXT [--lane SLUG] [--rule CODE]
   friction list [--status STATUS]
   auth t3 <host-id> --pairing-code <code> [--hosts-config <path>] [--tokens-dir <path>]
@@ -44,6 +50,7 @@ const usage = `usage: ostrom-platform [--db <path> | --socket <path>] [--json] <
   digest [--window 01:00Z|13:00Z|weekly]
   dashboard [--socket <path>] [--port 0]
   serve [--socket <path>] [--db <path>] [--hosts-config <path>] [--tokens-dir <path>]
+        [--github-poll-ms N] [--semon-bin <path>]
 
 Decision categories: ${decisionCategories.join(", ")}`;
 
@@ -94,6 +101,9 @@ const commands = new Map<string, { operands: number; flags: string }>([
   ["lane list", { operands: 0, flags: "" }],
   ["lane show", { operands: 1, flags: "" }],
   ["goal set", { operands: 1, flags: "statement metric target current unit week plan approved-decision" }],
+  ["budget set", { operands: 0, flags: "scope scope-id period cap-usd warn-pct source enabled" }],
+  ["budget list", { operands: 0, flags: "" }],
+  ["spend summary", { operands: 0, flags: "scope scope-id period source" }],
   ["policy list", { operands: 0, flags: "" }],
   ["friction add", { operands: 0, flags: "kind summary lane rule" }],
   ["friction list", { operands: 0, flags: "status" }],
@@ -101,7 +111,7 @@ const commands = new Map<string, { operands: number; flags: string }>([
   ["status", { operands: 0, flags: "" }],
   ["digest", { operands: 0, flags: "window" }],
   ["dashboard", { operands: 0, flags: "port" }],
-  ["serve", { operands: 0, flags: "hosts-config tokens-dir" }],
+  ["serve", { operands: 0, flags: "hosts-config tokens-dir github-poll-ms semon-bin" }],
 ]);
 
 function validateCommand(args: string[], flags: Map<string, string>): string {
@@ -164,6 +174,19 @@ async function execute(call: Call, command: string, operand: string, flags: Map<
     const lane = await call("GET", `/v1/lanes/${encodeURIComponent(slug)}`) as Lane;
     return lane.id;
   };
+  const safeId = (id: string) => /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,255}$/.test(id);
+  const scopeId = () => {
+    const value = optional("scope-id");
+    if (value === undefined || safeId(value)) return value;
+    if (optional("scope") === "agent") {
+      // T3 agents use a JSON tuple as their stable platform ID.
+      const parts: unknown = parseJson(value, "scope-id");
+      if (Array.isArray(parts) && parts.length === 4 && parts[0] === "t3"
+        && parts.slice(1).every((part: unknown) => typeof part === "string" && safeId(part))
+        && JSON.stringify(parts) === value) return value;
+    }
+    throw new UsageError("--scope-id requires a safe ID");
+  };
   const id = encodeURIComponent(operand);
   switch (command) {
     case "status":
@@ -215,6 +238,21 @@ async function execute(call: Call, command: string, operand: string, flags: Map<
         metricCurrent: parseNumber(optional("current"), "current"), metricUnit: optional("unit"), weekStart: optional("week"),
         weeklyPlan: parseJson(optional("plan"), "plan"), approvedDecisionId: optional("approved-decision"),
       }) };
+    case "budget set": {
+      const enabled = optional("enabled");
+      if (enabled !== undefined && enabled !== "true" && enabled !== "false") throw new UsageError("--enabled must be true or false");
+      return { data: await call("PUT", "/v1/budgets", {
+        scopeKind: required("scope"), scopeId: scopeId(), period: required("period"),
+        capUsd: parseNumber(required("cap-usd"), "cap-usd"), warnPct: parseNumber(required("warn-pct"), "warn-pct"),
+        spendSource: optional("source") ?? "semon", enabled: enabled !== "false",
+      }) };
+    }
+    case "budget list":
+      return { data: await call("GET", "/v1/budgets") };
+    case "spend summary":
+      return { data: await call("GET", withQuery("/v1/spend/summary", {
+        scopeKind: optional("scope"), scopeId: scopeId(), period: optional("period"), source: optional("source"),
+      })) };
     case "policy list":
       return { data: await call("GET", "/v1/policy/rules") };
     case "friction add":
@@ -228,41 +266,57 @@ async function execute(call: Call, command: string, operand: string, flags: Map<
   }
 }
 
-async function waitForShutdown(start: () => void, tick?: () => void): Promise<void> {
+async function waitForShutdown(start: () => void, tick?: (signal: AbortSignal) => Promise<void>): Promise<void> {
   const stop = Promise.withResolvers<void>();
+  const controller = new AbortController();
   const onSignal = () => stop.resolve();
   process.once("SIGINT", onSignal);
   process.once("SIGTERM", onSignal);
   let timer: ReturnType<typeof setInterval> | undefined;
+  let pending: Promise<void> | undefined;
+  const runTick = () => {
+    if (pending !== undefined || tick === undefined) return;
+    pending = tick(controller.signal).catch(stop.reject).finally(() => { pending = undefined; });
+  };
   try {
     start();
     if (tick !== undefined) {
-      tick();
-      timer = setInterval(() => {
-        try {
-          tick();
-        } catch (error) {
-          stop.reject(error);
-        }
-      }, 30_000);
+      runTick();
+      timer = setInterval(runTick, 30_000);
     }
     await stop.promise;
   } finally {
+    controller.abort();
     clearInterval(timer);
+    await pending;
     process.off("SIGINT", onSignal);
     process.off("SIGTERM", onSignal);
   }
 }
 
 async function serve(dbPath: string, socketPath: string, hosts: readonly PlatformT3Host[] | undefined,
-  tokensDir: string, started: () => void): Promise<void> {
+  tokensDir: string, started: () => void, githubPollMs: number | undefined, semonBin: string | undefined): Promise<void> {
   const store = PlatformStore.open(dbPath);
   try {
     const server = await startPlatformApiServer({ store, socketPath });
     let supervisor: T3HostSupervisor | undefined;
     try {
       if (hosts !== undefined) supervisor = new T3HostSupervisor(store, hosts, { tokensDir });
-      await waitForShutdown(started, () => { evaluatePolicyAndHealth(store, { now: new Date() }); });
+      const spend = semonBin === undefined ? undefined : new SemonCliSpendSource(semonBin);
+      let nextGitHubPoll = 0;
+      await waitForShutdown(started, async (signal) => {
+        const observe = () => evaluatePolicyAndHealth(store, { now: new Date() });
+        observe();
+        const updates: Promise<void>[] = [];
+        if (githubPollMs !== undefined && Date.now() >= nextGitHubPoll) {
+          nextGitHubPoll = Date.now() + githubPollMs;
+          updates.push(pollGitHubPrs(store, undefined, signal));
+        }
+        if (spend !== undefined) updates.push(refreshSpendSnapshots(store, spend, signal));
+        const results = await Promise.allSettled(updates);
+        for (const result of results) if (result.status === "rejected") throw result.reason;
+        if (updates.length && !signal.aborted) observe();
+      });
     } finally {
       try {
         await supervisor?.close();
@@ -334,9 +388,15 @@ export async function runPlatformCli(argv: readonly string[], io: CliIO = {}): P
     if (command === "serve") {
       const path = socket ?? defaultPlatformSocketPath(env);
       const hosts = hostsConfig === undefined ? undefined : await loadPlatformHosts(hostsConfig);
+      const githubPollMs = parseNumber(flags.get("--github-poll-ms"), "github-poll-ms");
+      if (githubPollMs !== undefined && (!Number.isSafeInteger(githubPollMs) || githubPollMs < 30_000)) {
+        throw new UsageError("--github-poll-ms must be an integer of at least 30000");
+      }
+      const semonBin = flags.get("--semon-bin");
+      if (semonBin?.trim() === "") throw new UsageError("--semon-bin requires a non-empty path");
       await serve(db ?? defaultPlatformDbPath(env), path, hosts, explicitTokensDir ?? defaultT3TokenDirectory(), () => {
         stdout.write(json ? `${JSON.stringify({ socketPath: path })}\n` : `Listening on ${path}\n`);
-      });
+      }, githubPollMs, semonBin);
       return 0;
     }
 

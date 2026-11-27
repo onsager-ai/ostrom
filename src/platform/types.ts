@@ -192,6 +192,7 @@ export interface T3HostState {
   lastEventAt: string | null;
   lastError: string | null;
   consecutiveFailures: number;
+  failureStreak: number;
   partialCoverage: boolean;
   updatedAt: string;
 }
@@ -224,4 +225,28 @@ export interface T3ThreadPr {
   lastWakeOutcome: string | null;
   lastWakeSummary: string | null;
   lastWakeAt: string | null;
+}
+
+export interface GitHubPrObservation {
+  headSha: string | null;
+  rollupState: "pending" | "success" | "failure" | "error" | "closed";
+  totalChecks: number;
+  failedChecks: number;
+}
+
+export interface GitHubPrCheck extends GitHubPrObservation {
+  repository: string;
+  number: number;
+  consecutiveFailures: number;
+  failureStreak: number;
+  lastCheckedAt: string;
+  lastError: string | null;
+  updatedAt: string;
+}
+
+export interface SpendSummaryFilter {
+  scopeKind: BudgetScope;
+  scopeId: string | null;
+  period: BudgetPeriod;
+  source: SpendSourceKind;
 }

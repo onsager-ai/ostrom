@@ -42,6 +42,11 @@ test("serves the loopback page and proxies authenticated GETs only", async () =>
       assert.equal(page.status, 200);
       assert.equal(page.headers["cache-control"], "no-store");
       assert.equal(page.headers["referrer-policy"], "no-referrer");
+      assert.match(page.body, /GitHub PR CI/);
+      assert.match(page.body, /Budgets &amp; Spend/);
+      assert.match(page.body, /Spend unavailable/);
+      assert.match(page.body, /Estimated USD.*Reported USD/);
+      assert.match(page.body, /Billed USD.*Coverage/);
       assert.match(page.body, /history\.replaceState/);
       assert(!page.body.includes("<script>invalid()</script>"));
       assert.equal((await read(url, "/v1/hosts")).status, 401);
@@ -51,6 +56,10 @@ test("serves the loopback page and proxies authenticated GETs only", async () =>
       assert.equal((await read(url, "/v1/hosts", { ...headers, origin: "https://foreign.example" })).status, 403);
       assert.equal((await read(url, "/v1/decisions", headers, "POST")).status, 405);
       assert.equal((await read(url, "/", {}, "HEAD")).status, 405);
+      assert.equal((await read(url, "/v1/budgets", headers, "PUT")).status, 405);
+      for (const path of ["/v1/budgets", "/v1/github/prs", "/v1/spend/summary"]) {
+        assert.equal((await read(url, path, headers)).status, 200);
+      }
       const hosts = await read(url, "/v1/hosts", { ...headers, origin: url.origin });
       assert.equal(hosts.status, 200);
       assert.equal(hosts.headers["cache-control"], "no-store");

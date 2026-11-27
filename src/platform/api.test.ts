@@ -169,3 +169,22 @@ test("registry, policy, friction, budget, agent, and run endpoints use the same 
   assert.deepEqual(await client.request("GET", "/v1/agents"), [agent]);
   assert.deepEqual(await client.request("GET", "/v1/runs"), [run]);
 });
+
+test("the Unix API writes budgets and exposes spend and GitHub PR observations", async (t) => {
+  const { store, client } = await fixture(t);
+  const budget = await client.request("PUT", "/v1/budgets", {
+    scopeKind: "team", period: "daily", capUsd: 10, warnPct: 80, spendSource: "semon",
+  });
+  assert.deepEqual(await client.request("GET", "/v1/budgets"), [budget]);
+  await assert.rejects(client.request("GET", "/v1/spend/summary?scopeKind=invalid"), { status: 400 });
+  await assert.rejects(client.request("GET", "/v1/spend/summary?scopeKind=lane"), { status: 400 });
+  const spend = await client.request<{ status: string; billedUsd: number | null }>("GET", "/v1/spend/summary");
+  assert.equal(spend.status, "unavailable");
+  assert.equal(spend.billedUsd, null);
+
+  store.recordGitHubPrCheck("org/repo", 7, {
+    headSha: "a".repeat(40), rollupState: "failure", totalChecks: 2, failedChecks: 1,
+  });
+  assert.deepEqual(await client.request("GET", "/v1/github/prs"), store.listGitHubPrChecks());
+  await assert.rejects(client.request("PUT", "/v1/github/prs", {}), { status: 404 });
+});

@@ -110,7 +110,23 @@ for (const transport of ["db", "socket"]) {
     await call<Decision>("decision", "answer", ownerAction.id, "--status", "approved", "--by", "owner", "--answer", "Proceed");
     await verify(ownerAction.id, "approved", 0);
 
-    assert.equal((await call<PolicyRule[]>("policy", "list")).length, 5);
+    assert.equal((await call<PolicyRule[]>("policy", "list")).length, 6);
+    const budget = await call("budget", "set", "--scope", "lane", "--scope-id", lane.id,
+      "--period", "weekly", "--cap-usd", "10", "--warn-pct", "85");
+    assert.deepEqual(await call("budget", "list"), [budget]);
+    const agentId = JSON.stringify(["t3", "east", "env-1", "thread-1"]);
+    store.upsertAgent({ id: agentId, role: "worker", connectorKind: "t3", hostId: "east", externalRef: "thread-1",
+      label: "Worker", status: "active" });
+    await call("budget", "set", "--scope", "agent", "--scope-id", agentId,
+      "--period", "weekly", "--cap-usd", "10", "--warn-pct", "85");
+    const spend = await call<{ status: string; billedUsd: number | null }>("spend", "summary",
+      "--scope", "lane", "--scope-id", lane.id);
+    assert.equal(spend.status, "unavailable");
+    assert.equal(spend.billedUsd, null);
+    assert.notEqual((await run("spend", "summary", "--scope-id", "../unsafe")).code, 0);
+    assert.notEqual((await run("spend", "summary", "--period", "yearly")).code, 0);
+    assert.notEqual((await run("budget", "set", "--scope", "team", "--period", "weekly",
+      "--cap-usd", "10", "--warn-pct", "101")).code, 0);
     const friction = await call<FrictionEntry>("friction", "add", "--kind", "owner_intervention", "--summary", "Clarified scope",
       "--lane", "platform", "--rule", "authority_routing");
     assert.equal(friction.laneId, lane.id);
@@ -124,6 +140,12 @@ test("the CLI entry point serves the requested database and shuts down on SIGTER
   const directory = mkdtempSync(join(tmpdir(), "ostrom-serve-"));
   const dbPath = join(directory, "platform.sqlite");
   const socketPath = join(directory, "api.sock");
+  const store = PlatformStore.open(dbPath);
+  store.upsertT3HostState({ hostId: "east", label: "East", mcpUrl: "https://t3.example/mcp",
+    originNamespace: null, connectionState: "connected" });
+  store.recordT3PrWake({ hostId: "east", threadId: "thread", prHost: "github.com", repository: "org/repo", number: 1,
+    outcome: "watch", summary: "Watching", watchEnded: false, occurredAt: "2026-11-27T13:00:00Z" });
+  store.close();
   const script = fileURLToPath(new URL("./cli.ts", import.meta.url));
   const child = spawn(process.execPath, [script, "serve", "--db", dbPath, "--socket", socketPath, "--json"],
     { stdio: ["ignore", "pipe", "pipe"] });
@@ -147,6 +169,8 @@ test("the CLI entry point serves the requested database and shuts down on SIGTER
   assert.deepEqual(JSON.parse(String(ready)), { socketPath });
   const client = new PlatformApiClient(socketPath);
   const lane = await client.request<Lane>("POST", "/v1/lanes", { slug: "platform", name: "Platform" });
+  assert.deepEqual(await client.request("GET", "/v1/github/prs"), []);
+  assert.equal((await client.request<{ status: string }>("GET", "/v1/spend/summary")).status, "unavailable");
   child.kill("SIGTERM");
   assert.deepEqual(await exited, [0, null]);
   assert.equal(existsSync(socketPath), false);
