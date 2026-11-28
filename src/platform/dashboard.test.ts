@@ -375,13 +375,13 @@ test("Lane Board caps exceptions, keeps lane summaries current, and preserves dr
       alert("Budget warning", "budget_cap", 30, { level: "warning" }),
     ];
     const pr = (number, rollupState) => ({ repository: "org/crawlab-pro", number, rollupState });
-    const githubPrs = [pr(1, "success"), pr(2, "pending"), pr(3, "error"), pr(4, "closed")];
+    const prChecks = [pr(1, "success"), pr(2, "pending"), pr(3, "error"), pr(4, "closed")];
     const linkedPrs = [
       { repository: "org/crawlab-pro", number: 5, prHost: "github.com", state: "merged", title: "Merged work" },
       { repository: "org/idle", number: 6, prHost: "github.com", state: "open", title: "New work" },
     ];
     const health = { pendingOwnerDecisions: decisions, policyAlerts: alerts, hosts: [], agents: [],
-      activeRuns: [], stalledRuns: [], waits: [], githubPrs, budgets: [], spend: { status: "unavailable" } };
+      activeRuns: [], stalledRuns: [], waits: [], githubPrs: prChecks, budgets: [], spend: { status: "unavailable" } };
     currentContext = context({ digest: { sections: { lanes: [idleLane, lane] } }, health, friction: [], linkedPrs });
     const view = byId("view");
     renderView();
