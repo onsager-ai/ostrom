@@ -81,10 +81,11 @@ test("alerts once for stale open goals and resolves when progress or lane status
   assert.deepEqual(evaluatePolicyAndHealth(store, { now: clock }).events, []);
   assert.equal(store.listOpenPolicyEvents().filter(({ ruleCode }) => ruleCode === "goal_stale").length, 2);
 
-  clock = "2026-11-27T13:00:00.000Z";
+  clock = "2026-11-27T12:30:00.000Z";
   store.setGoal({ id: staleGoal.id, laneId: active.id, statement: "Make progress", metricName: "items",
     metricCurrent: 1, metricTarget: 2 });
-  assert.equal(evaluatePolicyAndHealth(store, { now: clock }).policyAlerts.some(({ ruleCode }) => ruleCode === "goal_stale"), false);
+  assert.equal(evaluatePolicyAndHealth(store, { now: clock }).policyAlerts.some(({ laneId, ruleCode }) =>
+    ruleCode === "goal_stale" && laneId === active.id), false);
 
   assert.equal(evaluatePolicyAndHealth(store, { now: clock }).policyAlerts.filter(({ ruleCode }) => ruleCode === "goal_stale").length, 1);
   store.updateLane(pauseMe.slug, { status: "paused" });

@@ -110,7 +110,7 @@ for (const transport of ["db", "socket"]) {
     await call<Decision>("decision", "answer", ownerAction.id, "--status", "approved", "--by", "owner", "--answer", "Proceed");
     await verify(ownerAction.id, "approved", 0);
 
-    assert.equal((await call<PolicyRule[]>("policy", "list")).length, 6);
+    assert.equal((await call<PolicyRule[]>("policy", "list")).length, 7);
     const budget = await call("budget", "set", "--scope", "lane", "--scope-id", lane.id,
       "--period", "weekly", "--cap-usd", "10", "--warn-pct", "85");
     assert.deepEqual(await call("budget", "list"), [budget]);

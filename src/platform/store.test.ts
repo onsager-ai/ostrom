@@ -51,7 +51,7 @@ test("the host URL migration preserves existing rows and later URL updates", (t)
   const original = store.upsertT3HostState(host);
   assert.equal(original.webUrl, null);
   db.exec(`ALTER TABLE t3_host_state DROP COLUMN web_url;
-    DELETE FROM platform_schema_version WHERE version >= (SELECT max(version) - 1 FROM platform_schema_version)`);
+    DELETE FROM platform_schema_version WHERE version >= (SELECT max(version) - 2 FROM platform_schema_version)`);
   const upgraded = PlatformStore.open(path);
   const webUrl = "https://t3-east.example";
   try {
@@ -76,7 +76,7 @@ test("the PR draft migration preserves existing checks and persists draft change
   store.recordGitHubPrCheck("org/repo", 7, check);
   const before = store.listGitHubPrChecks();
   db.exec(`ALTER TABLE github_pr_check DROP COLUMN is_draft;
-    DELETE FROM platform_schema_version WHERE version = (SELECT max(version) FROM platform_schema_version)`);
+    DELETE FROM platform_schema_version WHERE version >= (SELECT max(version) - 1 FROM platform_schema_version)`);
   const upgraded = PlatformStore.open(path);
   try {
     assert.deepEqual(upgraded.listGitHubPrChecks(), before);
@@ -86,7 +86,7 @@ test("the PR draft migration preserves existing checks and persists draft change
   } finally {
     upgraded.close();
   }
-  db.exec("DELETE FROM platform_schema_version WHERE version = (SELECT max(version) FROM platform_schema_version)");
+  db.exec("DELETE FROM platform_schema_version WHERE version >= (SELECT max(version) - 1 FROM platform_schema_version)");
   const reopened = PlatformStore.open(path);
   try {
     assert.equal(reopened.listGitHubPrChecks()[0]?.isDraft, true);
@@ -237,7 +237,7 @@ test("raw SQLite rejects mutation of decided fields and replacement or mutation 
   const reopened = PlatformStore.open(path);
   t.after(() => reopened.close());
   assert.equal(reopened.getDecision(original.id)?.status, "superseded");
-  assert.equal(reopened.listPolicyRules().length, 6);
+  assert.equal(reopened.listPolicyRules().length, 7);
 });
 
 test("a failed event insert rolls back decision creation and answer", (t) => {
