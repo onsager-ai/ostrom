@@ -41,6 +41,7 @@ const usage = `usage: ostrom-platform [--db <path> | --socket <path>] [--json] <
   lane update <slug> [--name TEXT] [--status active|paused|archived] [--owner-agent ID] [--priority N]
   goal set <slug> --statement TEXT --metric NAME --target N [--current N] [--unit TEXT]
                   [--week YYYY-MM-DD] [--plan JSON] [--approved-decision ID]
+  goal complete <slug> [--week YYYY-MM-DD] [--current N]
   policy list
   budget set --scope team|lane|agent [--scope-id ID] --period daily|weekly|monthly
              --cap-usd N --warn-pct N [--source semon|magpie] [--enabled true|false]
@@ -112,6 +113,7 @@ const commands = new Map<string, { operands: number; flags: string }>([
   ["lane show", { operands: 1, flags: "" }],
   ["lane update", { operands: 1, flags: "name status owner-agent priority" }],
   ["goal set", { operands: 1, flags: "statement metric target current unit week plan approved-decision" }],
+  ["goal complete", { operands: 1, flags: "week current" }],
   ["budget set", { operands: 0, flags: "scope scope-id period cap-usd warn-pct source enabled" }],
   ["run link-semon", { operands: 1, flags: "session-uid" }],
   ["budget list", { operands: 0, flags: "" }],
@@ -258,6 +260,10 @@ async function execute(call: Call, command: string, operand: string, flags: Map<
         statement: required("statement"), metricName: required("metric"), metricTarget: parseNumber(required("target"), "target"),
         metricCurrent: parseNumber(optional("current"), "current"), metricUnit: optional("unit"), weekStart: optional("week"),
         weeklyPlan: parseJson(optional("plan"), "plan"), approvedDecisionId: optional("approved-decision"),
+      }) };
+    case "goal complete":
+      return { data: await call("POST", `/v1/lanes/${id}/goal/complete`, {
+        weekStart: optional("week"), metricCurrent: parseNumber(optional("current"), "current"),
       }) };
     case "budget set": {
       const enabled = optional("enabled");

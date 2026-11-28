@@ -7,7 +7,7 @@ import { test } from "node:test";
 import type { TestContext } from "node:test";
 
 import { unavailableSpendSource } from "./spend.ts";
-import { DecisionStateError, PlatformStore, PlatformValidationError } from "./store.ts";
+import { DecisionStateError, PlatformNotFoundError, PlatformStore, PlatformValidationError } from "./store.ts";
 import type { CreateDecisionInput } from "./store.ts";
 import type { SpendRollup } from "./types.ts";
 
@@ -155,6 +155,39 @@ test("the spend rollup migration is idempotent and preserves per-session snapsho
     ]) assert.throws(() => reopened.upsertSpendRollup({ ...rollup, ...input } as SpendRollup), PlatformValidationError);
   } finally {
     reopened.close();
+  }
+});
+
+test("the goal completion migration preserves existing goals and their foreign keys", (t) => {
+  const { store, db, path } = disk(t);
+  const lane = store.createLane({ slug: "releases", name: "Releases" });
+  const decision = store.createDecision({ ...decisionInput(), laneId: lane.id });
+  store.answerDecision(decision.id, { status: "approved", decidedBy: "owner", answer: "yes" });
+  const input = { laneId: lane.id, statement: "Ship the release", metricName: "Releases", metricUnit: "releases",
+    metricCurrent: 0, metricTarget: 1, weekStart: "2026-11-23", weeklyPlan: ["Test", "Ship"], approvedDecisionId: decision.id };
+  const original = store.setGoal(input);
+  db.exec(`DROP INDEX idx_goal_active_lane_week;
+    ALTER TABLE goal DROP COLUMN completed_at;
+    CREATE UNIQUE INDEX goal_by_lane_week ON goal (lane_id, week_start);
+    DELETE FROM platform_schema_version WHERE version >= 9`);
+
+  const upgraded = PlatformStore.open(path);
+  try {
+    assert.deepEqual(upgraded.listGoals(), [{ ...original, completedAt: null }]);
+    assert.deepEqual(db.prepare("PRAGMA foreign_key_list(goal)").all().map(({ table }) => table).sort(), ["decision", "lane"]);
+    assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+    const completed = upgraded.completeGoal(lane.id);
+    const replacement = upgraded.setGoal(input);
+    assert.notEqual(replacement.id, original.id);
+    db.exec("DELETE FROM platform_schema_version WHERE version = 9");
+    const reopened = PlatformStore.open(path);
+    try {
+      assert.deepEqual(reopened.listGoals(), [replacement, completed]);
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    upgraded.close();
   }
 });
 
@@ -351,8 +384,45 @@ test("weekly goal approvals must be approved for the right category, lane, and p
   const fresh = store.createDecision({ ...decisionInput(), laneId: lane.id });
   approve(fresh.id);
   assert.equal(store.setGoal({ ...goal, weeklyPlan: ["Review", "Ship"], approvedDecisionId: fresh.id }).approvedDecisionId, fresh.id);
+  store.completeGoal(lane.id);
+  assert.throws(() => store.setGoal({ ...goal, weeklyPlan: ["Ship"], approvedDecisionId: fresh.id }), /a changed weekly plan requires a new approval/);
   assert.equal(store.setGoal({ ...goal, weeklyPlan: ["Ship"], approvedDecisionId: null }).approvedDecisionId, null);
   assert.throws(() => store.setGoal({ ...goal, weekStart: "2026-02-30" }), PlatformValidationError);
+});
+
+test("completes a goal and keeps its history when replaced in the same week", (t) => {
+  let now = "2026-11-27T04:00:00.000Z";
+  const store = memory(t, () => now);
+  const lane = store.createLane({ slug: "product", name: "Product" });
+  const input = { laneId: lane.id, statement: "Ship a release", metricName: "Releases", metricCurrent: 1,
+    metricTarget: 2, weekStart: "2026-11-23" };
+  const original = store.setGoal(input);
+  assert.equal(original.completedAt, null);
+  assert.throws(() => store.completeGoal(""), PlatformValidationError);
+  assert.throws(() => store.completeGoal(lane.id, { weekStart: "2026-02-30" }), PlatformValidationError);
+  assert.throws(() => store.completeGoal(lane.id, { metricCurrent: Infinity }), PlatformValidationError);
+  assert.throws(() => store.completeGoal(lane.id, { weekStart: "2026-11-16" }), PlatformNotFoundError);
+
+  now = "2026-11-27T05:00:00.000Z";
+  const completed = store.completeGoal(lane.id, { weekStart: input.weekStart, metricCurrent: 2 });
+  assert.deepEqual(completed, { ...original, completedAt: now, updatedAt: now, metricCurrent: 2 });
+  assert.deepEqual(store.getLatestGoal(lane.id), completed);
+  assert.throws(() => store.completeGoal(lane.id), PlatformNotFoundError);
+
+  const replacement = store.setGoal({ ...input, statement: "Ship the next release" });
+  assert.notEqual(replacement.id, original.id);
+  assert.equal(replacement.completedAt, null);
+  assert.deepEqual(store.listGoals(lane.id), [replacement, completed]);
+  assert.deepEqual(store.getLatestGoal(lane.id), replacement);
+
+  const earlier = store.setGoal({ ...input, weekStart: "2026-11-16" });
+  const completedReplacement = store.completeGoal(lane.id, { metricCurrent: null });
+  assert.deepEqual(completedReplacement, { ...replacement, completedAt: now, metricCurrent: null });
+  assert.deepEqual(store.getLatestGoal(lane.id), earlier);
+  const completedEarlier = store.completeGoal(lane.id);
+  assert.deepEqual(completedEarlier, { ...earlier, completedAt: now });
+  assert.deepEqual(store.getLatestGoal(lane.id), completedReplacement);
+  assert.deepEqual(store.listGoals(lane.id), [completedReplacement, completed, completedEarlier]);
 });
 
 test("seeded policy rules observe, and the friction count uses UTC days and owner interventions only", (t) => {

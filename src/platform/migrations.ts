@@ -339,6 +339,37 @@ const migrations = [
     PRIMARY KEY (scope_kind, scope_id, period, since, source)
   ) STRICT;
   `,
+  (db: DatabaseSync) => {
+    if (!db.prepare("PRAGMA table_info(goal)").all().some(({ name }) => name === "completed_at")) {
+      // Nothing references goal(id), so the rebuild can leave foreign keys enabled.
+      db.exec(`
+        CREATE TABLE goal_new (
+          id TEXT PRIMARY KEY,
+          lane_id TEXT NOT NULL REFERENCES lane(id),
+          statement TEXT NOT NULL,
+          metric_name TEXT NOT NULL,
+          metric_unit TEXT,
+          metric_current REAL,
+          metric_target REAL NOT NULL,
+          week_start TEXT NOT NULL,
+          weekly_plan_json TEXT NOT NULL CHECK (json_valid(weekly_plan_json)),
+          approved_decision_id TEXT REFERENCES decision(id),
+          updated_at TEXT NOT NULL,
+          completed_at TEXT
+        ) STRICT;
+
+        INSERT INTO goal_new (rowid, id, lane_id, statement, metric_name, metric_unit, metric_current,
+          metric_target, week_start, weekly_plan_json, approved_decision_id, updated_at)
+        SELECT rowid, id, lane_id, statement, metric_name, metric_unit, metric_current,
+          metric_target, week_start, weekly_plan_json, approved_decision_id, updated_at FROM goal;
+
+        DROP TABLE goal;
+        ALTER TABLE goal_new RENAME TO goal;
+      `);
+    }
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_goal_active_lane_week ON goal (lane_id, week_start)
+      WHERE completed_at IS NULL`);
+  },
 ];
 
 // Read the version with the writer lock held so simultaneous opens cannot apply the same migration.

@@ -37,6 +37,7 @@ test("all four MCP results project only the allowed status fields", async () => 
   const goal = {
     statement: "Ship three releases", metricName: "Releases", metricCurrent: 1, metricTarget: 3,
     metricUnit: "releases", weekStart: "2026-11-23", approvedDecisionId: "internal-approved-decision",
+    completedAt: "2026-11-27T12:00:00.000Z",
     weeklyPlan: { path: "/home/bob/private-plan" },
   };
   const privateLane = { ...lane, id: "lane_private", slug: "ops", name: "Operations" };

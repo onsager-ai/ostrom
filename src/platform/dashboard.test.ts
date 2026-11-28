@@ -355,7 +355,7 @@ test("Lane Board caps exceptions, keeps lane summaries current, and preserves dr
     assert.equal(relativeExpiry("invalid date"), "expiry unknown");
 
     const goal = { statement: "Ship the release", weekStart: "2026-11-23", metricName: "Releases",
-      metricTarget: 1, approvedDecisionId: "approval", weeklyPlan: {
+      metricTarget: 1, approvedDecisionId: "approval", completedAt: "2026-11-27T12:00:00.000Z", weeklyPlan: {
         nextStep: "Review patch", next: "Alternative", blockers: ["Get test data"], items: ["Review patch", "Ship patch"],
       } };
     const lane = { id: "release", slug: "crawlab", name: "Release", status: "active", ownerAgentId: "release-manager", priorityRank: 1, goal };
@@ -496,7 +496,7 @@ test("Lane Board caps exceptions, keeps lane summaries current, and preserves dr
     assert(prevented && stopped);
     assert.equal(location.hash, "#lane/crawlab");
     navigate();
-    assert.match(textIn(view), /Goal & Weekly Plan Ship the release Releases · unknown\/1 Week of 2026-11-23 · Approved/);
+    assert.match(textIn(view), /Goal & Weekly Plan Ship the release Releases · unknown\/1 Week of 2026-11-23 · Approved · Completed/);
     assert.match(textIn(view), /Ship patch/);
     assert.match(textIn(view), /CI failed twice/);
     assert.doesNotMatch(textIn(view), /org\/idle/);

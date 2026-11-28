@@ -92,6 +92,37 @@ test("alerts once for stale open goals and resolves when progress or lane status
   assert.equal(evaluatePolicyAndHealth(store, { now: clock }).policyAlerts.some(({ ruleCode }) => ruleCode === "goal_stale"), false);
 });
 
+test("completing a stale goal resolves its alert and a same-week replacement gets 24 hours", (t) => {
+  let clock = "2026-11-23T12:00:00.000Z";
+  const store = PlatformStore.open(":memory:", { now: () => clock });
+  t.after(() => store.close());
+  const lane = store.createLane({ slug: "releases", name: "Releases" });
+  const input = { laneId: lane.id, statement: "Ship the release", metricName: "Releases", metricCurrent: 0,
+    metricTarget: 1, weekStart: "2026-11-23" };
+  const original = store.setGoal(input);
+  const observe = () => evaluatePolicyAndHealth(store, { now: clock }).policyAlerts;
+  const goalKey = (id: string) => `goal:${lane.id}:${id}`;
+
+  clock = "2026-11-24T12:00:00.000Z";
+  assert.equal(observe().length, 1);
+  assert(store.hasOpenPolicyEvent("goal_stale", goalKey(original.id)));
+  store.completeGoal(lane.id);
+  assert(!store.hasOpenPolicyEvent("goal_stale", goalKey(original.id)));
+  assert.deepEqual(observe(), []);
+  assert.equal(store.listPolicyEvents({ ruleCode: "goal_stale" }).length, 1);
+
+  clock = "2026-11-25T12:00:00.000Z";
+  assert.deepEqual(observe(), []);
+  const replacement = store.setGoal({ ...input, statement: "Ship the next release" });
+  assert.deepEqual(observe(), []);
+  clock = "2026-11-26T11:59:59.000Z";
+  assert.deepEqual(observe(), []);
+  clock = "2026-11-26T12:00:00.000Z";
+  assert.equal(observe().length, 1);
+  assert(store.hasOpenPolicyEvent("goal_stale", goalKey(replacement.id)));
+  assert(!store.hasOpenPolicyEvent("goal_stale", goalKey(original.id)));
+});
+
 test("keeps repeated failures on live runs and the latest settled run", (t) => {
   const store = PlatformStore.open(":memory:", { now: () => now });
   t.after(() => store.close());
