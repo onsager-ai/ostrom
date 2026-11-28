@@ -197,7 +197,8 @@ test("refreshes open PR alert attribution and resolves it when lane attribution 
   store.recordGitHubPrCheck(repository, 9, { isDraft: false, headSha: "a".repeat(40), rollupState: "error",
     totalChecks: 0, failedChecks: 0 });
   evaluatePolicyAndHealth(store, { now });
-  assert.equal(store.listOpenPolicyEvents()[0]?.summary, "org/crawlab-pro#9: CI could not be checked");
+  assert.equal(store.listOpenPolicyEvents()[0]?.summary,
+    "org/crawlab-pro#9: CI error: GitHub PR checks unavailable");
 
   const lane = store.createLane({ slug: "crawlab", name: "Crawlab" });
   evaluatePolicyAndHealth(store, { now });
