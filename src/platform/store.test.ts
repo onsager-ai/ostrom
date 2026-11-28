@@ -170,7 +170,7 @@ test("the goal completion migration preserves existing goals and their foreign k
   store.answerDecision(decision.id, { status: "approved", decidedBy: "owner", answer: "yes" });
   const input = { laneId: lane.id, statement: "Ship the release", metricName: "Releases", metricUnit: "releases",
     metricCurrent: 0, metricTarget: 1, weekStart: "2026-11-23", weeklyPlan: ["Test", "Ship"], approvedDecisionId: decision.id };
-  const original = store.setGoal(input);
+  const original = store.setGoal({ ...input, id: "goal-original" });
   db.exec(`DROP TABLE goal_audit_log;
     DROP INDEX idx_goal_active_lane_week;
     ALTER TABLE goal DROP COLUMN completed_at;
@@ -183,7 +183,7 @@ test("the goal completion migration preserves existing goals and their foreign k
     assert.deepEqual(db.prepare("PRAGMA foreign_key_list(goal)").all().map(({ table }) => table).sort(), ["decision", "lane"]);
     assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
     const completed = upgraded.completeGoal(lane.id);
-    const replacement = upgraded.setGoal(input);
+    const replacement = upgraded.setGoal({ ...input, id: "goal-replacement" });
     assert.notEqual(replacement.id, original.id);
     rewindMigrations(db, 9);
     const reopened = PlatformStore.open(path);
@@ -477,7 +477,7 @@ test("completes a goal and keeps its history when replaced in the same week", (t
   const lane = store.createLane({ slug: "product", name: "Product" });
   const input = { laneId: lane.id, statement: "Ship a release", metricName: "Releases", metricCurrent: 1,
     metricTarget: 2, weekStart: "2026-11-23" };
-  const original = store.setGoal(input);
+  const original = store.setGoal({ ...input, id: "goal-original" });
   assert.equal(original.completedAt, null);
   assert.throws(() => store.completeGoal(""), PlatformValidationError);
   assert.throws(() => store.completeGoal(lane.id, { weekStart: "2026-02-30" }), PlatformValidationError);
@@ -490,7 +490,7 @@ test("completes a goal and keeps its history when replaced in the same week", (t
   assert.deepEqual(store.getLatestGoal(lane.id), completed);
   assert.throws(() => store.completeGoal(lane.id), PlatformNotFoundError);
 
-  const replacement = store.setGoal({ ...input, statement: "Ship the next release" });
+  const replacement = store.setGoal({ ...input, id: "goal-replacement", statement: "Ship the next release" });
   assert.notEqual(replacement.id, original.id);
   assert.equal(replacement.completedAt, null);
   assert.deepEqual(store.listGoals(lane.id), [replacement, completed]);
@@ -504,6 +504,25 @@ test("completes a goal and keeps its history when replaced in the same week", (t
   assert.deepEqual(completedEarlier, { ...earlier, completedAt: now });
   assert.deepEqual(store.getLatestGoal(lane.id), completedReplacement);
   assert.deepEqual(store.listGoals(lane.id), [completedReplacement, completed, completedEarlier]);
+});
+
+test("lists goal history by descending week, update time and ID, with an optional lane filter", (t) => {
+  let now = "2026-11-27T04:00:00.000Z";
+  const store = memory(t, () => now);
+  const product = store.createLane({ slug: "product", name: "Product" });
+  const docs = store.createLane({ slug: "docs", name: "Docs" });
+  const input = { statement: "Ship", metricName: "Releases", metricTarget: 1, weekStart: "2026-11-23" };
+  store.setGoal({ ...input, laneId: product.id, id: "goal-z" });
+  const first = store.completeGoal(product.id);
+  const replacement = store.setGoal({ ...input, laneId: product.id, id: "goal-a" });
+  now = "2026-11-27T05:00:00.000Z";
+  const latest = store.setGoal({ ...input, laneId: docs.id, id: "goal-b" });
+  const earlierWeek = store.setGoal({ ...input, laneId: product.id, weekStart: "2026-11-16" });
+
+  assert.deepEqual(store.listGoals(), [latest, first, replacement, earlierWeek]);
+  assert.deepEqual(store.listGoals(product.id), [first, replacement, earlierWeek]);
+  assert.deepEqual(store.listGoals(docs.id), [latest]);
+  assert.deepEqual(store.listGoals("unknown"), []);
 });
 
 test("seeded policy rules observe, and the friction count uses UTC days and owner interventions only", (t) => {

@@ -617,8 +617,11 @@ export class PlatformStore {
   }
 
   listGoals(laneId?: string): Goal[] {
-    return this.all<GoalRow>(`SELECT ${goalColumns} FROM goal WHERE lane_id = coalesce(?, lane_id)
-      ORDER BY week_start DESC, (completed_at IS NOT NULL), updated_at DESC, rowid DESC, lane_id`, laneId ?? null).map(goalFromRow);
+    const select = `SELECT ${goalColumns} FROM goal`;
+    const order = "ORDER BY week_start DESC, updated_at DESC, id DESC";
+    const rows = laneId === undefined ? this.all<GoalRow>(`${select} ${order}`)
+      : this.all<GoalRow>(`${select} WHERE lane_id = ? ${order}`, laneId);
+    return rows.map(goalFromRow);
   }
 
   listPolicyRules(): PolicyRule[] {

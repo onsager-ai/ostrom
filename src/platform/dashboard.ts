@@ -39,13 +39,15 @@ export async function startPlatformDashboard({ socketPath, port = 0, publicUrl, 
     const supplied = /^Bearer ([0-9a-f]{64})$/.exec(authorization ?? "")?.[1];
     return supplied !== undefined && expectedToken !== undefined && timingSafeEqual(Buffer.from(supplied), expectedToken);
   };
-  let page = await readFile(new URL("./dashboard.html", import.meta.url));
-  if (publicOrigin !== undefined) {
+  async function readPage(file: string): Promise<Buffer> {
+    const page = await readFile(new URL(file, import.meta.url));
+    if (publicOrigin === undefined) return page;
     const html = page.toString("utf8");
     const root = '<html lang="en">';
     if (!html.includes(root)) throw new Error("Dashboard HTML is missing its expected root element");
-    page = Buffer.from(html.replace(root, '<html lang="en" data-auth="proxy">'));
+    return Buffer.from(html.replace(root, '<html lang="en" data-auth="proxy">'));
   }
+  const [page, preview] = await Promise.all([readPage("./dashboard.html"), readPage("./dashboard-v2.html")]);
   let authority = "";
   const trusted = (host: string | undefined, origin: string | undefined) =>
     host === (publicOrigin?.host ?? authority) && (origin === undefined || origin === (publicOrigin?.origin ?? `http://${authority}`));
@@ -68,6 +70,10 @@ export async function startPlatformDashboard({ socketPath, port = 0, publicUrl, 
     const path = incoming.url ?? "/";
     if (path === "/" || path === "/dashboard.html") {
       outgoing.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }).end(page);
+      return;
+    }
+    if (path === "/preview" || path === "/preview/") {
+      outgoing.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }).end(preview);
       return;
     }
     if (!path.startsWith("/v1/") || path.split("?", 1)[0] === "/v1/goals/audit") return send(outgoing, 404, "Not found");
