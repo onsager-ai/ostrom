@@ -36,6 +36,7 @@ export interface CompleteGoalOptions {
   weekStart?: string;
   metricCurrent?: number | null;
 }
+type GoalLaneReference = { laneId?: string; laneSlug?: string };
 
 export type CreateDecisionInput = Pick<Decision, "authority" | "category" | "urgency" | "title" | "recommendation" | "requestedBy">
   & Partial<Pick<Decision, "id" | "laneId" | "evidence" | "options">>;
@@ -559,11 +560,14 @@ export class PlatformStore {
     });
   }
 
-  assertLaneOwnerThread(slug: string, callerThread: string): Lane {
+  assertLaneOwnerThread(slug: string, callerThread: string, { laneId, laneSlug }: GoalLaneReference = {}): Lane {
     nonEmpty(callerThread, "callerThread");
     if (callerThread !== callerThread.trim()) throw new PlatformValidationError("callerThread must be trimmed");
     const lane = this.getLaneBySlug(slug);
     if (lane === null) throw new PlatformNotFoundError(`lane ${slug} not found`);
+    if ((laneId !== undefined && laneId !== lane.id) || (laneSlug !== undefined && laneSlug !== lane.slug)) {
+      throw new PlatformForbiddenError(`goal request lane does not match route lane ${slug}`);
+    }
     const owner = lane.ownerAgentId === null ? null : this.getAgent(lane.ownerAgentId);
     if (owner === null) throw new PlatformForbiddenError(`lane ${slug} has no registered owner agent`);
     const ref = owner.externalRef;
@@ -575,17 +579,17 @@ export class PlatformStore {
     return lane;
   }
 
-  setGoalAsOwner(slug: string, callerThread: string, input: Omit<SetGoalInput, "laneId">): { goal: Goal; audit: GoalAuditEvent } {
+  setGoalAsOwner(slug: string, callerThread: string, input: Omit<SetGoalInput, "laneId"> & GoalLaneReference): { goal: Goal; audit: GoalAuditEvent } {
     return this.transaction(() => {
-      const lane = this.assertLaneOwnerThread(slug, callerThread);
+      const lane = this.assertLaneOwnerThread(slug, callerThread, input);
       const goal = this.setGoal({ ...input, laneId: lane.id });
       return { goal, audit: this.appendGoalAudit(goal, "set", callerThread) };
     });
   }
 
-  completeGoalAsOwner(slug: string, callerThread: string, options?: CompleteGoalOptions): { goal: Goal; audit: GoalAuditEvent } {
+  completeGoalAsOwner(slug: string, callerThread: string, options?: CompleteGoalOptions & GoalLaneReference): { goal: Goal; audit: GoalAuditEvent } {
     return this.transaction(() => {
-      const lane = this.assertLaneOwnerThread(slug, callerThread);
+      const lane = this.assertLaneOwnerThread(slug, callerThread, options);
       const goal = this.completeGoal(lane.id, options);
       return { goal, audit: this.appendGoalAudit(goal, "complete", callerThread) };
     });

@@ -167,7 +167,7 @@ test("the owner goal route enforces lane ownership and exposes a filterable audi
   const owner = store.upsertAgent({ id: "manager", role: "manager", connectorKind: "t3", hostId: "east",
     externalRef: "environment/thread-1", label: "Manager", status: "active" });
   const lane = store.createLane({ slug: "releases", name: "Releases", ownerAgentId: owner.id });
-  store.createLane({ slug: "unowned", name: "Unowned" });
+  const other = store.createLane({ slug: "unowned", name: "Unowned" });
   const path = `/v1/lanes/${lane.slug}/goal/self`;
   const input = { action: "set", callerThread: "thread-1", statement: "Ship the release", metricName: "Releases", metricTarget: 2 };
   await assert.rejects(client.request("GET", path), { status: 404 });
@@ -179,9 +179,20 @@ test("the owner goal route enforces lane ownership and exposes a filterable audi
   assert.deepEqual(await client.request("GET", "/v1/goals/audit"), []);
 
   type OwnerResult = { goal: Goal; audit: GoalAuditEvent };
-  const set = await client.request<OwnerResult>("POST", path, input);
+  const set = await client.request<OwnerResult>("POST", path, { ...input, laneId: lane.id, laneSlug: lane.slug });
   assert.equal(set.goal.laneId, lane.id);
   assert.equal(set.audit.action, "set");
+  const otherGoal = store.setGoal({ laneId: other.id, statement: "Triage incoming work", metricName: "Items", metricTarget: 4 });
+  for (const action of ["set", "complete"]) {
+    for (const conflict of [{ laneId: other.id }, { laneSlug: other.slug }]) {
+      await assert.rejects(client.request("POST", path, { ...input, ...conflict, action, metricCurrent: 2 }),
+        { status: 403, message: /goal request lane does not match route lane/ });
+    }
+  }
+  assert.deepEqual(store.listGoals(lane.id), [set.goal]);
+  assert.deepEqual(store.listGoals(other.id), [otherGoal]);
+  assert.deepEqual(store.listGoalAuditEvents(), [set.audit]);
+
   const complete = await client.request<OwnerResult>("POST", path,
     { action: "complete", callerThread: owner.externalRef, weekStart: set.goal.weekStart, metricCurrent: 2 });
   assert.equal(complete.goal.id, set.goal.id);

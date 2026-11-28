@@ -127,7 +127,7 @@ export async function dispatchPlatformRequest(
     if (put && laneAction === undefined) return ok(store.updateLane(slug, await body<UpdateLaneInput>()));
     if (laneAction === "goal/self") {
       // The private socket authenticates the OS account. The caller supplies its thread for the owner check and audit.
-      const input = await body<{ callerThread: string } & (
+      const input = await body<{ callerThread: string; laneId?: string; laneSlug?: string } & (
         { action: "set" } & Omit<SetGoalInput, "laneId"> | { action: "complete" } & CompleteGoalOptions
       )>();
       if (input.action === "set") return ok(store.setGoalAsOwner(slug, input.callerThread, input));
