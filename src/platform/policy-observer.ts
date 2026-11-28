@@ -59,6 +59,7 @@ function runTime(run: Run): string {
 
 export function evaluatePolicyAndHealth(store: PlatformStore, options: HealthOptions & { markStalled?: boolean }) {
   const now = new Date(options.now).toISOString();
+  const timestamp = Date.parse(now);
   const enabled = new Set(store.listPolicyRules().filter((rule) => rule.enabled && rule.mode === "observe").map((rule) => rule.code));
   const failureRule = "two_failure_stop";
   const authorityRule = "authority_routing";

@@ -422,7 +422,7 @@ test("Lane Board caps exceptions, keeps lane summaries current, and preserves dr
     location.hash = "#system";
     renderView();
     const systemAlertRows = view.children[3].children[1].children;
-    const goalAlertRow = systemAlertRows.find((node) => textIn(node).includes("Release goal stale"));
+    const goalAlertRow = systemAlertRows.find((node) => textIn(node).includes("Quiet Lane goal stale"));
     assert.ok(goalAlertRow);
     assert.equal(goalAlertRow.href, "https://t3.example/threads/env/thread");
     assert.equal(goalAlertRow.children[0].children[0].children[1].textContent, "Warning");
