@@ -68,7 +68,7 @@ test("serves the loopback page and proxies authenticated GETs only", async () =>
       assert(!page.body.includes("<script>invalid()</script>"));
 
       const previewHtml = await readFile(new URL("./dashboard-v2.html", import.meta.url), "utf8");
-      for (const path of ["/preview", "/preview/"]) {
+      for (const path of ["/preview", "/preview/", "/preview?style=a", "/preview?style=b"]) {
         const preview = await read(url, path);
         assert.equal(preview.status, 200);
         assert.equal(preview.body, previewHtml);
@@ -79,6 +79,8 @@ test("serves the loopback page and proxies authenticated GETs only", async () =>
         assert.equal((await read(url, path, {}, "POST")).status, 405);
       }
 
+      assert.equal((await read(url, "/?style=b")).status, 404);
+      assert.equal((await read(url, "/previews?style=b")).status, 404);
       assert.equal((await read(url, "/v1/hosts")).status, 401);
       assert.equal((await read(url, "/v1/unknown")).status, 401);
       assert.equal((await read(url, "/v1/hosts", { authorization: "Bearer " + "0".repeat(64) })).status, 401);
@@ -181,14 +183,14 @@ test("public dashboard accepts Cloudflare Access alone without a bearer token", 
   assert.match(dashboard.url, /^http:\/\/127\.0\.0\.1:\d+\/$/);
   const url = new URL(dashboard.url);
   const headers = { host: "dashboard.example", "cf-access-jwt-assertion": assertion };
-  for (const path of ["/", "/preview", "/preview/", "/v1/hosts"]) {
+  for (const path of ["/", "/preview", "/preview/", "/preview?style=a", "/preview?style=b", "/v1/hosts"]) {
     assert.equal((await read(url, path, { host: headers.host })).status, 403);
     assert.equal((await read(url, path, { ...headers, "cf-access-jwt-assertion": "invalid" })).status, 403);
   }
   const page = await read(url, "/", headers);
   assert.equal(page.status, 200);
   assert.match(page.body, /<html lang="en" data-auth="proxy">/);
-  for (const path of ["/preview", "/preview/"]) {
+  for (const path of ["/preview", "/preview/", "/preview?style=a", "/preview?style=b"]) {
     const preview = await read(url, path, headers);
     assert.equal(preview.status, 200);
     assert.match(preview.body, /<html lang="en" data-auth="proxy">/);
@@ -224,7 +226,7 @@ test("public dashboard enforces proxy headers and keeps the bearer token out of 
   assert.equal(tunnel.status, 405);
   assert.equal(tunnel.headers.allow, "GET");
   assert.equal((await read(url, "dashboard.example:443", { host: url.host }, "CONNECT")).status, 403);
-  for (const path of ["/", "/dashboard.html", "/preview", "/preview/", "/v1/hosts", "/unknown"]) {
+  for (const path of ["/", "/dashboard.html", "/preview", "/preview/", "/preview?style=a", "/preview?style=b", "/v1/hosts", "/unknown"]) {
     assert.equal((await read(url, path, { host: proxyHeaders.host })).status, 401);
     assert.equal((await read(url, path, { ...proxyHeaders, authorization: `Bearer ${"0".repeat(64)}` })).status, 401);
   }
@@ -236,7 +238,7 @@ test("public dashboard enforces proxy headers and keeps the bearer token out of 
   assert.match(page.body, /<html lang="en" data-auth="proxy">/);
   assert(!page.body.includes(dashboardToken));
   assert.equal((await read(url, "/dashboard.html", proxyHeaders)).body, page.body);
-  for (const path of ["/preview", "/preview/"]) {
+  for (const path of ["/preview", "/preview/", "/preview?style=a", "/preview?style=b"]) {
     const preview = await read(url, path, proxyHeaders);
     assert.equal(preview.status, 200);
     assert.match(preview.body, /<html lang="en" data-auth="proxy">/);
@@ -664,12 +666,23 @@ test("the loopback page removes the token fragment and retains authorization dur
 test("the preview follows the system theme and contains no write controls or outbound T3 links", async () => {
   const html = await readFile(new URL("./dashboard-v2.html", import.meta.url), "utf8");
   assert.match(html, /color-scheme:\s*light dark/);
-  assert.match(html, /light-dark\(#4f46e5, #818cf8\)/);
+  for (const style of ["a", "b"]) assert.match(html, new RegExp(String.raw`:root\[data-style="${style}"\] \{[^}]*--accent: light-dark\(`));
   assert.doesNotMatch(html, /t3-thread:\/\/|\.ts\.net\/threads\/|Open in T3/i);
   assert.doesNotMatch(html, /theme-toggle|data-theme|<form\b|type=["']submit|\binnerHTML\b/i);
   assert.doesNotMatch(html, /\bStalled\b/);
   assert.match(html, /Stall signal: unavailable \(awaiting Semon #788\)/);
   assert.match(html, /\.tile p\s*\{[^}]*-webkit-line-clamp:\s*2\b[^}]*overflow:\s*hidden/);
+});
+
+test("the preview picks its visual style from the ?style= query before first paint", async () => {
+  const html = await readFile(new URL("./dashboard-v2.html", import.meta.url), "utf8");
+  const script = /<\/style>\s*<script>([\s\S]*?)<\/script>\s*<\/head>/.exec(html)?.[1];
+  assert(script);
+  for (const [search, style] of [["?style=a", "a"], ["?style=b", "b"], ["", "a"], ["?style=c", "a"], ["?style=B", "a"]]) {
+    const document = { documentElement: { dataset: {} as Record<string, string> } };
+    runInNewContext(script, { document, location: { search }, URLSearchParams });
+    assert.equal(document.documentElement.dataset.style, style, search);
+  }
 });
 
 const previewDom = `
