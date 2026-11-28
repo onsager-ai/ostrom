@@ -73,15 +73,20 @@ export function readLaneDetail(store: PlatformStore, lane: Lane, now: Date) {
   const agentsById = new Map(agents.map((agent) => [agent.id, agent]));
   const recentAgents = laneAgents.filter(({ status, lastSeenAt }) => status === "active" || status === "waiting" || recent(lastSeenAt, 1))
     .map(({ id, label, role, status, lastSeenAt }) => ({ id, label, role, status, lastSeenAt }));
-  const activeRuns = store.listRuns().flatMap((run) => {
+  const liveRuns = store.listRuns().flatMap((run) => {
     const agent = agentsById.get(run.agentId);
     const { status, startedAt, model } = run;
-    if (agent === undefined || (run.laneId !== lane.id && !belongs(agent)) || run.completedAt !== null
+    if (agent === undefined || (run.laneId !== null ? run.laneId !== lane.id : !belongs(agent)) || run.completedAt !== null
       || (status !== "running" && status !== "waiting_input" && status !== "waiting_approval" && status !== "stalled")) return [];
-    return [{ agentLabel: agent.label, role: agent.role, isLaneOwner: agent.id === lane.ownerAgentId,
+    const view = { agentLabel: agent.label, role: agent.role, isLaneOwner: agent.id === lane.ownerAgentId,
       status: status === "stalled" ? "unknown" as const : status, model, startedAt,
-      harness: run.semonIdentity?.nativeHarness ?? run.connectorKind }];
-  }).sort((a, b) => (b.startedAt ?? "").localeCompare(a.startedAt ?? ""));
+      harness: run.semonIdentity?.nativeHarness ?? run.connectorKind };
+    return [{ run, view, time: Date.parse(startedAt ?? run.updatedAt) || 0 }];
+  });
+  liveRuns.sort((a, b) => b.time - a.time || b.run.id.localeCompare(a.run.id));
+  const newestByAgent = new Map<string, typeof liveRuns[number]["view"]>();
+  for (const { run, view } of liveRuns) if (!newestByAgent.has(run.agentId)) newestByAgent.set(run.agentId, view);
+  const activeRuns = [...newestByAgent.values()];
   const prs = linkedPullRequests(store, lane, laneAgents);
   const decisions = store.listDecisions({ laneId: lane.id }).filter((decision) => decision.status === "pending"
     || recent(decision.createdAt, 7) || recent(decision.decidedAt, 7));

@@ -79,7 +79,7 @@ export async function dispatchPlatformRequest(
       scopeKind: query.get("scopeKind") ?? "team", scopeId: query.get("scopeId"),
       period: query.get("period") ?? "monthly", source: query.get("source") ?? "semon",
     } as SpendSummaryFilter;
-    return ok(readSpendSummary(store, filter, new Date()));
+    return ok(readSpendSummary(store, filter, new Date(), { rollupOnly: query.get("rollupOnly") === "true" }));
   }
   if (get && route === "/v1/health/summary") return ok(readPlatformHealth(store, { now: new Date() }));
   if (get && route === "/v1/digest") {

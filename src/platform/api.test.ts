@@ -320,6 +320,10 @@ test("lane detail returns scoped live records, joined PR checks and a bounded ti
     externalRef: "private-idle-ref", label: "Old idle", status: "idle", lastSeenAt: at(25) });
   store.upsertRun({ id: "lane-explicit-run", agentId: "foreign", laneId: lane.id, connectorKind: "t3", hostId: host.hostId,
     externalRunRef: "private-explicit-run", status: "waiting_input", startedAt: at(3) });
+  store.upsertRun({ id: "lane-older-run", agentId: "foreign", laneId: lane.id, connectorKind: "t3", hostId: host.hostId,
+    externalRunRef: "private-older-run", status: "running", startedAt: at(4) });
+  store.upsertRun({ id: "lane-a-run", agentId: "foreign", laneId: lane.id, connectorKind: "t3", hostId: host.hostId,
+    externalRunRef: "private-tied-run", status: "running", startedAt: at(3) });
   const ownedLane = store.updateLane(lane.slug, { ownerAgentId: "manager" });
   const goalInput = { statement: "Ship the first update", metricName: "Releases", metricTarget: 1 };
   store.setGoalAsOwner(lane.slug, "owner-thread", goalInput);
@@ -369,6 +373,10 @@ test("lane detail returns scoped live records, joined PR checks and a bounded ti
     ["Lane Manager", true, "running", "openai/gpt-6.2-sol", at(1)],
     ["Lane Worker", false, "unknown", null, at(2)],
     ["Other Worker", false, "waiting_input", null, at(3)],
+  ]);
+  const otherDetail = await client.request<Detail>("GET", "/v1/lanes/other/detail");
+  assert.deepEqual(otherDetail.activeRuns.map(({ agentLabel, status, startedAt }) => [agentLabel, status, startedAt]), [
+    ["Other Worker", "waiting_approval", at(1)],
   ]);
   assert.deepEqual(detail.recentAgents, [
     { id: "manager", label: "Lane Manager", role: "manager", status: "active", lastSeenAt: at(1) },
@@ -438,6 +446,16 @@ test("the Unix API upserts individual rollups and applies a batch atomically", a
   assert.equal(summary.status, "available");
   assert.equal(summary.preferredUsd, 8);
   assert.equal(summary.coverage, "partial");
+  const agent = store.upsertAgent({ id: "fixture-worker", role: "worker", connectorKind: "codex",
+    hostId: "fixture-host", externalRef: "fixture-thread", label: "Fixture Worker", status: "idle" });
+  store.upsertRun({ id: "priced-run", agentId: agent.id, connectorKind: agent.connectorKind, hostId: agent.hostId,
+    externalRunRef: "fixture-run", status: "completed", startedAt: now.toISOString(), semonSessionUid: "fixture-session" });
+  store.upsertSpendSnapshot({ sessionUid: "fixture-session", source: "semon", usdEst: 1, coverage: "complete" });
+  assert.equal((await client.request<typeof summary>("GET", "/v1/spend/summary")).preferredUsd, 1);
+  const team = await client.request<typeof summary & { observedAt: string }>("GET", "/v1/spend/summary?rollupOnly=true");
+  assert.equal(team.preferredUsd, 8);
+  assert.equal(team.coverage, "partial");
+  assert.equal(team.observedAt, rollup.observedAt);
 
   const weekly: SpendRollup = { ...rollup, ...spendWindow("weekly", now), period: "weekly" };
   const updated = { ...rollup, usdEst: 9, preferredUsd: 9 };

@@ -1185,6 +1185,17 @@ export class PlatformStore {
         ON CONFLICT (rule_code, dedupe_key) WHERE resolved_at IS NULL AND dedupe_key IS NOT NULL DO NOTHING
         RETURNING ${policyEventColumns}`, newId("pol"), input.ruleCode, laneId, input.summary, detailJson, at, key);
       if (row === null) {
+        if (friction) {
+          const previous = this.get<Pick<PolicyEvent, "summary" | "laneId" | "createdAt">>(`SELECT summary,
+            lane_id AS laneId, created_at AS createdAt FROM policy_event
+            WHERE rule_code = ? AND dedupe_key = ? AND resolved_at IS NULL`, input.ruleCode, key);
+          if (previous !== null && (previous.summary !== input.summary || previous.laneId !== laneId)) {
+            this.db.prepare(`UPDATE friction_entry SET summary = ?, lane_id = ?
+              WHERE kind = 'policy_break' AND status = 'open' AND rule_code = ? AND summary = ?
+                AND lane_id IS ? AND created_at = ?`)
+              .run(input.summary, laneId, input.ruleCode, previous.summary, previous.laneId, previous.createdAt);
+          }
+        }
         this.db.prepare(`UPDATE policy_event SET lane_id = ?, summary = ?, detail_json = ?
           WHERE rule_code = ? AND dedupe_key = ? AND resolved_at IS NULL
             AND (lane_id IS NOT ? OR summary IS NOT ? OR detail_json IS NOT ?)`)
@@ -1199,9 +1210,16 @@ export class PlatformStore {
   }
 
   resolveInactivePolicyEvents(ruleCode: string, activeKeys: readonly string[], at: string): void {
-    this.db.prepare(`UPDATE policy_event SET resolved_at = ? WHERE rule_code = ? AND resolved_at IS NULL
-      AND dedupe_key IS NOT NULL AND dedupe_key NOT IN (SELECT value FROM json_each(?))`)
-      .run(at, ruleCode, JSON.stringify(activeKeys));
+    this.transaction(() => {
+      this.db.prepare(`UPDATE policy_event SET resolved_at = ? WHERE rule_code = ? AND resolved_at IS NULL
+        AND dedupe_key IS NOT NULL AND dedupe_key NOT IN (SELECT value FROM json_each(?))`)
+        .run(at, ruleCode, JSON.stringify(activeKeys));
+      this.db.prepare(`UPDATE friction_entry SET status = 'kept'
+        WHERE kind = 'policy_break' AND status = 'open' AND rule_code = ? AND NOT EXISTS (
+          SELECT 1 FROM policy_event
+          WHERE rule_code = friction_entry.rule_code AND summary = friction_entry.summary AND resolved_at IS NULL
+        )`).run(ruleCode);
+    });
   }
 
   listOpenPolicyEvents(): PolicyEvent[] {

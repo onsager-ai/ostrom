@@ -122,7 +122,7 @@ small, .micro { font-size: 13px }
 .tag.good { background: var(--green-tint); border-color: color-mix(in srgb, var(--green) 26%, var(--surface)) }
 .tag.warn { background: var(--amber-tint); border-color: color-mix(in srgb, var(--amber) 26%, var(--surface)) }
 .tag.bad { background: var(--red-tint); border-color: color-mix(in srgb, var(--red) 26%, var(--surface)) }
-.shell { min-height: 100vh; min-height: 100dvh; display: grid; grid-template-rows: 48px 1fr auto }
+.shell { min-height: 100vh; min-height: 100dvh; display: grid; grid-template-rows: 48px 1fr }
 .app-header {
   position: sticky; top: 0; z-index: 2; display: flex; justify-content: space-between; align-items: center;
   gap: 8px; padding-inline: max(12px, env(safe-area-inset-left)) max(12px, env(safe-area-inset-right));
@@ -141,7 +141,7 @@ small, .micro { font-size: 13px }
 .app-header > .tag { text-transform: var(--label-case); letter-spacing: var(--label-track) }
 .rail { display: none }
 .tabbar {
-  position: sticky; bottom: 0; z-index: 2; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+  position: fixed; inset: auto 0 0; z-index: 2; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
   padding: 4px max(6px, env(safe-area-inset-right)) calc(4px + env(safe-area-inset-bottom)) max(6px, env(safe-area-inset-left));
   border-top: 1px solid var(--line); background: color-mix(in srgb, var(--surface) 88%, transparent);
   -webkit-backdrop-filter: saturate(180%) blur(16px); backdrop-filter: saturate(180%) blur(16px);
@@ -161,7 +161,7 @@ small, .micro { font-size: 13px }
   text-align: center; background: var(--accent); color: var(--on-accent); line-height: 18px;
   box-shadow: 0 0 0 2px var(--surface);
 }
-main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 18px 12px 24px; overflow-wrap: anywhere }
+main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 18px 12px calc(72px + env(safe-area-inset-bottom)); overflow-wrap: anywhere }
 .view, .stack { display: grid; gap: 12px; min-width: 0 }
 .view { gap: 14px }
 .hero { display: flex; align-items: end; justify-content: space-between; flex-wrap: wrap; gap: 8px }
@@ -209,6 +209,7 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 18px
 .meter > span { background: var(--accent); width: var(--fill); border-radius: inherit }
 .meter.warn > span { background: var(--amber) }
 .meter.good > span { background: var(--green) }
+.meter.bad > span { background: var(--red) }
 .meter.muted > span { background: var(--muted) }
 .inline-button, .filterbar button { min-height: 44px; border-radius: var(--r-control); font-weight: 500 }
 .inline-button { width: 100%; border: 0; padding: 6px 14px; text-align: left; background: transparent; color: var(--accent-text); font-weight: 600 }
@@ -299,6 +300,7 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 18px
 .lane-back:hover { text-decoration: underline; text-underline-offset: 3px }
 .lane-goal { font-family: var(--display); font-size: 19px; font-weight: 600; line-height: 1.35; letter-spacing: -.015em }
 .goal-history, .settled-prs { border-top: 1px solid var(--line) }
+.card-head + .settled-prs { border-top: 0 }
 .disclosure-label { min-height: 44px; padding: 11px 14px; color: var(--accent-text); cursor: pointer; font-weight: 500 }
 .disclosure-label:hover { background: var(--raised) }
 .history-heading { padding-inline: 14px }
@@ -311,6 +313,28 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 18px
 .timeline li .row-mark { position: absolute; top: 2px; left: 0; width: 27px; height: 27px; border-radius: 50%; z-index: 1 }
 .timeline .icon { width: 14px; height: 14px }
 .timeline time { display: block; margin-top: 2px; font-size: 13px; color: var(--muted) }
+.report-switch {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; width: min(100%, 460px);
+  padding: 4px; border: 1px solid var(--line); border-radius: var(--r-card); background: var(--surface);
+}
+.report-switch button { padding: 4px; border-color: transparent }
+.report-verdict { background: linear-gradient(145deg, var(--tint), var(--surface) 80%); border-color: var(--accent-line) }
+.report-verdict .card-head { flex-wrap: wrap; border-color: var(--accent-line); color: var(--accent-text) }
+.report-verdict .card-icon { background: var(--tint); border-color: var(--accent-line); color: var(--accent-text) }
+.report-verdict .metrics div + div { border-color: var(--accent-line) }
+.report-verdict .metrics dt { color: var(--ink); font-size: 15px; font-weight: 600 }
+.report-verdict .metrics dd { font-size: clamp(17px, 4.8vw, 29px); line-height: 1.2 }
+.report-verdict .metrics dd > span { display: block; margin-top: 4px; font-size: 13px; font-weight: 500; letter-spacing: normal }
+.report-verdict .metrics dd > .tag { display: inline-flex }
+.report-row, .report-score.matrix-row { min-height: 44px }
+.report-row .row-meta, .report-friction-row .row-meta { justify-content: space-between }
+.report-clamp { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden }
+.report-score { grid-template-columns: minmax(0, 2.8fr) minmax(22px, 1fr) minmax(40px, .8fr) minmax(48px, .85fr) }
+.report-score .tag { justify-self: start }
+.report-score .row-copy { display: grid; min-width: 0; gap: 3px }
+.report-score.matrix-head { min-height: 32px }
+.report-spend .metrics dt { font-size: 15px }
+.report-markdown pre { margin: 0; max-height: 24rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 15px/1.5 var(--mono) }
 @media (hover: none) {
   .lane-row:hover, a.detail-row:hover, a.matrix-row:hover, .inline-button:hover, .disclosure-label:hover { background: transparent }
 }
@@ -460,19 +484,24 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 18px
     return { time, label: dateOnly ? dayFormat.format(time) : `${dueFormat.format(time)}Z` };
   }
 
-  function activityByDay(linkedPrs, goals, now) {
-    const days = Array.from({ length: 7 }, (_, i) => ({ day: utcDay(now - (6 - i) * dayMs), prs: [], goals: [] }));
-    const byDay = new Map(days.map((entry) => [entry.day, entry]));
+  function mergedPullRequests(linkedPrs, since, until) {
     const merged = new Map();
     for (const pr of linkedPrs) {
       const time = Date.parse(pr.lastWakeAt);
-      if (pr.state !== "merged" || !Number.isFinite(time) || time > now + clockGraceMs || !byDay.has(utcDay(time))) continue;
+      if (pr.state !== "merged" || !(time >= since && time <= until)) continue;
       const key = `${pr.prHost}/${pr.repository}/${pr.number}`.toLowerCase();
-      if (!merged.has(key) || time > merged.get(key).time) {
-        merged.set(key, { time, label: text(pr.title) ?? `${pr.repository} #${pr.number}` });
-      }
+      if (!merged.has(key) || time > merged.get(key).time) merged.set(key, { pr, time });
     }
-    for (const item of merged.values()) byDay.get(utcDay(item.time)).prs.push(item);
+    return [...merged.values()];
+  }
+
+  function activityByDay(linkedPrs, goals, now) {
+    const days = Array.from({ length: 7 }, (_, i) => ({ day: utcDay(now - (6 - i) * dayMs), prs: [], goals: [] }));
+    const byDay = new Map(days.map((entry) => [entry.day, entry]));
+    for (const { pr, time } of mergedPullRequests(linkedPrs, Date.parse(days[0].day), Math.min(now + clockGraceMs,
+      Date.parse(days.at(-1).day) + dayMs - 1))) {
+      byDay.get(utcDay(time)).prs.push({ time, label: text(pr.title) ?? `${pr.repository} #${pr.number}` });
+    }
     for (const goal of goals) {
       const time = Date.parse(goal.completedAt);
       if (Number.isFinite(time) && time <= now + clockGraceMs) {
@@ -482,13 +511,18 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 18px
     return days;
   }
 
-  function laneRows(lanes, goals, decisions, alerts, week) {
+  function goalsForWeek(goals, week) {
     const current = new Map();
     for (const goal of goals) {
       if (goal.weekStart !== week) continue;
       const previous = current.get(goal.laneId);
       if (!previous || (previous.completedAt && !goal.completedAt)) current.set(goal.laneId, goal);
     }
+    return current;
+  }
+
+  function laneRows(lanes, goals, decisions, alerts, week) {
+    const current = goalsForWeek(goals, week);
     const atRisk = new Set(alerts.map(({ laneId }) => laneId));
     const needsOwner = new Set(decisions.map(({ laneId }) => laneId));
     return lanes.map((lane) => {
@@ -513,7 +547,7 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 18px
     const observedAt = Number.isFinite(generatedAt) ? generatedAt : now;
     const week = monday(observedAt);
     return {
-      now, observedAt, digest, health, friction, spend, week, decisions, alerts,
+      now, observedAt, health, friction, linkedPrs, goals, spend, week, decisions, alerts,
       lanes: laneRows(lanes, goals, decisions, alerts, week),
       laneNames: new Map(lanes.map(({ id, name }) => [id, name])),
       activity: activityByDay(linkedPrs, goals, observedAt),
@@ -601,18 +635,18 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 18px
   }
 
   // Only team rollups have observedAt. Session snapshots cannot describe team spend.
-  const amount = (summary) => summary?.status === "available" && summary.observedAt && Number.isFinite(summary.preferredUsd)
-    ? summary.preferredUsd : null;
+  const hasRollup = (summary) => summary?.status === "available" && Boolean(summary.observedAt);
+  const amount = (summary) => hasRollup(summary) && Number.isFinite(summary.preferredUsd) ? summary.preferredUsd : null;
   const money = (value) => value === null ? "Unavailable" : usd.format(value);
+  const spendPeriods = [["daily", "Today"], ["weekly", "This week"], ["monthly", "Month est."]];
+  const spendTotals = (spend) => group("dl", "metrics", ...spendPeriods.map(([period, label]) =>
+    group("div", "", el("dt", label), el("dd", money(amount(spend[period]))))));
 
   function spendCard({ spend, health }) {
-    const periods = [["daily", "Today"], ["weekly", "This week"], ["monthly", "Month est."]];
-    const snapshots = periods.map(([period]) => spend[period]);
+    const snapshots = spendPeriods.map(([period]) => spend[period]);
     const coverage = snapshots.some((summary) => amount(summary) !== null && summary.coverage === "partial") ? "Partial"
       : snapshots.every((summary) => amount(summary) !== null && summary.coverage === "complete") ? "Complete" : "Unknown";
-    const totals = group("dl", "metrics", ...periods.map(([period, label]) =>
-      group("div", "", el("dt", label), el("dd", money(amount(spend[period]))))));
-    const budget = [...periods].reverse().map(([period]) => health.budgets.find((item) =>
+    const budget = [...spendPeriods].reverse().map(([period]) => health.budgets.find((item) =>
       item.enabled && item.scopeKind === "team" && item.period === period)).find(Boolean);
     const budgetLine = group("div", "budget");
     if (budget) {
@@ -624,7 +658,7 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 18px
     } else {
       budgetLine.append(note("No team budget configured"));
     }
-    const panel = card("Spend", "wallet", body(totals, note("Semon · USD · month to date"), budgetLine,
+    const panel = card("Spend", "wallet", body(spendTotals(spend), note("Semon · USD · month to date"), budgetLine,
       note("By-model & by-lane breakdown: No data yet (awaiting Semon rollup)")));
     panel.firstChild.append(tag(coverage, { Complete: "good", Partial: "warn", Unknown: "muted" }[coverage]));
     return panel;
@@ -680,8 +714,13 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 18px
       legend.append(group("span", "lineup", el("i", "", `dot ${tone}`), el("span", `${count} ${label}`)));
     }
     const agents = new Map(health.agents.map((agent) => [agent.id, agent]));
-    const count = health.activeRuns.length;
-    const visibleRuns = showAllRuns ? health.activeRuns : health.activeRuns.slice(0, overviewRunLimit);
+    const runTime = (run) => Date.parse(run.startedAt ?? run.updatedAt) || 0;
+    const newestFirst = [...health.activeRuns].sort((a, b) => runTime(b) - runTime(a) || b.id.localeCompare(a.id));
+    const unique = new Map();
+    for (const run of newestFirst) if (!unique.has(run.agentId)) unique.set(run.agentId, run);
+    const activeRuns = [...unique.values()];
+    const count = activeRuns.length;
+    const visibleRuns = showAllRuns ? activeRuns : activeRuns.slice(0, overviewRunLimit);
     const runs = visibleRuns.map((run) => {
       const label = agents.get(run.agentId)?.label ?? run.externalRunRef;
       return group("li", "run-row", group("div", "", el("strong", label), modelBadge(run)),
@@ -830,6 +869,14 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 18px
     return waiting ? "waiting" : "active";
   }
 
+  function laneAttention({ decisions, alerts, health }) {
+    return {
+      pending: new Set(decisions.map(({ laneId }) => laneId)),
+      atRisk: new Set(alerts.map(({ laneId }) => laneId)),
+      waiting: new Set(health.agents.filter(({ status }) => status === "waiting").map(({ id }) => id)),
+    };
+  }
+
   const rowMark = (mark, tone = "muted") => group("span", `row-mark ${tone}`, icon(mark));
   const progress = (goal) => `${goal.metricCurrent ?? "—"}/${goal.metricTarget}`;
   function goalProgress(goal, tone) {
@@ -842,9 +889,7 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 18px
   let laneFilter = "all";
   let laneSearch = "";
   function lanesDirectory(ctx) {
-    const pending = new Set(ctx.decisions.map(({ laneId }) => laneId));
-    const atRisk = new Set(ctx.alerts.map(({ laneId }) => laneId));
-    const waiting = new Set(ctx.health.agents.filter(({ status }) => status === "waiting").map(({ id }) => id));
+    const { pending, atRisk, waiting } = laneAttention(ctx);
     const search = el("input", "", "lane-search");
     search.type = "search";
     search.placeholder = "Search lanes";
@@ -955,7 +1000,9 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 18px
       || b.number - a.number;
     const open = prs.filter((pr) => !isSettledPr(pr)).sort((a, b) => priority(a) - priority(b) || recent(a, b));
     const settled = prs.filter(isSettledPr).sort(recent);
-    return card("Recent PRs & Merges", "branch", group("div", "", ...open.map(prRow), ...(settled.length <= 5 ? settled.map(prRow) : [])),
+    const inlineSettled = settled.length <= 5 ? settled.map(prRow) : [];
+    const rows = open.length ? [group("div", "", ...open.map(prRow), ...inlineSettled)] : inlineSettled;
+    return card("Recent PRs & Merges", "branch", ...rows,
       ...(settled.length > 5 ? [disclosure(`settled-prs:${lane.id}`, `Merged & closed · ${settled.length}`, "settled-prs", ...settled.map(prRow))] : []));
   }
 
@@ -1034,22 +1081,232 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 18px
     return [top, summaryTiles(ctx), visuals, extras];
   }
 
-  function digestCard(title, digest) {
-    if (!digest) return card(title, "report", body(note(digest === null ? "Weekly digest unavailable." : "Loading weekly digest…")));
-    const { decisions, policyAlerts, interventionsByDay, openFrictionCount, topOpenFriction } = digest.sections;
-    const ownerDecisions = decisions.filter(({ authority }) => authority === "owner");
-    const items = [
-      plural(ownerDecisions.length, "owner decision"),
-      plural(policyAlerts.length, "policy alert"),
-      `${openFrictionCount} open friction`,
-    ];
-    const interventions = interventionsByDay.map(({ day, count }) => `${dayFormat.format(Date.parse(day))} (${count})`);
-    return card(title, "report", body(
-      note(`Generated ${digest.generatedAt.slice(0, 16).replace("T", " ")} UTC`),
-      el("p", items.join(" · ")),
-      ...(ownerDecisions.length ? [group("ul", "rows", ...ownerDecisions.map(({ title }) => el("li", title)))] : []),
-      ...(topOpenFriction ? [note(topOpenFriction.summary)] : []),
-      el("h3", "Owner interventions by UTC day"), note(interventions.join(" · "))));
+  const reportWindows = {
+    "01:00Z": { label: "Daily · 01:00Z", days: 1, shipped: "24h", spend: "daily", spendLabel: "Today" },
+    "13:00Z": { label: "Daily · 13:00Z", days: 1, shipped: "24h", spend: "daily", spendLabel: "Today" },
+    weekly: { label: "Weekly", days: 7, shipped: "7 days", spend: "weekly", spendLabel: "This week" },
+  };
+  const defaultReportWindow = "13:00Z";
+  const digestEndpoint = (window) => `/v1/digest?window=${window}`;
+  let reportWindow = defaultReportWindow;
+  let showAllShipped = false;
+  let showAllFriction = false;
+
+  function reportSwitcher() {
+    const controls = group("div", "filterbar report-switch", ...Object.entries(reportWindows).map(([key, { label }]) => {
+      const button = el("button", label);
+      button.type = "button";
+      button.dataset.focus = `report-window:${key}`;
+      button.setAttribute("aria-pressed", String(key === reportWindow));
+      button.onclick = () => {
+        if (key === reportWindow) return;
+        reportWindow = key;
+        showAllShipped = false;
+        render();
+        if (token || proxyAuth) void refreshRoute();
+      };
+      return button;
+    }));
+    controls.setAttribute("role", "group");
+    controls.setAttribute("aria-label", "Report window");
+    return controls;
+  }
+
+  function coverageBadge(...summaries) {
+    const rollups = summaries.filter(hasRollup);
+    if (rollups.length === 0) return tag("Unavailable");
+    if (rollups.some(({ coverage }) => coverage === "partial")) return tag("Partial", "warn");
+    if (rollups.length === summaries.length && rollups.every(({ coverage }) => coverage === "complete")) return tag("Complete", "good");
+    return tag("Unknown");
+  }
+
+  function reportVerdict(window, generatedAt, shipped, decisions, spend) {
+    const blockingLanes = new Set(decisions.map(({ laneId }) => laneId).filter(Boolean));
+    const value = amount(spend);
+    const total = (label, value, ...details) => group("div", "", el("dt", label), group("dd", "", el("strong", value), ...details));
+    const panel = card("Executive Verdict", "activity", body(group("dl", "metrics",
+      total("Shipped", shipped.length, el("span", window.shipped, "muted")),
+      total("Decisions", decisions.length, el("span", decisions.length ? `blocking ${plural(blockingLanes.size, "lane")}` : "none waiting", "muted")),
+      total("Spend", value === null ? "—" : usd.format(value), el("span", window.spendLabel, "muted"), coverageBadge(spend)))));
+    panel.className += " report-verdict";
+    const time = el("time", `${dueFormat.format(Date.parse(generatedAt))}Z`, "micro muted");
+    time.dateTime = generatedAt;
+    panel.firstChild.append(time);
+    return panel;
+  }
+
+  function reportDecisions({ decisions, now }, lanes) {
+    const rows = decisions.map((decision) => {
+      const due = decisionDue(decision);
+      const dueLabel = due ? `${due.time < now ? "Overdue" : "Due"} ${due.label}` : "No due date";
+      const dueTone = due && due.time < now ? "bad" : soon(due, now) ? "warn" : "muted";
+      const row = group("a", "detail-row report-row", rowMark("decision", "accent"),
+        group("span", "row-copy", group("span", "row-meta", tag(lanes.get(decision.laneId)?.name ?? "Team", "accent"), tag(dueLabel, dueTone)),
+          el("strong", decision.title), el("span", decision.recommendation, "report-clamp muted")));
+      row.href = "#decisions";
+      row.dataset.focus = `report-decision:${decision.id}`;
+      row.onclick = () => { decisionFilter = "all"; };
+      return row;
+    });
+    return card("Decisions Needed", "decision", rows.length ? group("div", "", ...rows) : body(note("No owner decisions waiting")));
+  }
+
+  function shippedItems({ linkedPrs, goals }, generatedAt, days) {
+    const end = Date.parse(generatedAt);
+    const since = end - days * dayMs;
+    const until = end + clockGraceMs;
+    const prs = mergedPullRequests(linkedPrs, since, until);
+    const completed = goals.flatMap((goal) => {
+      const time = Date.parse(goal.completedAt);
+      return time >= since && time <= until ? [{ goal, time }] : [];
+    });
+    return [...prs, ...completed].sort((a, b) => b.time - a.time);
+  }
+
+  function shippedRow({ pr, goal }, lanes) {
+    const lane = lanes.get(goal?.laneId);
+    const label = pr ? `${pr.repository} #${pr.number}` : lane?.name ?? "Lane unavailable";
+    const detail = pr ? pr.title : goal.statement;
+    const href = pr && githubPr(pr.url) ? pr.url : null;
+    const children = [rowMark(pr ? "branch" : "target", "good"),
+      group("span", "row-copy", el("strong", label), ...(detail ? [el("span", detail, "muted")] : [])),
+      tag(pr ? "Merged" : "Completed", "good")];
+    if (lane) {
+      const row = laneLink(lane, "detail-row report-row", ...children);
+      row.dataset.focus = `shipped-goal:${goal.id}`;
+      return row;
+    }
+    const row = group(href ? "a" : "div", "detail-row report-row", ...children);
+    if (href) {
+      row.href = href;
+      row.target = "_blank";
+      row.rel = "noopener noreferrer";
+      row.dataset.focus = href;
+    }
+    return row;
+  }
+
+  function reportToggle(list, expanded, label, onToggle) {
+    const button = el("button", label, "inline-button");
+    button.type = "button";
+    button.dataset.focus = `${list.id}-toggle`;
+    button.setAttribute("aria-expanded", String(expanded));
+    button.setAttribute("aria-controls", list.id);
+    button.onclick = () => { onToggle(); render(); };
+    return button;
+  }
+
+  function reportShipped(window, shipped, lanes) {
+    const title = `Shipped · ${window.shipped}`;
+    if (!shipped.length) return card(title, "branch", body(note("No merged PRs or completed goals recorded in this window yet")));
+    const visible = showAllShipped ? shipped : shipped.slice(0, 8);
+    const list = group("div", "", ...visible.map((item) => shippedRow(item, lanes)));
+    list.id = "report-shipped";
+    return card(title, "branch", list, ...(shipped.length > 8 ? [group("div", "card-foot", reportToggle(list, showAllShipped,
+      showAllShipped ? "Show fewer shipped items" : `Show all ${shipped.length} shipped items`, () => { showAllShipped = !showAllShipped; }))] : []));
+  }
+
+  function reportScorecard(lanes, ctx, week) {
+    const current = goalsForWeek(ctx.goals, week);
+    const { pending, atRisk, waiting } = laneAttention(ctx);
+    const priority = { risk: 0, waiting: 0, active: 1, paused: 2, archived: 2 };
+    const rows = lanes.map((lane) => {
+      const goal = current.get(lane.id);
+      const state = laneState(lane, goal, atRisk.has(lane.id), pending.has(lane.id) || waiting.has(lane.ownerAgentId));
+      return { lane, goal, state };
+    }).sort((a, b) => priority[a.state] - priority[b.state] || a.lane.priorityRank - b.lane.priorityRank
+      || a.lane.name.localeCompare(b.lane.name));
+    const columns = group("div", "matrix-row matrix-head report-score", ...["Lane", "", "Done", "Due"].map((label) => el("span", label)));
+    const listing = group("div", "", columns, ...rows.map(({ lane, goal, state }) => {
+      const [label, tone] = laneStates[state];
+      const plan = planFor(goal);
+      const due = dueDate(plan?.due) ?? dueDate(plan?.targetDate);
+      const done = Number.isFinite(goal?.metricCurrent) ? progress(goal) : "—";
+      return laneLink(lane, "matrix-row report-score",
+        group("span", "row-copy", el("strong", lane.name), tag(label, tone),
+          ...(goal ? [el("span", goal.statement, "report-clamp muted")] : [])),
+        ...(done === "—" ? [el("span")] : [meter(goal.metricCurrent, goal.metricTarget, `${goal.metricName}: ${done}`, tone)]),
+        el("span", done, "mono"), el("span", due ? dayFormat.format(due.time) : "—", "mono muted"));
+    }));
+    const panel = card("Weekly Scorecard", "target", rows.length ? listing : body(note("No lanes registered.")));
+    panel.firstChild.append(tag(`Week of ${dayFormat.format(Date.parse(week))}`));
+    return panel;
+  }
+
+  function reportSpend({ spend, health, friction, now }) {
+    const budgets = health.budgets.filter(({ enabled, scopeKind }) => enabled && scopeKind === "team");
+    const budgetRows = budgets.map((budget) => {
+      const measured = budget.spend?.status === "available" && Number.isFinite(budget.spend.preferredUsd)
+        ? budget.spend.preferredUsd : null;
+      const used = budget.spendSource === "semon" ? amount(spend[budget.period]) : measured;
+      const label = `${money(used)} / ${usd.format(budget.capUsd)} · ${budget.period} cap${budget.spendSource === "magpie" ? " · Magpie" : ""}`;
+      if (used === null) return group("div", "budget", note(label));
+      const tone = used >= budget.capUsd ? "bad" : used >= budget.capUsd * budget.warnPct / 100 ? "warn" : "accent";
+      return group("div", "budget", group("div", "row-meta", note(label),
+        ...(tone === "bad" ? [tag("Cap reached", tone)] : tone === "warn" ? [tag("Warning threshold reached", tone)] : [])),
+        meter(used, budget.capUsd, label, tone));
+    });
+    const visible = showAllFriction ? friction : friction.slice(0, 5);
+    const rows = visible.map(({ kind, summary, createdAt }) => {
+      const time = el("time", `${duration(now - Date.parse(createdAt))} ago`, "micro muted");
+      time.dateTime = createdAt;
+      return group("li", "report-friction-row", group("div", "row-meta", tag(kind.replaceAll("_", " "), "warn"), time), el("p", summary));
+    });
+    const list = group("ul", "rows", ...rows);
+    list.id = "report-friction";
+    const panel = card("Spend & Harness Friction", "wallet",
+      body(spendTotals(spend), note("Semon · USD · month to date"),
+        ...(budgetRows.length ? budgetRows : [note("No team budget configured")]),
+        note("By-model & by-lane breakdown: No data yet (awaiting Semon rollup)")),
+      group("div", "card-foot stack", el("h3", "Open Friction"), rows.length ? list : note("No open friction items"),
+        ...(friction.length > 5 ? [reportToggle(list, showAllFriction, showAllFriction ? "Show fewer friction items"
+          : `Show all ${friction.length} open friction items`, () => { showAllFriction = !showAllFriction; })] : []), note(stallSignal)));
+    panel.className += " report-spend";
+    panel.firstChild.append(coverageBadge(...spendPeriods.map(([period]) => spend[period])));
+    return panel;
+  }
+
+  function reportMarkdown(markdown) {
+    const pre = el("pre", markdown);
+    const feedback = note("");
+    feedback.setAttribute("role", "status");
+    const copy = el("button", "Copy Markdown", "inline-button");
+    copy.type = "button";
+    copy.dataset.focus = "copy-report-markdown";
+    copy.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(markdown);
+        feedback.textContent = "Markdown copied.";
+      } catch {
+        const selection = window.getSelection();
+        if (selection) {
+          selection.selectAllChildren(pre);
+          feedback.textContent = "Markdown selected. Use your device’s copy command.";
+        } else {
+          feedback.textContent = "Select and copy the Markdown below.";
+        }
+      }
+    };
+    return disclosure("report-markdown", "Raw Markdown Digest", "card report-markdown", body(copy, feedback, pre));
+  }
+
+  function reportView(result) {
+    const window = reportWindows[reportWindow];
+    const top = [el("h1", "Reports"), reportSwitcher()];
+    const reportDigest = result?.value;
+    if (!reportDigest || !ctx) {
+      const status = note(result?.error ? `Report unavailable. ${result.error.message}` : `Loading ${window.label} report…`);
+      status.setAttribute("role", "status");
+      return [...top, status, ...(reportDigest ? [reportMarkdown(reportDigest.markdown)] : [])];
+    }
+    const lanes = reportDigest.sections.lanes;
+    const generatedAt = reportDigest.generatedAt;
+    const shipped = shippedItems(ctx, generatedAt, window.days);
+    const lanesById = new Map(lanes.map((lane) => [lane.id, lane]));
+    return [...top, ...(result.error ? [note(`Stale report data. ${result.error.message}`)] : []),
+      reportVerdict(window, generatedAt, shipped, ctx.decisions, ctx.spend[window.spend]),
+      group("div", "grid", reportDecisions(ctx, lanesById), reportShipped(window, shipped, lanesById)),
+      reportScorecard(lanes, ctx, monday(Date.parse(generatedAt))), reportSpend(ctx), reportMarkdown(reportDigest.markdown)];
   }
 
   const routes = {
@@ -1073,7 +1330,7 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 18px
   }
   function routeEndpoint() {
     const selected = route();
-    if (selected === "report") return "/v1/digest?window=weekly";
+    if (selected === "report") return digestEndpoint(reportWindow);
     if (selected !== "lane") return null;
     const slug = laneSlug();
     return slug === null ? null : `/v1/lanes/${encodeURIComponent(slug)}/detail`;
@@ -1104,9 +1361,7 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 18px
     const focus = active?.dataset?.focus;
     const result = routeResult?.endpoint === routeEndpoint() ? routeResult : undefined;
     const nodes = selected === "lane" ? laneDetailView(result, laneSlug(), Date.now())
-      : selected === "report" ? [el("h1", "Reports"), note("The full Executive Report arrives in Slice 3."),
-        group("div", "grid", ...(ctx ? [digestCard("Daily digest · 13:00Z", ctx.digest)] : []),
-          digestCard("Weekly digest", result?.value ?? (result?.error ? null : undefined)))]
+      : selected === "report" ? reportView(result)
         : !ctx ? [el("h1", routes[selected][0])]
           : selected === "decisions" ? decisionsView(ctx)
             : selected === "lanes" ? lanesDirectory(ctx) : overview(ctx);
@@ -1163,13 +1418,14 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 18px
     banner.textContent = message;
     banner.hidden = false;
   }
-  async function refreshRoute() {
+  async function refreshRoute(defaultDigest) {
     const endpoint = routeEndpoint();
-    if (endpoint === null || routeRequest?.endpoint === endpoint) return;
+    if (endpoint === null) { routeRequest = undefined; return; }
+    if (routeRequest?.endpoint === endpoint) return;
     const request = { endpoint };
     routeRequest = request;
     try {
-      const value = await read(endpoint);
+      const value = await (endpoint === digestEndpoint(defaultReportWindow) && defaultDigest ? defaultDigest : read(endpoint));
       if (routeRequest === request) routeResult = { endpoint, value };
     } catch (error) {
       if (routeRequest === request) {
@@ -1184,17 +1440,16 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 18px
     }
   }
   async function refresh() {
-    void refreshRoute();
     try {
+      const defaultDigest = read(digestEndpoint(defaultReportWindow));
+      void refreshRoute(defaultDigest);
       const [digest, health, friction, linkedPrs, goals, daily, weekly, monthly] = await Promise.all([
-        read("/v1/digest?window=13:00Z"),
+        defaultDigest,
         read("/v1/health/summary"),
         read("/v1/friction?status=open"),
         read("/v1/prs"),
         read("/v1/goals"),
-        read("/v1/spend/summary?period=daily&source=semon"),
-        read("/v1/spend/summary?period=weekly&source=semon"),
-        read("/v1/spend/summary?period=monthly&source=semon"),
+        ...spendPeriods.map(([period]) => read(`/v1/spend/summary?period=${period}&source=semon&rollupOnly=true`)),
       ]);
       const now = Date.now();
       ctx = context({ digest, health, friction, linkedPrs, goals, spend: { daily, weekly, monthly } }, now);
