@@ -341,7 +341,7 @@ const migrations = [
   `,
   (db: DatabaseSync) => {
     if (!db.prepare("PRAGMA table_info(goal)").all().some(({ name }) => name === "completed_at")) {
-      // Nothing references goal(id), so the rebuild can leave foreign keys enabled.
+      // At this schema version nothing references goal(id), so foreign keys can stay enabled.
       db.exec(`
         CREATE TABLE goal_new (
           id TEXT PRIMARY KEY,
@@ -370,6 +370,33 @@ const migrations = [
     db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_goal_active_lane_week ON goal (lane_id, week_start)
       WHERE completed_at IS NULL`);
   },
+  `
+  CREATE TABLE IF NOT EXISTS goal_audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lane_id TEXT NOT NULL REFERENCES lane(id),
+    goal_id TEXT NOT NULL REFERENCES goal(id),
+    action TEXT NOT NULL CHECK (action IN ('set', 'complete')),
+    caller_thread TEXT NOT NULL,
+    detail_json TEXT NOT NULL CHECK (json_valid(detail_json)),
+    created_at TEXT NOT NULL
+  ) STRICT;
+
+  CREATE TRIGGER IF NOT EXISTS goal_audit_log_no_update BEFORE UPDATE ON goal_audit_log
+  BEGIN
+    SELECT RAISE(ABORT, 'goal audit events are append-only');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS goal_audit_log_no_delete BEFORE DELETE ON goal_audit_log
+  BEGIN
+    SELECT RAISE(ABORT, 'goal audit events are append-only');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS goal_audit_log_no_replace BEFORE INSERT ON goal_audit_log
+  WHEN EXISTS (SELECT 1 FROM goal_audit_log WHERE id = NEW.id)
+  BEGIN
+    SELECT RAISE(ABORT, 'goal audit events are append-only');
+  END;
+  `,
 ];
 
 // Read the version with the writer lock held so simultaneous opens cannot apply the same migration.

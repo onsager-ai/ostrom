@@ -71,6 +71,8 @@ test("serves the loopback page and proxies authenticated GETs only", async () =>
       assert.equal((await read(url, "/v1/hosts", { ...headers, origin: "https://foreign.example" })).status, 403);
       assert.equal((await read(url, "/v1/decisions", headers, "POST")).status, 405);
       assert.equal((await read(url, "/v1/spend/rollups", headers, "POST")).status, 405);
+      assert.equal((await read(url, "/v1/lanes/platform/goal/self", headers, "POST")).status, 405);
+      assert.equal((await read(url, "/v1/goals/audit?lane=platform", headers)).status, 404);
       assert.equal((await read(url, "/", {}, "HEAD")).status, 405);
       assert.equal((await read(url, "/v1/budgets", headers, "PUT")).status, 405);
       assert.equal((await read(url, "/v1/lanes/platform", headers, "PUT")).status, 405);

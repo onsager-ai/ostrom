@@ -7,7 +7,7 @@ import { dirname, isAbsolute, join } from "node:path";
 import { readSpendSummary } from "./budget-observer.ts";
 import { generateOwnerDigest, isDigestWindow } from "./digest.ts";
 import { readPlatformHealth } from "./policy-observer.ts";
-import { DecisionStateError, PlatformNotFoundError, PlatformValidationError } from "./store.ts";
+import { DecisionStateError, PlatformForbiddenError, PlatformNotFoundError, PlatformValidationError } from "./store.ts";
 import type {
   AnswerDecisionInput, CompleteGoalOptions, CreateDecisionInput, CreateLaneInput, DecisionFilter, PlatformStore,
   RecordFrictionInput, SetGoalInput, SupersedeDecisionInput, UpdateLaneInput, UpsertBudgetInput,
@@ -112,12 +112,28 @@ export async function dispatchPlatformRequest(
     if (get) return ok(store.listLanes());
     if (post) return created(store.createLane(await body<CreateLaneInput>()));
   }
-  const lane = /^\/v1\/lanes\/([^/]+)(?:\/(goal|goal\/complete))?$/.exec(route);
+  if (get && route === "/v1/goals/audit") {
+    const slug = query.get("lane");
+    if (slug === null) return ok(store.listGoalAuditEvents());
+    const entry = store.getLaneBySlug(slug);
+    if (entry === null) throw new PlatformNotFoundError(`lane ${slug} not found`);
+    return ok(store.listGoalAuditEvents(entry.id));
+  }
+  const lane = /^\/v1\/lanes\/([^/]+)(?:\/(goal|goal\/complete|goal\/self))?$/.exec(route);
   const laneAction = lane?.[2];
   if (lane?.[1] !== undefined && ((laneAction === undefined && (get || put))
-    || (put && laneAction === "goal") || (post && laneAction === "goal/complete"))) {
+    || (put && laneAction === "goal") || (post && (laneAction === "goal/complete" || laneAction === "goal/self")))) {
     const slug = decodeURIComponent(lane[1]);
     if (put && laneAction === undefined) return ok(store.updateLane(slug, await body<UpdateLaneInput>()));
+    if (laneAction === "goal/self") {
+      // The private socket authenticates the OS account. The caller supplies its thread for the owner check and audit.
+      const input = await body<{ callerThread: string } & (
+        { action: "set" } & Omit<SetGoalInput, "laneId"> | { action: "complete" } & CompleteGoalOptions
+      )>();
+      if (input.action === "set") return ok(store.setGoalAsOwner(slug, input.callerThread, input));
+      if (input.action === "complete") return ok(store.completeGoalAsOwner(slug, input.callerThread, input));
+      throw new PlatformValidationError("action must be set or complete");
+    }
     const entry = store.getLaneBySlug(slug);
     if (entry === null) throw new PlatformNotFoundError(`lane ${slug} not found`);
     if (get) return ok({ ...entry, goal: store.getLatestGoal(entry.id) });
@@ -189,6 +205,7 @@ function apiError(error: unknown): PlatformApiError {
     return new PlatformApiError(400, error.message);
   }
   if (error instanceof PlatformNotFoundError) return new PlatformApiError(404, error.message);
+  if (error instanceof PlatformForbiddenError) return new PlatformApiError(403, error.message);
   if (error instanceof DecisionStateError) return new PlatformApiError(409, error.message);
   if (error instanceof Error) {
     const status = sqliteStatus(error);

@@ -9,7 +9,7 @@ import type { TestContext } from "node:test";
 import { PlatformApiClient, PlatformApiError, startPlatformApiServer } from "./api.ts";
 import { PlatformStore } from "./store.ts";
 import { spendWindow } from "./types.ts";
-import type { Decision, DecisionVerification, Goal, Lane, SpendRollup } from "./types.ts";
+import type { Decision, DecisionVerification, Goal, GoalAuditEvent, Lane, SpendRollup } from "./types.ts";
 
 const entry = {
   title: "Release approval", authority: "owner", urgency: "blocking_today",
@@ -160,6 +160,37 @@ test("the goal completion route accepts requests with and without a JSON body", 
   assert.ok(closedReplacement.completedAt);
   assert.equal(closedReplacement.id, replacement.id);
   assert.equal(closedReplacement.metricCurrent, replacement.metricCurrent);
+});
+
+test("the owner goal route enforces lane ownership and exposes a filterable audit log", async (t) => {
+  const { client, store } = await fixture(t);
+  const owner = store.upsertAgent({ id: "manager", role: "manager", connectorKind: "t3", hostId: "east",
+    externalRef: "environment/thread-1", label: "Manager", status: "active" });
+  const lane = store.createLane({ slug: "releases", name: "Releases", ownerAgentId: owner.id });
+  store.createLane({ slug: "unowned", name: "Unowned" });
+  const path = `/v1/lanes/${lane.slug}/goal/self`;
+  const input = { action: "set", callerThread: "thread-1", statement: "Ship the release", metricName: "Releases", metricTarget: 2 };
+  await assert.rejects(client.request("GET", path), { status: 404 });
+  await assert.rejects(client.request("POST", path, { ...input, callerThread: "foreign-thread" }), { status: 403 });
+  await assert.rejects(client.request("POST", "/v1/lanes/unowned/goal/self", input), { status: 403 });
+  await assert.rejects(client.request("POST", "/v1/lanes/missing/goal/self", input), { status: 404 });
+  await assert.rejects(client.request("POST", path, { ...input, action: "delete" }), { status: 400 });
+  await assert.rejects(client.request("POST", path, { ...input, callerThread: 1 }), { status: 400 });
+  assert.deepEqual(await client.request("GET", "/v1/goals/audit"), []);
+
+  type OwnerResult = { goal: Goal; audit: GoalAuditEvent };
+  const set = await client.request<OwnerResult>("POST", path, input);
+  assert.equal(set.goal.laneId, lane.id);
+  assert.equal(set.audit.action, "set");
+  const complete = await client.request<OwnerResult>("POST", path,
+    { action: "complete", callerThread: owner.externalRef, weekStart: set.goal.weekStart, metricCurrent: 2 });
+  assert.equal(complete.goal.id, set.goal.id);
+  assert.equal(complete.goal.metricCurrent, 2);
+  assert.equal(complete.audit.action, "complete");
+  assert.deepEqual(await client.request("GET", "/v1/goals/audit"), [complete.audit, set.audit]);
+  assert.deepEqual(await client.request("GET", `/v1/goals/audit?lane=${lane.slug}`), [complete.audit, set.audit]);
+  assert.deepEqual(await client.request("GET", "/v1/goals/audit?lane=unowned"), []);
+  await assert.rejects(client.request("GET", "/v1/goals/audit?lane=missing"), { status: 404 });
 });
 
 test("registry, policy, friction, budget, agent, and run endpoints use the same stored records", async (t) => {

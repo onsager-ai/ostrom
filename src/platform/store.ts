@@ -12,12 +12,13 @@ import {
 } from "./types.ts";
 import type {
   Agent, Budget, Decision, DecisionEvent, DecisionStatus, DecisionVerification, FrictionEntry,
-  FrictionStatus, Goal, JsonValue, Lane, LaneStatus, PolicyEvent, PolicyRule, Run, SpendRollup, SpendSnapshot,
+  FrictionStatus, Goal, GoalAuditEvent, JsonValue, Lane, LaneStatus, PolicyEvent, PolicyRule, Run, SpendRollup, SpendSnapshot,
   GitHubPrCheck, GitHubPrObservation, SemonSessionIdentity, SpendSummaryFilter, T3HostState, T3PendingWait, T3ThreadPr,
 } from "./types.ts";
 
 export class PlatformValidationError extends Error {}
 export class PlatformNotFoundError extends Error {}
+export class PlatformForbiddenError extends Error {}
 
 export class DecisionStateError extends Error {
   constructor(id: string, status: DecisionStatus, action: string) {
@@ -98,6 +99,8 @@ const goalColumns = `id, lane_id AS laneId, statement, metric_name AS metricName
   metric_unit AS metricUnit, metric_current AS metricCurrent, metric_target AS metricTarget,
   week_start AS weekStart, weekly_plan_json AS weeklyPlan, approved_decision_id AS approvedDecisionId,
   completed_at AS completedAt, updated_at AS updatedAt`;
+const goalAuditColumns = `id, lane_id AS laneId, goal_id AS goalId, action, caller_thread AS callerThread,
+  detail_json AS detail, created_at AS createdAt`;
 const decisionColumns = `id, lane_id AS laneId, authority, category, urgency, title,
   evidence_json AS evidence, recommendation, options_json AS options, status, requested_by AS requestedBy,
   decided_by AS decidedBy, answer_json AS answer, rationale, superseded_by_id AS supersededById,
@@ -127,6 +130,7 @@ const runColumns = `id, agent_id AS agentId, lane_id AS laneId, connector_kind A
 type JsonColumns<T, K extends keyof T> = Omit<T, K> & Record<K, string>;
 type DecisionRow = JsonColumns<Decision, "evidence" | "options" | "answer">;
 type GoalRow = JsonColumns<Goal, "weeklyPlan">;
+type GoalAuditRow = JsonColumns<GoalAuditEvent, "detail">;
 type DecisionEventRow = JsonColumns<DecisionEvent, "detail">;
 type PolicyRuleRow = JsonColumns<Omit<PolicyRule, "enabled"> & { enabled: number }, "params">;
 type PolicyEventRow = JsonColumns<PolicyEvent, "detail">;
@@ -294,6 +298,8 @@ export class PlatformStore {
   }
 
   private transaction<T>(operation: () => T): T {
+    // Nested store operations share the outer transaction and its rollback.
+    if (this.db.isTransaction) return operation();
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const result = operation();
@@ -553,6 +559,53 @@ export class PlatformStore {
     });
   }
 
+  assertLaneOwnerThread(slug: string, callerThread: string): Lane {
+    nonEmpty(callerThread, "callerThread");
+    if (callerThread !== callerThread.trim()) throw new PlatformValidationError("callerThread must be trimmed");
+    const lane = this.getLaneBySlug(slug);
+    if (lane === null) throw new PlatformNotFoundError(`lane ${slug} not found`);
+    const owner = lane.ownerAgentId === null ? null : this.getAgent(lane.ownerAgentId);
+    if (owner === null) throw new PlatformForbiddenError(`lane ${slug} has no registered owner agent`);
+    const ref = owner.externalRef;
+    const slash = ref.indexOf("/");
+    const threadId = slash >= 0 ? ref.slice(slash + 1) : ref;
+    if (callerThread !== threadId && callerThread !== ref) {
+      throw new PlatformForbiddenError(`callerThread does not match the owner of lane ${slug}`);
+    }
+    return lane;
+  }
+
+  setGoalAsOwner(slug: string, callerThread: string, input: Omit<SetGoalInput, "laneId">): { goal: Goal; audit: GoalAuditEvent } {
+    return this.transaction(() => {
+      const lane = this.assertLaneOwnerThread(slug, callerThread);
+      const goal = this.setGoal({ ...input, laneId: lane.id });
+      return { goal, audit: this.appendGoalAudit(goal, "set", callerThread) };
+    });
+  }
+
+  completeGoalAsOwner(slug: string, callerThread: string, options?: CompleteGoalOptions): { goal: Goal; audit: GoalAuditEvent } {
+    return this.transaction(() => {
+      const lane = this.assertLaneOwnerThread(slug, callerThread);
+      const goal = this.completeGoal(lane.id, options);
+      return { goal, audit: this.appendGoalAudit(goal, "complete", callerThread) };
+    });
+  }
+
+  private appendGoalAudit(goal: Goal, action: GoalAuditEvent["action"], callerThread: string): GoalAuditEvent {
+    const { statement, metricName, metricUnit, metricCurrent, metricTarget, weekStart, completedAt } = goal;
+    const detail = { statement, metricName, metricUnit, metricCurrent, metricTarget, weekStart, completedAt };
+    const row = this.write<GoalAuditRow>(`INSERT INTO goal_audit_log (lane_id, goal_id, action, caller_thread, detail_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?) RETURNING ${goalAuditColumns}`, goal.laneId, goal.id, action, callerThread,
+    encode(detail, "detail"), goal.updatedAt);
+    return { ...row, detail };
+  }
+
+  listGoalAuditEvents(laneId?: string): GoalAuditEvent[] {
+    return this.all<GoalAuditRow>(`SELECT ${goalAuditColumns} FROM goal_audit_log
+      WHERE lane_id = coalesce(?, lane_id) ORDER BY id DESC`, laneId ?? null)
+      .map((row) => ({ ...row, detail: decode(row.detail) }));
+  }
+
   getLatestGoal(laneId: string): Goal | null {
     const row = this.get<GoalRow>(`SELECT ${goalColumns} FROM goal WHERE lane_id = ?
       ORDER BY (completed_at IS NOT NULL), week_start DESC, updated_at DESC, rowid DESC LIMIT 1`, laneId);
@@ -791,6 +844,10 @@ export class PlatformStore {
 
   listAgents(): Agent[] {
     return this.all<Agent>(`SELECT ${agentColumns} FROM agent ORDER BY id`);
+  }
+
+  getAgent(id: string): Agent | null {
+    return this.get<Agent>(`SELECT ${agentColumns} FROM agent WHERE id = ?`, id);
   }
 
   upsertRun(input: UpsertRunInput): Run {

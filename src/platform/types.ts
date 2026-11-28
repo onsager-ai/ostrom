@@ -58,6 +58,16 @@ export interface Goal {
   updatedAt: string;
 }
 
+export interface GoalAuditEvent {
+  id: number;
+  laneId: string;
+  goalId: string;
+  action: "set" | "complete";
+  callerThread: string;
+  detail: JsonValue;
+  createdAt: string;
+}
+
 export interface Decision {
   id: string;
   laneId: string | null;

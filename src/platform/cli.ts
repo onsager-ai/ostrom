@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import type { Readable } from "node:stream";
+import { text } from "node:stream/consumers";
 import { inspect } from "node:util";
 
 import {
@@ -42,6 +44,11 @@ const usage = `usage: ostrom-platform [--db <path> | --socket <path>] [--json] <
   goal set <slug> --statement TEXT --metric NAME --target N [--current N] [--unit TEXT]
                   [--week YYYY-MM-DD] [--plan JSON] [--approved-decision ID]
   goal complete <slug> [--week YYYY-MM-DD] [--current N]
+  goal audit [--lane <slug>]
+  goal-self set <slug> --thread <threadId> --statement TEXT --metric NAME --target N
+                       [--current N] [--unit TEXT] [--week YYYY-MM-DD] [--plan JSON] [--approved-decision ID]
+  goal-self complete <slug> --thread <threadId> [--week YYYY-MM-DD] [--current N]
+  goal-self --stdin-json
   policy list
   budget set --scope team|lane|agent [--scope-id ID] --period daily|weekly|monthly
              --cap-usd N --warn-pct N [--source semon|magpie] [--enabled true|false]
@@ -69,6 +76,7 @@ type Call = (method: "GET" | "POST" | "PUT", path: string, body?: unknown) => Pr
 type Result = { data: unknown; exitCode?: number; text?: string };
 
 interface CliIO {
+  stdin?: Readable;
   stdout?: { write(text: string): unknown };
   stderr?: { write(text: string): unknown };
   env?: NodeJS.ProcessEnv;
@@ -84,7 +92,7 @@ function parse(argv: readonly string[]): { args: string[]; flags: Map<string, st
     const arg = argv[index]!;
     if (arg === "--json") {
       json = true;
-    } else if (arg.startsWith("--")) {
+    } else if (arg.startsWith("--") && !(arg === "--stdin-json" && args[0] === "goal-self")) {
       const equals = arg.indexOf("=");
       const name = equals < 0 ? arg : arg.slice(0, equals);
       const value = equals < 0 ? (name === "--browser" ? "" : argv[++index]) : arg.slice(equals + 1);
@@ -101,6 +109,8 @@ function parse(argv: readonly string[]): { args: string[]; flags: Map<string, st
   return { args, flags, json };
 }
 
+const goalSetFlags = "statement metric target current unit week plan approved-decision";
+const goalCompleteFlags = "week current";
 const commands = new Map<string, { operands: number; flags: string }>([
   ["decision create", { operands: 0, flags: "title authority category urgency recommendation requested-by lane evidence options" }],
   ["decision list", { operands: 0, flags: "status authority urgency lane" }],
@@ -112,8 +122,12 @@ const commands = new Map<string, { operands: number; flags: string }>([
   ["lane list", { operands: 0, flags: "" }],
   ["lane show", { operands: 1, flags: "" }],
   ["lane update", { operands: 1, flags: "name status owner-agent priority" }],
-  ["goal set", { operands: 1, flags: "statement metric target current unit week plan approved-decision" }],
-  ["goal complete", { operands: 1, flags: "week current" }],
+  ["goal set", { operands: 1, flags: goalSetFlags }],
+  ["goal complete", { operands: 1, flags: goalCompleteFlags }],
+  ["goal audit", { operands: 0, flags: "lane" }],
+  ["goal-self set", { operands: 1, flags: `thread ${goalSetFlags}` }],
+  ["goal-self complete", { operands: 1, flags: `thread ${goalCompleteFlags}` }],
+  ["goal-self --stdin-json", { operands: 0, flags: "" }],
   ["budget set", { operands: 0, flags: "scope scope-id period cap-usd warn-pct source enabled" }],
   ["run link-semon", { operands: 1, flags: "session-uid" }],
   ["budget list", { operands: 0, flags: "" }],
@@ -179,13 +193,67 @@ function withQuery(path: string, values: Record<string, string | undefined>): st
   return query.size === 0 ? path : `${path}?${query}`;
 }
 
-async function execute(call: Call, command: string, operand: string, flags: Map<string, string>): Promise<Result> {
+function flagReaders(flags: Map<string, string>) {
   const optional = (name: string) => flags.get(`--${name}`);
   const required = (name: string) => {
     const value = optional(name);
     if (value === undefined || value.trim() === "") throw new UsageError(`--${name} is required`);
     return value;
   };
+  return { optional, required };
+}
+
+function goalFields(action: "set" | "complete", flags: Map<string, string>) {
+  const { optional, required } = flagReaders(flags);
+  const progress = { weekStart: optional("week"), metricCurrent: parseNumber(optional("current"), "current") };
+  if (action === "complete") return progress;
+  return {
+    ...progress, statement: required("statement"), metricName: required("metric"),
+    metricTarget: parseNumber(required("target"), "target"), metricUnit: optional("unit"),
+    weeklyPlan: parseJson(optional("plan"), "plan"), approvedDecisionId: optional("approved-decision"),
+  };
+}
+
+function goalSelfRequest(action: "set" | "complete", slug: string, flags: Map<string, string>, sessionThread?: string) {
+  const { optional, required } = flagReaders(flags);
+  const thread = optional("thread");
+  if (sessionThread && thread !== undefined && thread !== sessionThread) {
+    throw new UsageError("--thread must match T3CODE_THREAD_ID");
+  }
+  const callerThread = sessionThread || required("thread");
+  if (callerThread !== callerThread.trim()) throw new UsageError("--thread must be trimmed");
+  return { action, slug, callerThread, ...goalFields(action, flags) };
+}
+
+export function parseGoalSelfArgs(argv: readonly string[], sessionThread?: string) {
+  const action = argv[0];
+  if (action !== "set" && action !== "complete") throw new UsageError("expected set or complete");
+  const { args, flags } = parse(["goal-self", ...argv]);
+  validateCommand(args, flags);
+  return goalSelfRequest(action, args[2]!, flags, sessionThread);
+}
+
+type GoalSelfRequest = { action: "set" | "complete"; slug: string; callerThread: string };
+
+async function readGoalSelfRequest(stdin: Readable): Promise<GoalSelfRequest> {
+  const payload = parseJson(await text(stdin), "stdin-json");
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    throw new UsageError("--stdin-json requires a JSON object");
+  }
+  const { action, slug, callerThread } = payload as Partial<GoalSelfRequest>;
+  if ((action !== "set" && action !== "complete") || typeof slug !== "string" || slug.trim() === ""
+    || typeof callerThread !== "string" || callerThread === "" || callerThread !== callerThread.trim()) {
+    throw new UsageError("--stdin-json requires action (set or complete), slug and callerThread");
+  }
+  return { ...payload, action, slug, callerThread };
+}
+
+function callGoalSelf(call: Call, { slug, ...body }: GoalSelfRequest): Promise<unknown> {
+  return call("POST", `/v1/lanes/${encodeURIComponent(slug)}/goal/self`, body);
+}
+
+async function execute(call: Call, command: string, operand: string, flags: Map<string, string>, stdin: Readable): Promise<Result> {
+  const { optional, required } = flagReaders(flags);
   const laneId = async () => {
     const slug = optional("lane");
     if (slug === undefined) return undefined;
@@ -256,15 +324,17 @@ async function execute(call: Call, command: string, operand: string, flags: Map<
         priorityRank: parseNumber(optional("priority"), "priority"),
       }) };
     case "goal set":
-      return { data: await call("PUT", `/v1/lanes/${id}/goal`, {
-        statement: required("statement"), metricName: required("metric"), metricTarget: parseNumber(required("target"), "target"),
-        metricCurrent: parseNumber(optional("current"), "current"), metricUnit: optional("unit"), weekStart: optional("week"),
-        weeklyPlan: parseJson(optional("plan"), "plan"), approvedDecisionId: optional("approved-decision"),
-      }) };
+      return { data: await call("PUT", `/v1/lanes/${id}/goal`, goalFields("set", flags)) };
     case "goal complete":
-      return { data: await call("POST", `/v1/lanes/${id}/goal/complete`, {
-        weekStart: optional("week"), metricCurrent: parseNumber(optional("current"), "current"),
-      }) };
+      return { data: await call("POST", `/v1/lanes/${id}/goal/complete`, goalFields("complete", flags)) };
+    case "goal audit":
+      return { data: await call("GET", withQuery("/v1/goals/audit", { lane: optional("lane") })) };
+    case "goal-self set":
+      return { data: await callGoalSelf(call, goalSelfRequest("set", operand, flags)) };
+    case "goal-self complete":
+      return { data: await callGoalSelf(call, goalSelfRequest("complete", operand, flags)) };
+    case "goal-self --stdin-json":
+      return { data: await callGoalSelf(call, await readGoalSelfRequest(stdin)) };
     case "budget set": {
       const enabled = optional("enabled");
       if (enabled !== undefined && enabled !== "true" && enabled !== "false") throw new UsageError("--enabled must be true or false");
@@ -395,7 +465,7 @@ async function authorizeT3(host: PlatformT3Host, pairingCode: string, tokensDir:
 }
 
 export async function runPlatformCli(argv: readonly string[], io: CliIO = {}): Promise<number> {
-  const { stdout = process.stdout, stderr = process.stderr, env = process.env } = io;
+  const { stdin = process.stdin, stdout = process.stdout, stderr = process.stderr, env = process.env } = io;
   if (argv.length === 1 && argv[0] === "--help") {
     stdout.write(`${usage}\n`);
     return 0;
@@ -527,7 +597,7 @@ export async function runPlatformCli(argv: readonly string[], io: CliIO = {}): P
       const call: Call = store === undefined
         ? (method, path, data) => client.request(method, path, data)
         : async (method, path, data) => (await dispatchPlatformRequest(store, method, path, async () => data)).body;
-      const result = await execute(call, command, args[2] ?? "", flags);
+      const result = await execute(call, command, args[2] ?? "", flags, stdin);
       stdout.write(`${json ? JSON.stringify(result.data) : result.text ?? inspect(result.data, { depth: null, colors: false })}\n`);
       return result.exitCode ?? 0;
     } finally {

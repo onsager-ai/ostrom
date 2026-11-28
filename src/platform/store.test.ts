@@ -7,7 +7,7 @@ import { test } from "node:test";
 import type { TestContext } from "node:test";
 
 import { unavailableSpendSource } from "./spend.ts";
-import { DecisionStateError, PlatformNotFoundError, PlatformStore, PlatformValidationError } from "./store.ts";
+import { DecisionStateError, PlatformForbiddenError, PlatformNotFoundError, PlatformStore, PlatformValidationError } from "./store.ts";
 import type { CreateDecisionInput } from "./store.ts";
 import type { SpendRollup } from "./types.ts";
 
@@ -45,14 +45,18 @@ function disk(t: TestContext): { store: PlatformStore; db: DatabaseSync; path: s
   return { store, db, path };
 }
 
+function rewindMigrations(db: DatabaseSync, fromVersion: number): void {
+  db.prepare("DELETE FROM platform_schema_version WHERE version >= ?").run(fromVersion);
+}
+
 test("the host URL migration preserves existing rows and later URL updates", (t) => {
   const { store, db, path } = disk(t);
   const host = { hostId: "east", label: "East", mcpUrl: "http://127.0.0.1:8000/mcp",
     originNamespace: null, connectionState: "connected" } as const;
   const original = store.upsertT3HostState(host);
   assert.equal(original.webUrl, null);
-  db.exec(`ALTER TABLE t3_host_state DROP COLUMN web_url;
-    DELETE FROM platform_schema_version WHERE version >= 5`);
+  db.exec("ALTER TABLE t3_host_state DROP COLUMN web_url");
+  rewindMigrations(db, 5);
   const upgraded = PlatformStore.open(path);
   const webUrl = "https://t3-east.example";
   try {
@@ -76,8 +80,8 @@ test("the PR draft migration preserves existing checks and persists draft change
   const check = { headSha: "a".repeat(40), isDraft: false, rollupState: "failure", totalChecks: 2, failedChecks: 1 } as const;
   store.recordGitHubPrCheck("org/repo", 7, check);
   const before = store.listGitHubPrChecks();
-  db.exec(`ALTER TABLE github_pr_check DROP COLUMN is_draft;
-    DELETE FROM platform_schema_version WHERE version >= 6`);
+  db.exec("ALTER TABLE github_pr_check DROP COLUMN is_draft");
+  rewindMigrations(db, 6);
   const upgraded = PlatformStore.open(path);
   try {
     assert.deepEqual(upgraded.listGitHubPrChecks(), before);
@@ -87,7 +91,7 @@ test("the PR draft migration preserves existing checks and persists draft change
   } finally {
     upgraded.close();
   }
-  db.exec("DELETE FROM platform_schema_version WHERE version >= 6");
+  rewindMigrations(db, 6);
   const reopened = PlatformStore.open(path);
   try {
     assert.equal(reopened.listGitHubPrChecks()[0]?.isDraft, true);
@@ -100,8 +104,8 @@ test("the PR draft migration preserves existing checks and persists draft change
 
 test("the goal stale policy migration seeds existing databases", (t) => {
   const { db, path } = disk(t);
-  db.exec(`DELETE FROM policy_rule WHERE code = 'goal_stale';
-    DELETE FROM platform_schema_version WHERE version >= 7`);
+  db.exec("DELETE FROM policy_rule WHERE code = 'goal_stale'");
+  rewindMigrations(db, 7);
   const upgraded = PlatformStore.open(path);
   try {
     const rule = upgraded.listPolicyRules().find(({ code }) => code === "goal_stale");
@@ -118,7 +122,8 @@ test("the goal stale policy migration seeds existing databases", (t) => {
 test("the spend rollup migration is idempotent and preserves per-session snapshots", (t) => {
   const { store, db, path } = disk(t);
   const snapshot = store.upsertSpendSnapshot({ sessionUid: "session-1", source: "semon", usdEst: 8 });
-  db.exec("DROP TABLE spend_rollup; DELETE FROM platform_schema_version WHERE version >= 8");
+  db.exec("DROP TABLE spend_rollup");
+  rewindMigrations(db, 8);
   const rollup: SpendRollup = {
     scopeKind: "team", scopeId: null, period: "daily", source: "semon", since: "2026-11-27T00:00:00.000Z",
     until: "2026-11-27T13:00:00.000Z", observedAt: "2026-11-27T13:00:00.000Z", sessionCount: 2,
@@ -134,7 +139,7 @@ test("the spend rollup migration is idempotent and preserves per-session snapsho
   } finally {
     upgraded.close();
   }
-  db.exec("DELETE FROM platform_schema_version WHERE version >= 8");
+  rewindMigrations(db, 8);
   const reopened = PlatformStore.open(path);
   try {
     assert.deepEqual(reopened.getSpendRollup(rollup, "2026-11-27T00:00:00Z"), rollup);
@@ -166,10 +171,11 @@ test("the goal completion migration preserves existing goals and their foreign k
   const input = { laneId: lane.id, statement: "Ship the release", metricName: "Releases", metricUnit: "releases",
     metricCurrent: 0, metricTarget: 1, weekStart: "2026-11-23", weeklyPlan: ["Test", "Ship"], approvedDecisionId: decision.id };
   const original = store.setGoal(input);
-  db.exec(`DROP INDEX idx_goal_active_lane_week;
+  db.exec(`DROP TABLE goal_audit_log;
+    DROP INDEX idx_goal_active_lane_week;
     ALTER TABLE goal DROP COLUMN completed_at;
-    CREATE UNIQUE INDEX goal_by_lane_week ON goal (lane_id, week_start);
-    DELETE FROM platform_schema_version WHERE version >= 9`);
+    CREATE UNIQUE INDEX goal_by_lane_week ON goal (lane_id, week_start)`);
+  rewindMigrations(db, 9);
 
   const upgraded = PlatformStore.open(path);
   try {
@@ -179,7 +185,7 @@ test("the goal completion migration preserves existing goals and their foreign k
     const completed = upgraded.completeGoal(lane.id);
     const replacement = upgraded.setGoal(input);
     assert.notEqual(replacement.id, original.id);
-    db.exec("DELETE FROM platform_schema_version WHERE version = 9");
+    rewindMigrations(db, 9);
     const reopened = PlatformStore.open(path);
     try {
       assert.deepEqual(reopened.listGoals(), [replacement, completed]);
@@ -189,6 +195,81 @@ test("the goal completion migration preserves existing goals and their foreign k
   } finally {
     upgraded.close();
   }
+});
+
+const ownerGoalInput = { statement: "Ship the release", metricName: "Releases", metricUnit: "releases",
+  metricCurrent: 0, metricTarget: 2, weekStart: "2026-11-23" };
+
+function laneWithOwner(store: PlatformStore, slug: string, externalRef: string) {
+  const owner = store.upsertAgent({ id: `${slug}-owner`, role: "manager", connectorKind: "t3", hostId: "east",
+    externalRef, label: "Manager", status: "active" });
+  return store.createLane({ slug, name: slug, ownerAgentId: owner.id });
+}
+
+test("the goal audit migration is idempotent and protects existing rows from mutation", (t) => {
+  const { store, db, path } = disk(t);
+  const lane = laneWithOwner(store, "releases", "environment/thread-1");
+  const original = store.setGoal({ ...ownerGoalInput, laneId: lane.id });
+  db.exec("DROP TABLE goal_audit_log");
+  rewindMigrations(db, 10);
+  const upgraded = PlatformStore.open(path);
+  t.after(() => upgraded.close());
+  assert.deepEqual(upgraded.listGoals(), [original]);
+  assert.deepEqual(upgraded.listGoalAuditEvents(), []);
+  assert.equal(db.prepare("SELECT strict FROM pragma_table_list WHERE name = 'goal_audit_log'").get()?.["strict"], 1);
+  assert.deepEqual(db.prepare("PRAGMA foreign_key_list(goal_audit_log)").all().map(({ table }) => table).sort(), ["goal", "lane"]);
+  const { audit } = upgraded.completeGoalAsOwner(lane.slug, "thread-1");
+  assert.throws(() => db.exec("UPDATE goal_audit_log SET caller_thread = 'other'"), /append-only/);
+  assert.throws(() => db.exec("DELETE FROM goal_audit_log"), /append-only/);
+  assert.throws(() => db.exec("INSERT OR REPLACE INTO goal_audit_log SELECT * FROM goal_audit_log"), /append-only/);
+  rewindMigrations(db, 10);
+  const reopened = PlatformStore.open(path);
+  t.after(() => reopened.close());
+  assert.deepEqual(reopened.listGoalAuditEvents(), [audit]);
+});
+
+test("lane owners can set and complete goals with either exact thread reference", (t) => {
+  const store = memory(t);
+  const lane = laneWithOwner(store, "releases", "environment/thread-1");
+  const other = laneWithOwner(store, "docs", "thread-2");
+  const unowned = store.createLane({ slug: "triage", name: "Triage" });
+  for (const [slug, caller] of [[lane.slug, "thread-2"], [other.slug, "thread-1"], [unowned.slug, "thread-1"]] as const) {
+    assert.throws(() => store.setGoalAsOwner(slug, caller, ownerGoalInput), PlatformForbiddenError);
+    assert.throws(() => store.completeGoalAsOwner(slug, caller), PlatformForbiddenError);
+  }
+  assert.throws(() => store.setGoalAsOwner(lane.slug, " ", ownerGoalInput), PlatformValidationError);
+  assert.throws(() => store.setGoalAsOwner(lane.slug, " thread-1", ownerGoalInput), PlatformValidationError);
+  assert.throws(() => store.setGoalAsOwner("missing", "thread-1", ownerGoalInput), PlatformNotFoundError);
+  assert.deepEqual(store.listGoals(), []);
+  assert.deepEqual(store.listGoalAuditEvents(), []);
+
+  const set = store.setGoalAsOwner(lane.slug, "thread-1", ownerGoalInput);
+  assert.deepEqual(set.audit, { id: 1, laneId: lane.id, goalId: set.goal.id, action: "set", callerThread: "thread-1",
+    detail: { ...ownerGoalInput, completedAt: null }, createdAt: set.goal.updatedAt });
+  const complete = store.completeGoalAsOwner(lane.slug, "environment/thread-1", { weekStart: set.goal.weekStart, metricCurrent: 2 });
+  assert.equal(complete.goal.id, set.goal.id);
+  assert.equal(complete.goal.metricCurrent, 2);
+  assert.ok(complete.goal.completedAt);
+  assert.deepEqual(complete.audit, { id: 2, laneId: lane.id, goalId: set.goal.id, action: "complete",
+    callerThread: "environment/thread-1", detail: { ...ownerGoalInput, metricCurrent: 2, completedAt: complete.goal.completedAt },
+    createdAt: complete.goal.updatedAt });
+  const another = store.setGoalAsOwner(other.slug, "thread-2", ownerGoalInput);
+  assert.deepEqual(store.listGoalAuditEvents(lane.id), [complete.audit, set.audit]);
+  assert.deepEqual(store.listGoalAuditEvents(), [another.audit, complete.audit, set.audit]);
+});
+
+test("a failed goal audit insert rolls back goal changes", (t) => {
+  const { store, db } = disk(t);
+  const lane = laneWithOwner(store, "releases", "thread-1");
+  db.exec(`CREATE TRIGGER reject_audit BEFORE INSERT ON goal_audit_log
+    BEGIN SELECT RAISE(ABORT, 'audit insert failed'); END`);
+  assert.throws(() => store.setGoalAsOwner(lane.slug, "thread-1", ownerGoalInput), /audit insert failed/);
+  assert.deepEqual(store.listGoals(), []);
+  const goal = store.setGoal({ ...ownerGoalInput, laneId: lane.id });
+  assert.throws(() => store.setGoalAsOwner(lane.slug, "thread-1", { ...ownerGoalInput, metricCurrent: 1 }), /audit insert failed/);
+  assert.throws(() => store.completeGoalAsOwner(lane.slug, "thread-1", { metricCurrent: 2 }), /audit insert failed/);
+  assert.deepEqual(store.listGoals(), [goal]);
+  assert.deepEqual(store.listGoalAuditEvents(), []);
 });
 
 test("decisions validate input, persist evidence, filter the inbox, and record the request", (t) => {
