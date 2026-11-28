@@ -44,6 +44,32 @@ function disk(t: TestContext): { store: PlatformStore; db: DatabaseSync; path: s
   return { store, db, path };
 }
 
+test("the host URL migration preserves existing rows and later URL updates", (t) => {
+  const { store, db, path } = disk(t);
+  const host = { hostId: "east", label: "East", mcpUrl: "http://127.0.0.1:8000/mcp",
+    originNamespace: null, connectionState: "connected" } as const;
+  const original = store.upsertT3HostState(host);
+  assert.equal(original.webUrl, null);
+  db.exec(`ALTER TABLE t3_host_state DROP COLUMN web_url;
+    DELETE FROM platform_schema_version WHERE version = (SELECT max(version) FROM platform_schema_version)`);
+  const upgraded = PlatformStore.open(path);
+  const webUrl = "https://t3-east.example";
+  try {
+    assert.deepEqual(upgraded.listT3HostStates(), [original]);
+    assert.equal(upgraded.upsertT3HostState({ ...host, webUrl }).webUrl, webUrl);
+  } finally {
+    upgraded.close();
+  }
+  const reopened = PlatformStore.open(path);
+  try {
+    assert.equal(reopened.listT3HostStates()[0]?.webUrl, webUrl);
+    assert.equal(reopened.upsertT3HostState({ ...host, connectionState: "stale" }).webUrl, webUrl);
+    assert.equal(reopened.upsertT3HostState({ ...host, webUrl: null }).webUrl, null);
+  } finally {
+    reopened.close();
+  }
+});
+
 test("decisions validate input, persist evidence, filter the inbox, and record the request", (t) => {
   const store = memory(t);
   const lane = store.createLane({ slug: "product", name: "Product" });

@@ -1,5 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
-// Once applied, these statements are immutable. Add a migration to change the schema.
+// Add a migration for existing databases when a table definition changes.
 const migrations = [
   `
   CREATE TABLE lane (
@@ -216,6 +216,7 @@ const migrations = [
     host_id TEXT PRIMARY KEY,
     label TEXT NOT NULL,
     mcp_url TEXT NOT NULL,
+    web_url TEXT,
     origin_namespace TEXT,
     environment_id TEXT,
     server_version TEXT,
@@ -301,6 +302,11 @@ const migrations = [
   VALUES ('budget_cap', 'budget_cap', 'docs/platform.md §5', 'observe', '{}', 1,
     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
   `,
+  (db: DatabaseSync) => {
+    if (!db.prepare("PRAGMA table_info(t3_host_state)").all().some(({ name }) => name === "web_url")) {
+      db.exec("ALTER TABLE t3_host_state ADD COLUMN web_url TEXT");
+    }
+  },
 ];
 
 // Read the version with the writer lock held so simultaneous opens cannot apply the same migration.
@@ -312,10 +318,11 @@ export function migrate(db: DatabaseSync): void {
     const current = Number(row?.["version"]);
     if (current > migrations.length) throw new Error(`unsupported platform schema version ${current}`);
     const record = db.prepare("INSERT INTO platform_schema_version (version) VALUES (?)");
-    for (const [index, sql] of migrations.entries()) {
+    for (const [index, migration] of migrations.entries()) {
       const version = index + 1;
       if (version <= current) continue;
-      db.exec(sql);
+      if (typeof migration === "string") db.exec(migration);
+      else migration(db);
       record.run(version);
     }
     db.exec("COMMIT");

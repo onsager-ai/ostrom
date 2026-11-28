@@ -17,7 +17,7 @@ test("all four MCP results project only the allowed status fields", async () => 
   const publicUrl = "https://status.example.com";
   const host = {
     hostId: "node-east-1", label: "Personal Workstation", originNamespace: "t3-private-origin",
-    environmentId: "private_environment_9342", mcpUrl: "https://node-east.tail000000.ts.net/mcp",
+    environmentId: "private_environment_9342", mcpUrl: "https://t3-mcp.example/mcp", webUrl: "https://t3-east.example",
     connectionState: "connected", tokenExpiresAt: "2030-12-31T00:00:00.000Z", lastError: "OAuth pairing device expired",
   };
   const wait = { threadId: "thread-private-AbCdEf", requestId: "request-private-123", questions: ["Raw question about the outage"] };
@@ -57,8 +57,8 @@ test("all four MCP results project only the allowed status fields", async () => 
     ["/v1/health/summary", health], ["/v1/spend/summary", { status: "available", debug: decision.evidence }],
     ["/v1/lanes", [lane, privateLane]], ["/v1/decisions?status=pending", [
       decision, { ...decision, title: "Investigate node-east-1 and /var/lib/private",
-        recommendation: "Review https://node-east.tail000000.ts.net with bob",
-        options: ["Open synthetic-org/stealth-repo", "Read thread-private-AbCdEf", "Fetch /tmp/local.log",
+        recommendation: "Review https://t3-east.example",
+        options: ["Open synthetic-org/stealth-repo", "Read thread-private-AbCdEf", "Fetch /tmp/local.log", "Confirm T3-EAST.EXAMPLE",
           { label: "Unsafe option", metadata: decision.evidence }] },
       { ...decision, title: `Discuss ${decision.evidence.account}`,
         recommendation: `Check the private meeting phrase with ${lane.ownerAgentId}`,
@@ -101,14 +101,14 @@ test("all four MCP results project only the allowed status fields", async () => 
   const server = await startStatusMcp({ publicUrl, socketPath, stateDir });
   try {
     const banned = [
-      host.hostId, host.label, host.originNamespace, host.environmentId, host.mcpUrl, "node-east.tail000000.ts.net",
+      host.hostId, host.label, host.originNamespace, host.environmentId, host.mcpUrl, "t3-mcp.example", host.webUrl, "t3-east.example",
       host.tokenExpiresAt, host.lastError, wait.threadId, wait.requestId, wait.questions[0]!, pr.threadId,
       pr.repository, pr.headBranch, pr.lastWakeSummary, agent.id, agent.label, agent.externalRef, decision.laneId,
       decision.requestedBy, decision.decidedBy, decision.evidence.path, decision.evidence.bearer, decision.evidence.account,
       "private meeting phrase", lane.ownerAgentId,
       goal.weeklyPlan.path, goal.approvedDecisionId, "Raw digest", "Private alert body", "private-custom-rule",
       "alpha-private-token", "/var/lib/private", "/tmp/local.log", bearer,
-      "hostId", "mcpUrl", "originNamespace", "environmentId", "requestedBy", "decidedBy", "weeklyPlan", "evidence",
+      "hostId", "mcpUrl", "webUrl", "originNamespace", "environmentId", "requestedBy", "decidedBy", "weeklyPlan", "evidence",
     ];
     async function call(name: string, args = {}) {
       const response = await fetch(server.url, {
@@ -143,7 +143,8 @@ test("all four MCP results project only the allowed status fields", async () => 
       title: decision.title, recommendation: decision.recommendation, options: ["Proceed", "Wait", "[redacted]", "[redacted]"],
       createdAt: decision.createdAt,
     });
-    assert.equal(decisions[1].options.length, 3);
+    assert.equal(decisions[1].recommendation, "[redacted]");
+    assert.equal(decisions[1].options[3], "[redacted]");
     assert.equal(decisions[2].title, "[redacted]");
     assert.equal(decisions[2].recommendation, "[redacted]");
     assert.deepEqual(decisions[2].options, ["[redacted]", "[redacted]", "[redacted]"]);

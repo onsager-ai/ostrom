@@ -29,6 +29,7 @@ export class DecisionStateError extends Error {
 type OptionalFields<T, K extends keyof T> = Omit<T, K> & Partial<Pick<T, K>>;
 
 export type CreateLaneInput = OptionalFields<Omit<Lane, "createdAt" | "updatedAt">, "id" | "status" | "ownerAgentId" | "priorityRank">;
+export type UpdateLaneInput = Partial<Pick<Lane, "name" | "status" | "ownerAgentId" | "priorityRank">>;
 export type SetGoalInput = OptionalFields<Omit<Goal, "updatedAt">, "id" | "metricUnit" | "metricCurrent" | "weekStart" | "weeklyPlan" | "approvedDecisionId">;
 export type CreateDecisionInput = Pick<Decision, "authority" | "category" | "urgency" | "title" | "recommendation" | "requestedBy">
   & Partial<Pick<Decision, "id" | "laneId" | "evidence" | "options">>;
@@ -73,7 +74,7 @@ export interface T3ThreadSnapshot {
   prs?: T3PrInput[];
 }
 
-const t3HostColumns = `host_id AS hostId, label, mcp_url AS mcpUrl, origin_namespace AS originNamespace,
+const t3HostColumns = `host_id AS hostId, label, mcp_url AS mcpUrl, web_url AS webUrl, origin_namespace AS originNamespace,
   environment_id AS environmentId, server_version AS serverVersion, token_expires_at AS tokenExpiresAt,
   connection_state AS connectionState, last_reconciled_at AS lastReconciledAt, last_event_at AS lastEventAt,
   last_error AS lastError, consecutive_failures AS consecutiveFailures,
@@ -409,6 +410,21 @@ export class PlatformStore {
   getLaneBySlug(slug: string): Lane | null {
     pathIdentifier(slug, "lane slug");
     return this.get<Lane>(`SELECT ${laneColumns} FROM lane WHERE slug = ?`, slug);
+  }
+
+  updateLane(slug: string, { name, status, ownerAgentId, priorityRank }: UpdateLaneInput): Lane {
+    pathIdentifier(slug, "lane slug");
+    if (name !== undefined) nonEmpty(name, "name");
+    if (status !== undefined) choice(status, laneStatuses, "status");
+    if (ownerAgentId !== undefined && ownerAgentId !== null) nonEmpty(ownerAgentId, "ownerAgentId");
+    if (priorityRank !== undefined) number(priorityRank, "priorityRank", { integer: true });
+    const row = this.get<Lane>(`UPDATE lane SET name = coalesce(?, name), status = coalesce(?, status),
+      owner_agent_id = CASE WHEN ? THEN ? ELSE owner_agent_id END, priority_rank = coalesce(?, priority_rank),
+      updated_at = ? WHERE slug = ? RETURNING ${laneColumns}`,
+    name ?? null, status ?? null, Number(ownerAgentId !== undefined), ownerAgentId ?? null, priorityRank ?? null,
+    this.now(), slug);
+    if (row === null) throw new PlatformNotFoundError(`lane ${slug} not found`);
+    return row;
   }
 
   getLaneById(id: string): Lane | null {
@@ -767,19 +783,19 @@ export class PlatformStore {
 
   upsertT3HostState(input: T3HostUpdate): T3HostState {
     const current = this.get<T3HostRow>(`SELECT ${t3HostColumns} FROM t3_host_state WHERE host_id = ?`, input.hostId);
-    const state = { environmentId: null, serverVersion: null, tokenExpiresAt: null, lastReconciledAt: null,
+    const state = { webUrl: null, environmentId: null, serverVersion: null, tokenExpiresAt: null, lastReconciledAt: null,
       lastEventAt: null, lastError: null, consecutiveFailures: 0, partialCoverage: false, ...current, ...input };
-    const row = this.write<T3HostRow>(`INSERT INTO t3_host_state (host_id, label, mcp_url, origin_namespace,
+    const row = this.write<T3HostRow>(`INSERT INTO t3_host_state (host_id, label, mcp_url, web_url, origin_namespace,
       environment_id, server_version, token_expires_at, connection_state, last_reconciled_at, last_event_at,
-      last_error, consecutive_failures, partial_coverage, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      last_error, consecutive_failures, partial_coverage, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (host_id) DO UPDATE SET label = excluded.label, mcp_url = excluded.mcp_url,
-        origin_namespace = excluded.origin_namespace, environment_id = excluded.environment_id,
+        web_url = excluded.web_url, origin_namespace = excluded.origin_namespace, environment_id = excluded.environment_id,
         server_version = excluded.server_version, token_expires_at = excluded.token_expires_at,
         connection_state = excluded.connection_state, last_reconciled_at = excluded.last_reconciled_at,
         last_event_at = excluded.last_event_at, last_error = excluded.last_error,
         consecutive_failures = excluded.consecutive_failures, partial_coverage = excluded.partial_coverage,
         updated_at = excluded.updated_at
-      RETURNING ${t3HostColumns}`, state.hostId, state.label, state.mcpUrl, state.originNamespace,
+      RETURNING ${t3HostColumns}`, state.hostId, state.label, state.mcpUrl, state.webUrl, state.originNamespace,
     state.environmentId, state.serverVersion, state.tokenExpiresAt, state.connectionState,
     state.lastReconciledAt, state.lastEventAt, state.lastError, state.consecutiveFailures, Number(state.partialCoverage), this.now());
     return { ...row, partialCoverage: row.partialCoverage === 1 };

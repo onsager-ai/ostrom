@@ -10,7 +10,7 @@ import { readPlatformHealth } from "./policy-observer.ts";
 import { DecisionStateError, PlatformNotFoundError, PlatformValidationError } from "./store.ts";
 import type {
   AnswerDecisionInput, CreateDecisionInput, CreateLaneInput, DecisionFilter, PlatformStore,
-  RecordFrictionInput, SetGoalInput, SupersedeDecisionInput, UpsertBudgetInput,
+  RecordFrictionInput, SetGoalInput, SupersedeDecisionInput, UpdateLaneInput, UpsertBudgetInput,
 } from "./store.ts";
 import type { FrictionStatus, SpendSummaryFilter } from "./types.ts";
 
@@ -108,8 +108,9 @@ export async function dispatchPlatformRequest(
     if (post) return created(store.createLane(await body<CreateLaneInput>()));
   }
   const lane = /^\/v1\/lanes\/([^/]+)(\/goal)?$/.exec(route);
-  if (lane?.[1] !== undefined && ((get && lane[2] === undefined) || (put && lane[2] !== undefined))) {
+  if (lane?.[1] !== undefined && (put || (get && lane[2] === undefined))) {
     const slug = decodeURIComponent(lane[1]);
+    if (put && lane[2] === undefined) return ok(store.updateLane(slug, await body<UpdateLaneInput>()));
     const entry = store.getLaneBySlug(slug);
     if (entry === null) throw new PlatformNotFoundError(`lane ${slug} not found`);
     if (get) return ok({ ...entry, goal: store.getLatestGoal(entry.id) });

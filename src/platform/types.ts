@@ -194,6 +194,7 @@ export interface T3HostState {
   hostId: string;
   label: string;
   mcpUrl: string;
+  webUrl: string | null;
   originNamespace: string | null;
   environmentId: string | null;
   serverVersion: string | null;
