@@ -164,6 +164,19 @@ test("registry, policy, friction, budget, agent, and run endpoints use the same 
   assert.deepEqual(await client.request("GET", "/v1/budgets"), [budget]);
   const agent = store.upsertAgent({ id: "manager", role: "manager", laneId: lane.id, connectorKind: "t3",
     hostId: "host", externalRef: "external-agent", label: "Manager", status: "idle" });
+  const lanePath = "/v1/lanes/platform";
+  const update = { name: "Platform Work", status: "paused", ownerAgentId: agent.id, priorityRank: 5 };
+  const updatedLane = await client.request<Lane>("PUT", lanePath, update);
+  assert.deepEqual(updatedLane, { ...lane, ...update, updatedAt: updatedLane.updatedAt });
+  assert.deepEqual(await client.request("GET", lanePath), { ...updatedLane, goal });
+  const cleared = await client.request<Lane>("PUT", lanePath, { ownerAgentId: null });
+  assert.deepEqual(cleared, { ...updatedLane, ownerAgentId: null, updatedAt: cleared.updatedAt });
+  for (const invalid of [{ name: " " }, { status: "blocked" }, { ownerAgentId: "" }, { ownerAgentId: "missing" },
+    { priorityRank: 0.5 }, { priorityRank: null }]) {
+    await assert.rejects(client.request("PUT", lanePath, invalid), { status: 400 });
+  }
+  await assert.rejects(client.request("PUT", "/v1/lanes/missing", update), { status: 404 });
+  assert.deepEqual(await client.request("GET", lanePath), { ...cleared, goal });
   const run = store.upsertRun({ id: "run", agentId: agent.id, laneId: lane.id, connectorKind: "t3", hostId: "host",
     externalRunRef: "external-run", status: "completed" });
   assert.deepEqual(await client.request("GET", "/v1/agents"), [agent]);

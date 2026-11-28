@@ -38,6 +38,7 @@ const usage = `usage: ostrom-platform [--db <path> | --socket <path>] [--json] <
   lane create --slug SLUG --name NAME [--priority N] [--owner-agent ID]
   lane list
   lane show <slug>
+  lane update <slug> [--name TEXT] [--status active|paused|archived] [--owner-agent ID] [--priority N]
   goal set <slug> --statement TEXT --metric NAME --target N [--current N] [--unit TEXT]
                   [--week YYYY-MM-DD] [--plan JSON] [--approved-decision ID]
   policy list
@@ -107,6 +108,7 @@ const commands = new Map<string, { operands: number; flags: string }>([
   ["lane create", { operands: 0, flags: "slug name priority owner-agent" }],
   ["lane list", { operands: 0, flags: "" }],
   ["lane show", { operands: 1, flags: "" }],
+  ["lane update", { operands: 1, flags: "name status owner-agent priority" }],
   ["goal set", { operands: 1, flags: "statement metric target current unit week plan approved-decision" }],
   ["budget set", { operands: 0, flags: "scope scope-id period cap-usd warn-pct source enabled" }],
   ["run link-semon", { operands: 1, flags: "session-uid" }],
@@ -242,6 +244,11 @@ async function execute(call: Call, command: string, operand: string, flags: Map<
       return { data: await call("GET", "/v1/lanes") };
     case "lane show":
       return { data: await call("GET", `/v1/lanes/${id}`) };
+    case "lane update":
+      return { data: await call("PUT", `/v1/lanes/${id}`, {
+        name: optional("name"), status: optional("status"), ownerAgentId: optional("owner-agent"),
+        priorityRank: parseNumber(optional("priority"), "priority"),
+      }) };
     case "goal set":
       return { data: await call("PUT", `/v1/lanes/${id}/goal`, {
         statement: required("statement"), metricName: required("metric"), metricTarget: parseNumber(required("target"), "target"),

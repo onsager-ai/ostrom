@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync, sign } from "node:crypto";
-import { chmod, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { request } from "node:http";
 import type { OutgoingHttpHeaders } from "node:http";
 import { tmpdir } from "node:os";
@@ -51,85 +51,17 @@ test("serves the loopback page and proxies authenticated GETs only", async () =>
       assert.equal(page.headers["referrer-policy"], "no-referrer");
       assert.equal(page.headers["content-security-policy"],
         "default-src 'none'; connect-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'");
-      assert.doesNotMatch(page.body, /<(?:link|script|img)\b[^>]*https?:\/\//i);
+      assert.doesNotMatch(page.body, /<(?:link|img)\b|<script\b[^>]*\bsrc\s*=/i);
       assert.doesNotMatch(page.body, /\binnerHTML\b/);
-      assert.match(page.body, /GitHub PR CI/);
-      assert.match(page.body, /Closed PRs \(\$\{closedGithubPrs\.length\}\)/);
-      assert.match(page.body, /const disclosure = element\("details"\)/);
-      assert.match(page.body, /restoreClosedPrsDisclosure\(disclosure\)/);
-      assert.match(page.body, /Budgets &amp; Spend/);
-      assert.match(page.body, /Semon connector not enabled on this host/);
-      assert.match(page.body, /No open watched PRs checked yet/);
-      assert.match(page.body, /No lanes or decisions seeded yet on this host\./);
-      assert.match(page.body, /No pending decisions\./);
-      assert.match(page.body, /No lanes seeded yet on this host\./);
-      assert.match(page.body, /No active runs, open waits, or PR wakes\./);
+      const fontSizes = [...page.body.matchAll(/\bfont-size:\s*([^;}]*)/g)];
+      assert(fontSizes.length > 0);
+      for (const [, size] of fontSizes) {
+        assert.match(size ?? "", /^\d+px\s*$/);
+        assert(Number.parseInt(size!, 10) >= 15, `text size ${size} is too small`);
+      }
       assert.match(page.body, /aria-label="Theme"/);
       for (const theme of ["auto", "light", "dark"]) assert(page.body.includes(`data-theme="${theme}"`));
-      assert.match(page.body, /document\.documentElement\.dataset\.theme/);
-      assert.match(page.body, /Estimated USD.*Reported USD/);
-      assert.match(page.body, /Billed USD.*Coverage/);
-      assert.match(page.body, /history\.replaceState/);
       assert(!page.body.includes("<script>invalid()</script>"));
-
-      const script = /<script type="module">([\s\S]*?)<\/script>/.exec(page.body)?.[1];
-      assert(script);
-      runInNewContext(`${script}
-        Date.now = () => Date.parse("2026-11-27T13:00:00.000Z");
-        assert.equal(relativeTime("2026-11-27T12:59:42.000Z"), "18s ago");
-        assert.equal(relativeTime("2026-11-27T12:57:00.000Z"), "3 min ago");
-        assert.equal(relativeExpiry("2026-12-27T13:00:00.000Z"), "expires in 30d");
-        assert.equal(relativeExpiry("2026-11-25T13:00:00.000Z"), "expired 2d ago");
-        assert.equal(relativeTime("invalid date"), "unknown time");
-        assert.equal(relativeExpiry("invalid date"), "expiry unknown");
-        const validExpiry = "2026-12-27T13:00:00.000Z";
-        const hosts = ["invalid date", null, validExpiry].map((tokenExpiresAt) => ({
-          connectionState: "connected", tokenExpiresAt,
-        }));
-        const hostSummary = summarizeHosts(hosts);
-        assert.equal(hostSummary.degraded, 2);
-        assert.equal(hostSummary.unknownExpiry, 2);
-        assert.equal(hostSummary.hostError, false);
-        assert.equal(hostSummary.soonestExpiry, validExpiry);
-        const alerts = [{ summary: "Repeated run failure", ruleCode: "two_failure_stop" }];
-        const entry = { ...alerts[0], kind: "policy_break" };
-        assert.equal(isEchoedPolicyBreak(entry, alerts), true);
-        assert.equal(isEchoedPolicyBreak({ ...entry, ruleCode: null }, alerts), true);
-        assert.equal(isEchoedPolicyBreak({ ...entry, ruleCode: "authority_routing" }, alerts), false);
-        assert.equal(isEchoedPolicyBreak({ ...entry, summary: "Other failure" }, alerts), false);
-        assert.equal(isEchoedPolicyBreak({ ...entry, kind: "correction" }, alerts), false);
-        assert.equal(goalHasMetric({ metricName: " Unknown " }), false);
-        assert.equal(goalHasMetric({ metricName: "Releases" }), true);
-        assert.equal(goalHasWeeklyPlan({ weeklyPlan: null }), false);
-        assert.equal(goalHasWeeklyPlan({ weeklyPlan: [] }), false);
-        assert.equal(goalHasWeeklyPlan({ weeklyPlan: ["Ship"] }), true);
-        assert.equal(policySeverity("pr_green_ci"), "warn");
-        assert.equal(policySeverity("budget_warning"), "warn");
-        assert.equal(policySeverity("two_failure_stop"), "err");
-        assert.equal(policySeverity("unknown_critical_rule"), "err");
-        const groupedPrs = partitionGithubPrs([
-          { repository: "z/repo", number: 2, rollupState: "success" },
-          { repository: "a/repo", number: 3, rollupState: "pending" },
-          { repository: "a/repo", number: 2, rollupState: "error" },
-          { repository: "a/repo", number: 1, rollupState: "closed" },
-        ]);
-        assert.equal(groupedPrs.open.map((pr) => pr.number).join(","), "2,3,2");
-        assert.equal(groupedPrs.closed.map((pr) => pr.number).join(","), "1");
-        let firstToggle;
-        const firstDisclosure = { open: false, addEventListener: (name, callback) => { assert.equal(name, "toggle"); firstToggle = callback; } };
-        restoreClosedPrsDisclosure(firstDisclosure);
-        firstDisclosure.open = true;
-        assert(firstToggle);
-        firstToggle();
-        const nextDisclosure = { open: false, addEventListener() {} };
-        restoreClosedPrsDisclosure(nextDisclosure);
-        assert.equal(nextDisclosure.open, true);
-      `, {
-        assert, URLSearchParams, location: { hash: "", pathname: "/", search: "" },
-        history: { replaceState() {} },
-        localStorage: { getItem: () => null },
-        document: { documentElement: { dataset: {} }, getElementById: () => ({}), querySelectorAll: () => [] },
-      });
 
       assert.equal((await read(url, "/v1/hosts")).status, 401);
       assert.equal((await read(url, "/v1/unknown")).status, 401);
@@ -139,6 +71,7 @@ test("serves the loopback page and proxies authenticated GETs only", async () =>
       assert.equal((await read(url, "/v1/decisions", headers, "POST")).status, 405);
       assert.equal((await read(url, "/", {}, "HEAD")).status, 405);
       assert.equal((await read(url, "/v1/budgets", headers, "PUT")).status, 405);
+      assert.equal((await read(url, "/v1/lanes/platform", headers, "PUT")).status, 405);
       for (const path of ["/v1/budgets", "/v1/github/prs", "/v1/spend/summary"]) {
         assert.equal((await read(url, path, headers)).status, 200);
       }
@@ -277,14 +210,15 @@ test("public dashboard enforces proxy headers and keeps the bearer token out of 
   const windowSelect: { value: string; onchange?: () => void } = { value: "13:00Z" };
   const calls: string[] = [];
   const authorizationError = runInNewContext(`${script}\nread("/v1/hosts");`, {
-    location: { hash: "", pathname: "/", search: "" },
-    history: { replaceState() {} },
+    location: { hash: "#system", pathname: "/", search: "" },
+    history: { replaceState() { assert.fail("proxy navigation hash must survive startup"); } },
     localStorage: { getItem: () => null },
     document: {
       documentElement: { dataset: { auth: "proxy" } },
       getElementById: (id: string) => id === "window" ? windowSelect : {},
       querySelectorAll: () => [],
     },
+    window: { addEventListener() {} },
     AbortSignal, clearTimeout() {}, setTimeout() {}, setInterval() {},
     async fetch(path: string, options: RequestInit) {
       assert.equal(new Headers(options.headers).has("authorization"), false);
@@ -293,11 +227,11 @@ test("public dashboard enforces proxy headers and keeps the bearer token out of 
     },
   });
   await assert.rejects(authorizationError, { message: "Dashboard authorization failed." });
-  assert.deepEqual(calls, ["/v1/digest?window=13%3A00Z", "/v1/health/summary", "/v1/friction?status=open", "/v1/hosts"]);
+  assert.deepEqual(calls, ["/v1/digest?window=13%3A00Z", "/v1/health/summary", "/v1/friction?status=open", "/v1/prs", "/v1/hosts"]);
   assert(windowSelect.onchange);
   windowSelect.value = "weekly";
   windowSelect.onchange();
-  assert.deepEqual(calls.slice(4), ["/v1/digest?window=weekly", "/v1/health/summary", "/v1/friction?status=open"]);
+  assert.deepEqual(calls.slice(5), ["/v1/digest?window=weekly", "/v1/health/summary", "/v1/friction?status=open", "/v1/prs"]);
 });
 
 test("public dashboard verifies Access JWTs and refreshes its key cache at a bounded rate", async (t) => {
@@ -371,4 +305,241 @@ test("public dashboard verifies Access JWTs and refreshes its key cache at a bou
   jwks = { keys: null };
   assert.equal((await withJwt(rotated)).status, 403);
   assert.equal(fetchCount, 4);
+});
+
+async function dashboardScript(): Promise<string> {
+  const html = await readFile(new URL("./dashboard.html", import.meta.url), "utf8");
+  const script = /<script type="module">([\s\S]*?)<\/script>/.exec(html)?.[1];
+  assert(script);
+  return script;
+}
+
+test("Lane Board caps exceptions, keeps lane summaries current, and preserves drill-down state", async () => {
+  const script = await dashboardScript();
+  runInNewContext(String.raw`
+    function mockElement(tag) {
+      return {
+        tag, dataset: {}, children: [], open: false, classList: { add() {} },
+        append(...nodes) { this.children.push(...nodes); },
+        replaceChildren(...nodes) { this.children = nodes; },
+        querySelector() { return descendants(this).find((node) => node.tag === "details"); },
+        get firstChild() { return this.children[0]; },
+        setAttribute(name, value) { this[name] = value; },
+      };
+    }
+    function descendants(node) {
+      return node.children.flatMap((child) => [child, ...descendants(child)]);
+    }
+    function textIn(node) {
+      return [node, ...descendants(node)].map((child) => child.textContent).filter(Boolean).join(" ");
+    }
+    const ids = new Map();
+    const document = {
+      documentElement: { dataset: {} }, createElement: mockElement, querySelectorAll: () => [],
+      getElementById(id) {
+        if (!ids.has(id)) ids.set(id, mockElement("div"));
+        return ids.get(id);
+      },
+    };
+    let navigate;
+    const window = { addEventListener: (event, handler) => { navigate = handler; }, scrollTo() {} };
+    ${script}
+    Date.now = () => Date.parse("2026-11-27T13:00:00.000Z");
+    assert.equal(relativeTime("2026-11-27T12:59:42.000Z"), "18s ago");
+    assert.equal(relativeTime("2026-11-27T12:57:00.000Z"), "3 min ago");
+    assert.equal(relativeExpiry("2026-12-27T13:00:00.000Z"), "expires in 30d");
+    assert.equal(relativeExpiry("2026-11-25T13:00:00.000Z"), "expired 2d ago");
+    assert.equal(relativeTime("invalid date"), "unknown time");
+    assert.equal(relativeExpiry("invalid date"), "expiry unknown");
+
+    const goal = { statement: "Ship the release", weekStart: "2026-11-23", metricName: "Releases",
+      metricTarget: 1, approvedDecisionId: "approval", weeklyPlan: {
+        nextStep: "Review patch", next: "Alternative", blockers: ["Get test data"], items: ["Review patch", "Ship patch"],
+      } };
+    const lane = { id: "release", slug: "crawlab", name: "Release", status: "active", priorityRank: 1, goal };
+    const idleLane = { id: "idle", slug: "idle", name: "Quiet Lane", status: "paused", priorityRank: 5 };
+    const decision = (title, urgency, day, laneId) => ({
+      title, urgency, createdAt: "2026-11-" + day + "T00:00:00Z", laneId, recommendation: "Proceed",
+    });
+    const alert = (summary, ruleCode, day, detail = {}) => ({
+      summary, ruleCode, createdAt: "2026-11-" + day + "T00:00:00Z", detail,
+    });
+    const decisions = [
+      decision("Digest request", "digest", 28), decision("Incident older", "incident", 23, lane.id),
+      decision("Block today", "blocking_today", 26), decision("Incident newest", "incident", 24),
+    ];
+    const laneAlert = alert("CI failed twice", "two_failure_stop", 24, { repository: "org/crawlab-pro" });
+    const alerts = [
+      alert("CI warning", "pr_green_ci", 29), laneAlert,
+      alert("Routing exception", "authority_routing", 25), alert("Budget exceeded", "budget_exceeded", 23),
+      alert("Budget warning", "budget_cap", 30, { level: "warning" }),
+    ];
+    const pr = (number, rollupState) => ({ repository: "org/crawlab-pro", number, rollupState });
+    const prChecks = [pr(1, "success"), pr(2, "pending"), pr(3, "error"), pr(4, "closed")];
+    const linkedPrs = [
+      { repository: "org/crawlab-pro", number: 5, prHost: "github.com", state: "merged", title: "Merged work" },
+      { repository: "org/idle", number: 6, prHost: "github.com", state: "open", title: "New work" },
+    ];
+    const health = { pendingOwnerDecisions: decisions, policyAlerts: alerts, hosts: [], agents: [],
+      activeRuns: [], stalledRuns: [], waits: [], githubPrs: prChecks, budgets: [], spend: { status: "unavailable" } };
+    currentContext = context({ digest: { sections: { lanes: [idleLane, lane] } }, health, friction: [], linkedPrs });
+    const view = byId("view");
+    renderView();
+    const [waiting, flagged, lanes, spend] = view.children;
+    const titles = (panel) => panel.children[1].children.filter((node) => node.className === "row")
+      .map((node) => node.firstChild.firstChild.firstChild.textContent);
+    assert.deepEqual(titles(waiting), ["Incident newest", "Incident older", "Block today"]);
+    assert.equal(waiting.children[1].children[3].textContent, "View all 4 waiting on you →");
+    assert.equal(waiting.children[1].children[3].href, "#system");
+    assert.deepEqual(titles(flagged), ["Routing exception", "CI failed twice", "Budget exceeded"]);
+    assert.equal(flagged.children[1].children[3].textContent, "View all 5 alerts →");
+    assert.deepEqual(titles(lanes), ["Release", "Quiet Lane"]);
+    assert.match(textIn(lanes), /Release blocked Ship the release Next: Review patch · Blocker: Get test data/);
+    assert.match(textIn(lanes), /Quiet Lane paused Next: Paused · Blocker: None/);
+    assert.match(textIn(spend), /Unavailable · Semon not enabled on this host/);
+    assert.match(textIn(spendMeter({ spend: { status: "available", preferredUsd: 4.5 }, budgets: [] })), /USD 4.5 estimated/);
+    assert.match(textIn(spendMeter({ spend: health.spend, budgets: [{ enabled: true, scopeKind: "team",
+      period: "monthly", capUsd: 12, spend: { status: "available", preferredUsd: 4.5 } }] })), /USD 4.5 \/ 12 monthly/);
+    assert.equal(byId("owner-digest").hidden, true);
+    assert.equal(descendants(view).some((node) => node.textContent === "Hosts"), false);
+    const manager = { status: "waiting" };
+    const withoutPlan = { ...lane, goal: null };
+    assert.deepEqual(laneSummary(withoutPlan, manager, [decisions[1]], [laneAlert]),
+      { status: "blocked", next: "Manager waiting", blocker: "Incident older" });
+    assert.deepEqual(laneSummary(withoutPlan, null, [], [laneAlert]),
+      { status: "blocked", next: "No next step recorded", blocker: "CI failed twice" });
+    assert.deepEqual(laneSummary(withoutPlan, null, [], [alerts[4]]),
+      { status: "active", next: "No next step recorded", blocker: "Budget warning" });
+    assert.deepEqual(laneSummary({ ...lane, goal: { weeklyPlan: [{ next: "Test", blocker: "Fixtures" }] } }, null, [], []),
+      { status: "active", next: "Test", blocker: "Fixtures" });
+    assert.equal(laneSummary({ ...lane, goal: { weeklyPlan: ["Test"] } }, null, [], []).next, "Test");
+
+    const laneButton = descendants(lanes).find((item) => item.tag === "button");
+    assert.equal(laneButton["aria-label"], "View Release");
+    laneButton.onclick();
+    assert.equal(location.hash, "#lane/crawlab");
+    navigate();
+    assert.match(textIn(view), /Goal & Weekly Plan Ship the release Releases · unknown\/1 Week of 2026-11-23 · Approved/);
+    assert.match(textIn(view), /Ship patch/);
+    assert.match(textIn(view), /CI failed twice/);
+    assert.doesNotMatch(textIn(view), /org\/idle/);
+    assert.match(textIn(view), /#3.*#2.*#1.*Closed PRs \(2\)/);
+    const laneDisclosure = view.querySelector();
+    laneDisclosure.open = true;
+    renderView();
+    assert.equal(view.querySelector().open, true);
+    location.hash = "#system";
+    navigate();
+    assert.equal(view.querySelector().open, false);
+    assert.equal(byId("owner-digest").hidden, false);
+    assert.match(textIn(view), /Incident newest.*Incident older.*Block today.*Digest request/);
+    assert.match(textIn(view), /CI warning/);
+    assert.match(textIn(view), /org\/idle #6/);
+    location.hash = "#lane/crawlab";
+    navigate();
+    assert.equal(view.querySelector().open, true);
+    location.hash = "";
+    navigate();
+    assert.equal(byId("owner-digest").hidden, true);
+    currentContext = context({ digest: { sections: { lanes: [] } }, health: {
+      ...health, pendingOwnerDecisions: [], policyAlerts: [],
+    }, friction: [], linkedPrs });
+    renderView();
+    assert.match(textIn(view), /Nothing waiting on you Alerts No active alerts/);
+  `, {
+    assert,
+    location: {
+      fragment: "",
+      get hash() { return this.fragment; },
+      set hash(value: string) { this.fragment = value && !value.startsWith("#") ? "#" + value : value; },
+    },
+    localStorage: { getItem: () => null },
+  });
+});
+
+test("T3 deep links encode both segments and follow evidence, lane, requester, or repository", async () => {
+  const script = await dashboardScript();
+  runInNewContext(`${script}
+    const east = { hostId: "east", webUrl: "https://t3-east.example/", mcpUrl: "http://127.0.0.1:8000/mcp", environmentId: "env-east" };
+    const west = { hostId: "west", webUrl: "https://t3-west.example/threads", mcpUrl: "https://t3-west.example/mcp", environmentId: "env-west" };
+    const eastAgent = { id: "east-manager", hostId: "east", externalRef: "env-east/mcp:launch:one/two", label: "Manager" };
+    const westAgent = { id: "chief-pm", hostId: "west", externalRef: "env-west/mcp:launch:three", label: "Chief PM" };
+    const lane = { id: "lane1", slug: "awb", ownerAgentId: eastAgent.id };
+    const ctx = {
+      agentsById: new Map([[eastAgent.id, eastAgent], [westAgent.id, westAgent]]),
+      hostsById: new Map([[east.hostId, east], [west.hostId, west]]),
+      lanesById: new Map([[lane.id, lane]]), lanesBySlug: new Map([[lane.slug, lane]]),
+    };
+    const eastLink = "https://t3-east.example/threads/env-east/mcp%3Alaunch%3Aone%2Ftwo";
+    const westLink = "https://t3-west.example/threads/env-west/mcp%3Alaunch%3Athree";
+    assert.equal(encodeT3Segment(".!~*'() /:"), "%2E%21%7E%2A%27%28%29%20%2F%3A");
+    assert.equal(t3ThreadUrl(east, "env.one", "thread!"), "https://t3-east.example/threads/env%2Eone/thread%21");
+    assert.equal(hostWebOrigin({ ...east, mcpUrl: west.mcpUrl }), "https://t3-east.example");
+    assert.equal(hostWebOrigin(west), "https://t3-west.example");
+    for (const webUrl of [null, "http://t3-east.example", "https://t3-east.example/?", "https://t3-east.example/.", "https://@t3-east.example"]) {
+      assert.equal(hostWebOrigin({ ...east, webUrl }), null);
+    }
+    assert.equal(t3ThreadUrl(east, "", "thread"), null);
+    assert.equal(t3ThreadUrl(east, "env", ""), null);
+    assert.equal(laneThreadUrl(lane, ctx.agentsById, ctx.hostsById), eastLink);
+    assert.equal(agentThreadUrl({ ...eastAgent, externalRef: "thread-only" }, ctx.hostsById), null);
+    assert.equal(decisionThreadUrl({ evidence: { hostId: "west", environmentId: "env-west", threadId: "mcp:launch:three" }, laneId: lane.id }, ctx), westLink);
+    assert.equal(decisionThreadUrl({ evidence: [{ nested: { agentId: westAgent.id } }] }, ctx), westLink);
+    assert.equal(decisionThreadUrl({ evidence: ["t3-thread://v2/env-west/mcp:launch:three"] }, ctx), westLink);
+    assert.equal(decisionThreadUrl({ laneId: lane.id, requestedBy: westAgent.id }, ctx), eastLink);
+    assert.equal(decisionThreadUrl({ requestedBy: "chief pm" }, ctx), westLink);
+    assert.equal(decisionThreadUrl({ requestedBy: westAgent.id }, ctx), westLink);
+    assert.equal(decisionThreadUrl({}, ctx), null);
+    assert.equal(alertThreadUrl({ detail: { agentId: westAgent.id }, laneId: lane.id }, ctx), westLink);
+    assert.equal(alertThreadUrl({ detail: { environmentId: "env-west", threadId: "mcp:launch:three" }, laneId: lane.id }, ctx), westLink);
+    assert.equal(alertThreadUrl({ laneId: lane.id }, ctx), eastLink);
+    assert.equal(alertThreadUrl({ detail: { repository: "org/agent-workbench" } }, ctx), eastLink);
+    assert.equal(alertThreadUrl({ detail: { repository: "org/other" } }, ctx), null);
+    const link = t3Link(eastLink);
+    assert.equal(link.href, eastLink);
+    assert.equal(link.target, "_blank");
+    assert.equal(link.rel, "noopener noreferrer");
+    let stopped = false;
+    link.onclick({ stopPropagation() { stopped = true; } });
+    assert(stopped);
+    assert.equal(t3Link("http://127.0.0.1:8000"), null);
+  `, {
+    assert, URL, location: { hash: "" }, window: { addEventListener() {} },
+    localStorage: { getItem: () => null },
+    document: {
+      documentElement: { dataset: {} }, getElementById: () => ({}),
+      querySelectorAll: () => [], createElement: () => ({}),
+    },
+  });
+});
+
+test("the loopback page removes the token fragment and retains authorization during hash navigation", async () => {
+  const script = await dashboardScript();
+  const token = "a".repeat(64);
+  const location = { hash: `#token=${token}`, pathname: "/", search: "" };
+  const browser: { navigate?: () => void } = {};
+  const calls: string[] = [];
+  const authorization = runInNewContext(`${script}\nread("/v1/hosts");`, {
+    location, URLSearchParams,
+    history: { replaceState(_state: null, _title: string, path: string) {
+      assert.equal(path, "/");
+      location.hash = "";
+    } },
+    window: { addEventListener(_event: string, callback: () => void) { browser.navigate = callback; }, scrollTo() {} },
+    localStorage: { getItem: () => null },
+    document: { documentElement: { dataset: {} }, querySelectorAll: () => [], getElementById: () => ({ value: "01:00Z" }) },
+    AbortSignal, clearTimeout() {}, setTimeout() {}, setInterval() {},
+    async fetch(path: string, options: RequestInit) {
+      assert.equal(new Headers(options.headers).get("authorization"), `Bearer ${token}`);
+      calls.push(path);
+      return { ok: false, status: 401 };
+    },
+  });
+  await assert.rejects(authorization, { message: "Open the dashboard URL printed by the CLI." });
+  assert.equal(location.hash, "");
+  assert(calls.includes("/v1/hosts"));
+  assert(browser.navigate);
+  location.hash = "#lane/crawlab";
+  browser.navigate();
+  assert.equal(location.hash, "#lane/crawlab");
 });

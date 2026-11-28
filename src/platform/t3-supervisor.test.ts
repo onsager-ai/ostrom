@@ -213,10 +213,12 @@ test("reconciles separate hosts, projects live milestones, and rebuilds after bo
   try {
     for (const mock of [east, west]) await saveToken(mock.host.id, { accessToken: "fixture", expiresAt: Date.now() + 60_000 }, directory);
     west.pending.set("approval-startup", "approval");
-    supervisor = new T3HostSupervisor(store, [east.host, west.host], { tokensDir: directory, retryMs: 10 });
+    supervisor = new T3HostSupervisor(store, [{ ...east.host, webUrl: "https://t3-east.example" }, west.host],
+      { tokensDir: directory, retryMs: 10 });
     await eventually(() => east.streamCount === 4 && west.streamCount === 4
       && store.listT3HostStates().every((host) => host.connectionState === "connected"));
     assert.deepEqual(store.listAgents().map((agent) => agent.externalRef), ["env-east/thread", "env-west/thread"]);
+    assert.deepEqual(store.listT3HostStates().map((host) => host.webUrl), ["https://t3-east.example", null]);
     assert.deepEqual(store.listRuns().map((run) => run.status), ["waiting_input", "waiting_approval"]);
     assert.equal(store.listOpenT3Waits().length, 3);
     assert.equal(store.listT3ThreadPrs().length, 2);
@@ -410,6 +412,14 @@ test("validates platform host identities and transport", async () => {
       await assert.rejects(load({ ...host, mcpUrl }), /mcpUrl/);
     }
     assert.equal((await load({ ...host, mcpUrl: "http://localhost:8000/mcp" }))[0]?.id, host.id);
+    const webHost = { ...host, mcpUrl: "http://127.0.0.1:8000/mcp", webUrl: "https://t3-east.example/" };
+    assert.deepEqual(await load(webHost), [webHost]);
+    assert.equal((await load({ ...webHost, webUrl: "https://t3-east.example" }))[0]?.webUrl, "https://t3-east.example");
+    for (const webUrl of [null, "http://t3-east.example", "https://t3-east.example/mcp",
+      "https://t3-east.example/.", "https://t3-east.example/?", "https://t3-east.example/#", "https://@t3-east.example",
+      " https://t3-east.example", "https:t3-east.example"]) {
+      await assert.rejects(load({ ...webHost, webUrl }), /webUrl/);
+    }
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

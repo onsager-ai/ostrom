@@ -39,6 +39,7 @@ function textSanitizer(health: Health, digest: Digest, lanes: Lane[], decisions:
   for (const host of health.hosts) {
     add(host.hostId, host.label, host.mcpUrl, host.originNamespace, host.environmentId, host.tokenExpiresAt, host.lastError);
     add(URL.parse(host.mcpUrl)?.hostname);
+    add(host.webUrl, URL.parse(host.webUrl ?? "")?.hostname);
   }
   for (const agent of health.agents) add(agent.label, agent.id, agent.externalRef);
   for (const run of [...health.activeRuns, ...health.stalledRuns]) add(run.externalRunRef, run.semonSessionUid, run.semonIdentity?.nativeSessionId);

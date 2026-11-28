@@ -6,6 +6,7 @@ import type { T3TargetConfig } from "../connectors/t3/index.ts";
 
 export interface PlatformT3Host extends T3TargetConfig {
   laneSlug?: string;
+  webUrl?: string;
 }
 
 export function defaultHostsConfigPath(env: NodeJS.ProcessEnv = process.env): string {
@@ -26,7 +27,7 @@ export async function loadPlatformHosts(path = defaultHostsConfigPath()): Promis
   if (!Array.isArray(hosts)) throw new Error("platform hosts config requires a hosts array");
   const seen = new Set<string>();
   return hosts.map((entry: unknown) => {
-    const { id, label, mcpUrl, originNamespace, laneSlug } = record(entry);
+    const { id, label, mcpUrl, originNamespace, laneSlug, webUrl } = record(entry);
     if (typeof id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(id) || seen.has(id)) {
       throw new Error("platform host IDs must be unique and contain 1–64 letters, numbers, dots, underscores or hyphens, starting with a letter or number");
     }
@@ -35,6 +36,13 @@ export async function loadPlatformHosts(path = defaultHostsConfigPath()): Promis
     if (url === null || url.username || url.password || url.search || url.hash
       || (url.protocol !== "https:" && !(url.protocol === "http:" && ["127.0.0.1", "localhost"].includes(url.hostname)))) {
       throw new Error(`invalid mcpUrl for platform host ${id}`);
+    }
+    if (webUrl !== undefined) {
+      const web = typeof webUrl === "string" && /^https:\/\/[^/?#@\\\s\p{Cc}]+\/?$/u.test(webUrl)
+        ? URL.parse(webUrl) : null;
+      if (web === null || web.protocol !== "https:" || web.href !== `${web.origin}/`) {
+        throw new Error(`invalid webUrl for platform host ${id}: expected an HTTPS origin`);
+      }
     }
     if (originNamespace !== undefined && (typeof originNamespace !== "string" || originNamespace.trim() === "")) {
       throw new Error(`invalid originNamespace for platform host ${id}`);
@@ -45,6 +53,7 @@ export async function loadPlatformHosts(path = defaultHostsConfigPath()): Promis
     seen.add(id);
     return {
       id, label, mcpUrl: url.href,
+      ...(typeof webUrl === "string" ? { webUrl } : {}),
       ...(originNamespace === undefined ? {} : { originNamespace }),
       ...(laneSlug === undefined ? {} : { laneSlug }),
     };

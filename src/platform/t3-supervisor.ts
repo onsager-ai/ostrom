@@ -39,7 +39,7 @@ function rpcSignal(signal?: AbortSignal): AbortSignal {
 }
 
 function hostUpdate(host: PlatformT3Host, connectionState: T3HostState["connectionState"]): T3HostUpdate {
-  return { hostId: host.id, label: host.label, mcpUrl: host.mcpUrl,
+  return { hostId: host.id, label: host.label, mcpUrl: host.mcpUrl, webUrl: host.webUrl ?? null,
     originNamespace: host.originNamespace ?? null, connectionState };
 }
 

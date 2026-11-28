@@ -117,6 +117,12 @@ for (const transport of ["db", "socket"]) {
     const agentId = JSON.stringify(["t3", "east", "env-1", "thread-1"]);
     store.upsertAgent({ id: agentId, role: "worker", connectorKind: "t3", hostId: "east", externalRef: "thread-1",
       label: "Worker", status: "active" });
+    const updated = await call<Lane>("lane", "update", "platform", "--owner-agent", agentId, "--status", "paused");
+    assert.deepEqual(updated, { ...lane, ownerAgentId: agentId, status: "paused", updatedAt: updated.updatedAt });
+    assert.deepEqual(await call("lane", "show", "platform"), { ...updated, goal });
+    const reprioritized = await call<Lane>("lane", "update", "platform", "--priority", "0", "--name", "Platform Work");
+    assert.deepEqual(reprioritized, { ...updated, name: "Platform Work", priorityRank: 0, updatedAt: reprioritized.updatedAt });
+    assert.match((await run("lane", "update", "missing", "--status", "archived")).stderr, /lane missing not found/);
     const runId = JSON.stringify([agentId, "run-1"]);
     store.upsertRun({ id: runId, agentId, connectorKind: "t3", hostId: "east", externalRunRef: "run-1", status: "completed" });
     assert.equal((await call<{ semonSessionUid: string }>("run", "link-semon", runId, "--session-uid", "uid-1")).semonSessionUid, "uid-1");
