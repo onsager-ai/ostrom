@@ -70,7 +70,7 @@ export async function startPlatformDashboard({ socketPath, port = 0, publicUrl, 
       outgoing.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }).end(page);
       return;
     }
-    if (!path.startsWith("/v1/")) return send(outgoing, 404, "Not found");
+    if (!path.startsWith("/v1/") || path.split("?", 1)[0] === "/v1/goals/audit") return send(outgoing, 404, "Not found");
     if (publicOrigin === undefined && !authorized(authorization)) {
       return send(outgoing, 401, "Unauthorized");
     }

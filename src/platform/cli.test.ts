@@ -4,18 +4,20 @@ import { once } from "node:events";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Readable } from "node:stream";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { PlatformApiClient, startPlatformApiServer } from "./api.ts";
 import { runPlatformCli } from "./cli.ts";
 import { PlatformStore } from "./store.ts";
-import type { Decision, DecisionVerification, FrictionEntry, Goal, Lane, PolicyRule, SpendRollup } from "./types.ts";
+import type { Decision, DecisionVerification, FrictionEntry, Goal, GoalAuditEvent, Lane, PolicyRule, SpendRollup } from "./types.ts";
 
-async function cli(argv: string[]) {
+async function cli(argv: string[], input?: string) {
   let stdout = "";
   let stderr = "";
   const code = await runPlatformCli(argv, {
+    ...(input === undefined ? {} : { stdin: Readable.from([input]) }),
     stdout: { write: (text) => { stdout += text; } },
     stderr: { write: (text) => { stderr += text; } },
   });
@@ -161,6 +163,28 @@ for (const transport of ["db", "socket"]) {
     assert.deepEqual(completed, { ...goal, completedAt: completed.completedAt, updatedAt: completed.completedAt, metricCurrent: 2 });
     assert.deepEqual(await call("lane", "show", "platform"), { ...reprioritized, goal: completed });
     assert.notEqual((await run("goal", "complete", "platform")).code, 0);
+
+    const goalSelf = ["goal-self", "set", "platform", "--statement", "Ship the next release", "--metric", "Releases", "--target", "1"];
+    assert.equal((await run(...goalSelf)).code, 2);
+    assert.equal((await run(...goalSelf, "--thread", "another-thread")).code, 1);
+    assert.equal((await run("goal-self", "complete", "missing", "--thread", "thread-1")).code, 1);
+    assert.deepEqual(await call<GoalAuditEvent[]>("goal", "audit"), []);
+    type OwnerResult = { goal: Goal; audit: GoalAuditEvent };
+    const set = await call<OwnerResult>(...goalSelf, "--thread", "thread-1", "--week", goal.weekStart);
+    assert.equal(set.audit.action, "set");
+    const selfCompleted = await call<OwnerResult>("goal-self", "complete", "platform", "--thread", "thread-1", "--current", "1");
+    assert.equal(selfCompleted.goal.id, set.goal.id);
+    assert.equal(selfCompleted.audit.callerThread, "thread-1");
+    const stdin = (input: string) => cli([...global, "--json", "goal-self", "--stdin-json"], input);
+    assert.equal((await stdin("{broken")).code, 2);
+    assert.equal((await stdin(JSON.stringify({ action: "delete", slug: "platform", callerThread: "thread-1" }))).code, 2);
+    const stdinResult = await stdin(JSON.stringify({ action: "set", slug: "platform", callerThread: "thread-1",
+      statement: "Test the next release", metricName: "Releases", metricTarget: 3, weekStart: goal.weekStart }));
+    assert.equal(stdinResult.code, 0, stdinResult.stderr);
+    const stdinSet = JSON.parse(stdinResult.stdout) as OwnerResult;
+    assert.equal(stdinSet.goal.statement, "Test the next release");
+    assert.deepEqual(await call<GoalAuditEvent[]>("goal", "audit", "--lane", "platform"),
+      [stdinSet.audit, selfCompleted.audit, set.audit]);
   });
 }
 
