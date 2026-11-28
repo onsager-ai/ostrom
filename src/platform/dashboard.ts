@@ -72,7 +72,8 @@ export async function startPlatformDashboard({ socketPath, port = 0, publicUrl, 
       outgoing.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }).end(page);
       return;
     }
-    if (path === "/preview" || path === "/preview/") {
+    const pathname = path.split("?", 1)[0];
+    if (pathname === "/preview" || pathname === "/preview/") {
       outgoing.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }).end(preview);
       return;
     }
