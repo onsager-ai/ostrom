@@ -51,7 +51,7 @@ test("the host URL migration preserves existing rows and later URL updates", (t)
   const original = store.upsertT3HostState(host);
   assert.equal(original.webUrl, null);
   db.exec(`ALTER TABLE t3_host_state DROP COLUMN web_url;
-    DELETE FROM platform_schema_version WHERE version = (SELECT max(version) FROM platform_schema_version)`);
+    DELETE FROM platform_schema_version WHERE version >= (SELECT max(version) - 1 FROM platform_schema_version)`);
   const upgraded = PlatformStore.open(path);
   const webUrl = "https://t3-east.example";
   try {
@@ -65,6 +65,33 @@ test("the host URL migration preserves existing rows and later URL updates", (t)
     assert.equal(reopened.listT3HostStates()[0]?.webUrl, webUrl);
     assert.equal(reopened.upsertT3HostState({ ...host, connectionState: "stale" }).webUrl, webUrl);
     assert.equal(reopened.upsertT3HostState({ ...host, webUrl: null }).webUrl, null);
+  } finally {
+    reopened.close();
+  }
+});
+
+test("the PR draft migration preserves existing checks and persists draft changes", (t) => {
+  const { store, db, path } = disk(t);
+  const check = { headSha: "a".repeat(40), isDraft: false, rollupState: "failure", totalChecks: 2, failedChecks: 1 } as const;
+  store.recordGitHubPrCheck("org/repo", 7, check);
+  const before = store.listGitHubPrChecks();
+  db.exec(`ALTER TABLE github_pr_check DROP COLUMN is_draft;
+    DELETE FROM platform_schema_version WHERE version = (SELECT max(version) FROM platform_schema_version)`);
+  const upgraded = PlatformStore.open(path);
+  try {
+    assert.deepEqual(upgraded.listGitHubPrChecks(), before);
+    assert.equal(upgraded.listGitHubPrChecks()[0]?.isDraft, false);
+    upgraded.recordGitHubPrCheck("org/repo", 7, { ...check, isDraft: true });
+    assert.equal(db.prepare("SELECT is_draft FROM github_pr_check").get()?.["is_draft"], 1);
+  } finally {
+    upgraded.close();
+  }
+  db.exec("DELETE FROM platform_schema_version WHERE version = (SELECT max(version) FROM platform_schema_version)");
+  const reopened = PlatformStore.open(path);
+  try {
+    assert.equal(reopened.listGitHubPrChecks()[0]?.isDraft, true);
+    reopened.recordGitHubPrCheck("org/repo", 7, check);
+    assert.equal(reopened.listGitHubPrChecks()[0]?.isDraft, false);
   } finally {
     reopened.close();
   }

@@ -241,6 +241,7 @@ export interface T3ThreadPr {
 
 export interface GitHubPrObservation {
   headSha: string | null;
+  isDraft: boolean;
   rollupState: "pending" | "success" | "failure" | "error" | "closed";
   totalChecks: number;
   failedChecks: number;

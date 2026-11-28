@@ -202,7 +202,7 @@ test("the Unix API writes budgets and exposes spend and GitHub PR observations",
   assert.equal(spend.billedUsd, null);
 
   store.recordGitHubPrCheck("org/repo", 7, {
-    headSha: "a".repeat(40), rollupState: "failure", totalChecks: 2, failedChecks: 1,
+    headSha: "a".repeat(40), isDraft: false, rollupState: "failure", totalChecks: 2, failedChecks: 1,
   });
   assert.deepEqual(await client.request("GET", "/v1/github/prs"), store.listGitHubPrChecks());
   await assert.rejects(client.request("PUT", "/v1/github/prs", {}), { status: 404 });

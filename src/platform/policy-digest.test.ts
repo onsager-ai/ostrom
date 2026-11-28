@@ -48,8 +48,6 @@ test("observes failures and authority mismatches once, reports health, and gener
     const run = { agentId: agent.id, laneId: lane.id, hostId, connectorKind: "t3" as const, startedAt: earlier };
     store.upsertRun({ ...run, id: "fail-a", externalRunRef: "a", status: "failed", completedAt: "2026-11-27T12:05:00.000Z" });
     store.upsertRun({ ...run, id: "fail-b", externalRunRef: "b", status: "failed", completedAt: "2026-11-27T12:10:00.000Z" });
-    store.upsertRun({ ...run, id: "success", externalRunRef: "success", status: "completed",
-      startedAt: "2026-11-27T12:11:00.000Z", completedAt: "2026-11-27T12:12:00.000Z" });
     store.upsertRun({ ...run, id: "stall", externalRunRef: "c", status: "running", failureCount: 2 });
     store.recordFriction({ kind: "owner_intervention", summary: "Owner clarified the scope" });
 
@@ -62,7 +60,8 @@ test("observes failures and authority mismatches once, reports health, and gener
     assert.equal(observed.waits.length, 2);
     assert(store.hasOpenPolicyEvent("authority_routing", mismatch.id));
     assert(store.hasOpenPolicyEvent("two_failure_stop", "streak:worker:fail-b"));
-    assert.deepEqual(observed.events[1]?.detail, { agentId: "worker", runIds: ["fail-a", "fail-b"] });
+    assert.deepEqual(observed.events.find((event) => event.summary === "Worker failed two consecutive runs")?.detail,
+      { agentId: "worker", runIds: ["fail-a", "fail-b"] });
     assert.deepEqual(evaluatePolicyAndHealth(store, options).events, []);
     assert.equal(store.listFriction({ status: "open" }).length, 3);
     evaluatePolicyAndHealth(store, { now, markStalled: true });
@@ -80,8 +79,11 @@ test("observes failures and authority mismatches once, reports health, and gener
       "Open friction items: 3", "Spend: unavailable", "Continue?", "CI passed"]) assert(digest.markdown.includes(entry), entry);
 
     store.expireDecision(mismatch.id, { actor: "Manager" });
+    store.upsertRun({ ...run, id: "success", externalRunRef: "success", status: "completed",
+      startedAt: "2026-11-27T12:11:00.000Z", completedAt: "2026-11-27T12:12:00.000Z" });
     evaluatePolicyAndHealth(store, options);
     assert.equal(store.hasOpenPolicyEvent("authority_routing", mismatch.id), false);
+    assert.equal(store.hasOpenPolicyEvent("two_failure_stop", "streak:worker:fail-b"), false);
   } finally {
     store.close();
   }
