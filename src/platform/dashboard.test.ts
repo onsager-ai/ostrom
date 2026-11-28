@@ -669,6 +669,7 @@ test("the preview follows the system theme and contains no write controls or out
   assert.doesNotMatch(html, /theme-toggle|data-theme|<form\b|type=["']submit|\binnerHTML\b/i);
   assert.doesNotMatch(html, /\bStalled\b/);
   assert.match(html, /Stall signal: unavailable \(awaiting Semon #788\)/);
+  assert.match(html, /\.tile p\s*\{[^}]*-webkit-line-clamp:\s*2\b[^}]*overflow:\s*hidden/);
 });
 
 const previewDom = `
@@ -805,6 +806,19 @@ test("preview overview summarizes UTC activity, prioritizes goals, and renders S
     assert.match(throughputPanel.textContent, /2 PRs merged2 goals completed/);
     assert.match(throughputPanel.textContent, /1 open frictionRepeated approval request/);
     assert.equal(throughput(activityByDay([], [], testingNow)).textContent, "No data yet");
+
+    ctx = { ...ctx, decisions: [], health: { ...health, activeRuns: [...health.activeRuns, ...health.activeRuns] } };
+    render();
+    const visible = () => descendants(byId("view")).filter((node) => node.className === "run-row");
+    const toggle = () => descendants(byId("view")).find((node) => node.dataset.focus === "overview-run-toggle");
+    assert.equal(visible().length, 5);
+    assert.equal(toggle().textContent, "Show all 8 active runs");
+    assert.equal(toggle().attrs["aria-expanded"], "false");
+    toggle().onclick();
+    assert.equal(visible().length, 8);
+    assert.equal(toggle().attrs["aria-expanded"], "true");
+    toggle().onclick();
+    assert.equal(visible().length, 5);
   `, { assert });
 });
 
@@ -933,7 +947,8 @@ test("preview lane detail renders the six sections and uses only safe GitHub PR 
       "Current Goal & Next Step|Recent PRs & Merges|Running Workers|Lane Spend|Decisions & Blockers|Activity Timeline");
     assert.match(view.textContent, /At riskProduct.*Publish an updateDone 1\/2Due Nov 30Next: Review the draft/);
     assert.match(view.textContent, /Goal History · 1Cut the previous releaseWeek of 2026-11-16 · Releases 1\/1Completed/);
-    assert.match(view.textContent, /#7 Update 7org\/product · 1\/25 checks failed · 2 consecutive headsFailing›#5 Update 5org\/product · re-runningPending›#4/);
+    assert.match(view.textContent, /Recent PRs & Merges#7 Update 7org\/product · 1\/25 checks failed · 2 consecutive headsFailing›#5 Update 5org\/product · re-runningPending›/);
+    assert.match(view.textContent, /#4 Update 4org\/product · Checks passedPassing›/);
     assert.match(view.textContent, /Merged & closed · 6.*mergedMerged/);
     assert.match(view.textContent, /No active runs on ProductStall signal: unavailable \(awaiting Semon #788\)/);
     assert.match(view.textContent, /No data yet · awaiting per-lane Semon rollup/);
@@ -961,6 +976,10 @@ test("preview lane detail renders the six sections and uses only safe GitHub PR 
     assert.match(view.textContent, /LanesAt riskCodex · gpt-6\.2-solProduct/);
     assert.match(view.textContent, /ManagerCodex · gpt-6\.2-solRunning5mWorkerGemini · gemini-4-neonWaiting for input/);
     assert.match(view.textContent, /Lane Spend\$12\.50Coverage: partialThis week · Semon · USD/);
+    detail.activeRuns = [...detail.activeRuns, ...detail.activeRuns, ...detail.activeRuns];
+    render();
+    assert.equal(descendants(view).filter((node) => node.tag === "strong" && node.textContent === "Worker").length, 3);
+    assert.doesNotMatch(view.textContent, /Show all.*active runs/);
 
     routeResult.value = { lane, goal: null, goalHistory: [], prs: [], activeRuns: [], recentAgents: [],
       spend: { status: "unavailable" }, decisions: [], alerts: [], friction: [], timeline: [] };
