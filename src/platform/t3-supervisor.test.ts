@@ -21,16 +21,21 @@ const later = "2026-11-27T01:01:00.000Z";
 const prKey = { host: "forge.example", repository: "org/repo", number: 17 };
 
 type Rpc = { id: number; method: string; params: {
-  name: string; cursor?: string; arguments: { action?: string; requestId?: string; cursor?: number };
+  name: string; cursor?: string; arguments: { action?: string; requestId?: string; cursor?: number; threadId?: string };
 } };
 type FixtureRun = { runId: string; status: string; startedAt: string; completedAt: string; model: string };
+
+function idleThread(threadId: string) {
+  return { threadId, title: threadId, status: "idle", settled: false, latestRunId: "run",
+    updatedAt: time, activeRunId: null, pendingRequestCount: 0 };
+}
 
 function frame(response: ServerResponse, name: string, params: unknown): void {
   const message = { jsonrpc: "2.0", method: "notifications/events/" + name, params };
   response.write("data: " + JSON.stringify(message) + "\n\n");
 }
 
-async function mockHost(id: string, options: { deny?: number; polling?: boolean } = {}) {
+async function mockHost(id: string, options: { deny?: number; polling?: boolean; idleThreads?: ReturnType<typeof idleThread>[] } = {}) {
   let epoch = 1;
   let activity = 0;
   let environmentReads = 0;
@@ -43,7 +48,7 @@ async function mockHost(id: string, options: { deny?: number; polling?: boolean 
   let nextEnvironment: Promise<void> | undefined;
   let runStatus = "waiting";
   let watching = true;
-  const pending = new Map<string, "user_input" | "approval">([["initial", "user_input"]]);
+  const pending = new Map<string, "user_input" | "approval">(options.idleThreads === undefined ? [["initial", "user_input"]] : []);
   const streams = new Map<string, ServerResponse>();
   const retained: { event: T3MilestoneEvent; position: number }[] = [];
   const streamOpens: { cursor: string | undefined; name: string }[] = [];
@@ -101,7 +106,7 @@ async function mockHost(id: string, options: { deny?: number; polling?: boolean 
           case "t3_thread_list":
             listPages++;
             data = unboundedList ? { threads: [], nextCursor: (args.cursor ?? 0) + 1 }
-              : args.cursor === undefined ? { threads: [], nextCursor: 1 } : { threads: [thread], nextCursor: null };
+              : args.cursor === undefined ? { threads: [], nextCursor: 1 } : { threads: options.idleThreads ?? [thread], nextCursor: null };
             break;
           case "t3_thread_read":
             threadReads++;
@@ -119,6 +124,13 @@ async function mockHost(id: string, options: { deny?: number; polling?: boolean 
                 .end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result }));
               return;
             }
+            if (options.idleThreads !== undefined) {
+              const idle = options.idleThreads.find(({ threadId }) => threadId === args.threadId);
+              assert(idle, "unexpected thread detail read");
+              data = { thread: idle, recentRuns: [{ runId: idle.latestRunId, status: "completed", startedAt: time,
+                completedAt: idle.updatedAt, model: "test" }] };
+              break;
+            }
             data = { thread, recentRuns: settledRuns ?? [{ runId: "run", status: runStatus, startedAt: time,
               completedAt: runStatus === "completed" ? later : null, model: "test" }] };
             break;
@@ -127,8 +139,8 @@ async function mockHost(id: string, options: { deny?: number; polling?: boolean 
               : { requestId: args.requestId, questions: [{ question: "Continue?" }] };
             break;
           case "list_thread_pull_requests":
-            data = { pullRequests: [{ ...prKey, url: "https://forge.example/org/repo/pull/17", source: "manual", state: "open",
-              watching, title: "Fix", headBranch: "fix", baseBranch: "main", isDraft: false }], nextCursor: null };
+            data = { pullRequests: options.idleThreads === undefined ? [{ ...prKey, url: "https://forge.example/org/repo/pull/17", source: "manual", state: "open",
+              watching, title: "Fix", headBranch: "fix", baseBranch: "main", isDraft: false }] : [], nextCursor: null };
             break;
           default:
             throw new Error("unexpected mock tool " + name);
@@ -319,6 +331,56 @@ test("reconciles newly settled runs after downtime and reports capped coverage",
     assert.equal(store.listAgents()[0]?.status, "idle", "an incomplete listing cannot prove removal");
     mock.setUnboundedList(false);
     assert.equal((await reconcileT3HostOnce(client, store, mock.host)).partialCoverage, false);
+  } finally {
+    store.close();
+    await mock.close();
+  }
+});
+
+for (const [field, update] of [
+  ["updatedAt", { updatedAt: later, title: "Renamed" }],
+  ["latestRunId", { latestRunId: "new-run" }],
+  ["pendingRequestCount", { pendingRequestCount: 1 }],
+] as const) {
+  test(`skips an unchanged unsettled idle thread and re-reads it when ${field} changes`, async () => {
+    const thread = idleThread("thread");
+    const mock = await mockHost("idle", { idleThreads: [thread] });
+    const store = PlatformStore.open(":memory:");
+    try {
+      const client = new T3McpClient(mock.host, "fixture");
+      const reconcile = () => reconcileT3HostOnce(client, store, mock.host, { now: () => new Date(later) });
+      assert.equal((await reconcile()).partialCoverage, false);
+      assert.equal(mock.threadReads, 1);
+      assert.equal(store.listAgents()[0]?.lastSeenAt, time);
+
+      assert.equal((await reconcile()).partialCoverage, false);
+      assert.equal(mock.threadReads, 1);
+      assert.equal(store.listAgents()[0]?.status, "idle");
+
+      Object.assign(thread, update);
+      assert.equal((await reconcile()).partialCoverage, false);
+      assert.equal(mock.threadReads, 2);
+    } finally {
+      store.close();
+      await mock.close();
+    }
+  });
+}
+
+test("finishes a capped reconcile by skipping idle threads read on the prior pass", async () => {
+  const mock = await mockHost("capped", { idleThreads: [idleThread("a"), idleThread("b"), idleThread("c")] });
+  const store = PlatformStore.open(":memory:");
+  try {
+    const client = new T3McpClient(mock.host, "fixture");
+    const reconcile = () => reconcileT3HostOnce(client, store, mock.host, { threadLimit: 2, listPageLimit: 2 });
+    assert.equal((await reconcile()).partialCoverage, true);
+    assert.equal(mock.threadReads, 2);
+    assert.deepEqual(store.listAgents().map((agent) => agent.externalRef), ["env-capped/a", "env-capped/b"]);
+
+    assert.equal((await reconcile()).partialCoverage, false);
+    assert.equal(mock.threadReads, 3);
+    assert.deepEqual(store.listAgents().map((agent) => [agent.externalRef, agent.status]),
+      [["env-capped/a", "idle"], ["env-capped/b", "idle"], ["env-capped/c", "idle"]]);
   } finally {
     store.close();
     await mock.close();
