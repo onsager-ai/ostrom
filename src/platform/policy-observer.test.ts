@@ -147,11 +147,13 @@ test("keeps repeated failures on live runs and the latest settled run", (t) => {
 });
 
 test("GitHub draft state overrides linked T3 metadata and clears PR alerts", (t) => {
-  const store = PlatformStore.open(":memory:", { now: () => now });
+  let clock = now;
+  const store = PlatformStore.open(":memory:", { now: () => clock });
   t.after(() => store.close());
   const hostId = "east";
   const repository = "org/repo";
   const number = 42;
+  const lane = store.createLane({ slug: "repo", name: "Repo lane" });
   store.reconcileT3Host({ hostId, label: "East", mcpUrl: "https://t3.example/mcp", originNamespace: null,
     connectionState: "connected" }, [{
     threadId: "thread", runs: [], agent: { id: "manager", label: "Manager", role: "manager", connectorKind: "t3",
@@ -160,18 +162,105 @@ test("GitHub draft state overrides linked T3 metadata and clears PR alerts", (t)
       url: "https://github.com/org/repo/pull/42", source: "manual", state: "open", watching: true, title: null,
       headBranch: null, baseBranch: null, isDraft: false }],
   }], { observedAt: now });
-  const record = (isDraft: boolean, head = "a") => store.recordGitHubPrCheck(repository, number, {
-    isDraft, headSha: head.repeat(40), rollupState: "failure", totalChecks: 1, failedChecks: 1,
+  const record = (isDraft: boolean, head = "a", rollupState: "failure" | "pending" | "error" = "failure") => store.recordGitHubPrCheck(repository, number, {
+    isDraft, headSha: head.repeat(40), rollupState, totalChecks: 1, failedChecks: 1,
   });
-  const openRules = () => evaluatePolicyAndHealth(store, { now }).policyAlerts.map((alert) => alert.ruleCode).sort();
+  const openRules = () => evaluatePolicyAndHealth(store, { now: clock }).policyAlerts.map((alert) => alert.ruleCode).sort();
 
   record(true);
   assert.deepEqual(openRules(), []);
   record(false);
   assert.deepEqual(openRules(), ["pr_green_ci"]);
+  assert.equal(store.listOpenPolicyEvents()[0]?.summary, "Repo lane · org/repo#42: 1/1 checks failed");
+  assert.equal(store.listOpenPolicyEvents()[0]?.laneId, lane.id);
+  assert.equal((store.listOpenPolicyEvents()[0]?.detail as { laneSlug?: string }).laneSlug, "repo");
   record(false, "b");
-  assert.deepEqual(openRules(), ["pr_green_ci", "two_failure_stop"]);
+  assert.deepEqual(openRules(), ["two_failure_stop"]);
+  assert.equal(store.listOpenPolicyEvents()[0]?.summary,
+    "Repo lane · org/repo#42: 1/1 checks failed (2 consecutive heads)");
+  const twoFailureAlert = store.listOpenPolicyEvents()[0]!;
+  const frictionCount = store.listFriction({ status: "open" }).length;
+  assert.equal(frictionCount, 1);
+
+  clock = "2026-11-27T13:01:00.000Z";
+  record(false, "b", "pending");
+  assert.deepEqual(evaluatePolicyAndHealth(store, { now: clock }).events, []);
+  assert.equal(store.listOpenPolicyEvents()[0]?.summary, twoFailureAlert.summary);
+  assert.equal(store.listFriction({ status: "open" }).length, frictionCount);
+
+  clock = "2026-11-27T13:02:00.000Z";
+  record(false, "b", "error");
+  assert.deepEqual(evaluatePolicyAndHealth(store, { now: clock }).events, []);
+  assert.equal(store.listOpenPolicyEvents()[0]?.summary, twoFailureAlert.summary);
+  assert.equal(store.listFriction({ status: "open" }).length, frictionCount);
+
+  clock = "2026-11-27T13:03:00.000Z";
+  record(false, "c");
+  assert.deepEqual(evaluatePolicyAndHealth(store, { now: clock }).events, []);
+  const refreshed = store.listOpenPolicyEvents()[0]!;
+  assert.equal(refreshed.id, twoFailureAlert.id);
+  assert.equal(refreshed.createdAt, twoFailureAlert.createdAt);
+  assert.equal(store.listOpenPolicyEvents().length, 1);
+  assert.equal(store.listFriction({ status: "open" }).length, frictionCount);
+
   record(true, "b");
   assert.deepEqual(openRules(), []);
   assert.equal(store.listT3ThreadPrs()[0]?.isDraft, false);
+});
+
+test("refreshes open CI alert attribution without adding friction", (t) => {
+  let clock = now;
+  const store = PlatformStore.open(":memory:", { now: () => clock });
+  t.after(() => store.close());
+  const repository = "org/crawlab-pro";
+  store.reconcileT3Host({ hostId: "east", label: "East", mcpUrl: "https://t3.example/mcp", originNamespace: null,
+    connectionState: "connected" }, [{
+    threadId: "thread", runs: [], agent: { id: "manager", label: "Manager", role: "manager", connectorKind: "t3",
+      hostId: "east", externalRef: "environment/thread", status: "idle" },
+    prs: [{ hostId: "east", threadId: "thread", prHost: "github.com", repository, number: 9,
+      url: "https://github.com/org/crawlab-pro/pull/9", source: "manual", state: "open", watching: true,
+      title: null, headBranch: null, baseBranch: null, isDraft: false }],
+  }], { observedAt: now });
+  store.recordGitHubPrCheck(repository, 9, { isDraft: false, headSha: "a".repeat(40), rollupState: "error",
+    totalChecks: 0, failedChecks: 0 });
+  evaluatePolicyAndHealth(store, { now: clock });
+  assert.equal(store.listOpenPolicyEvents()[0]?.summary,
+    "org/crawlab-pro#9: CI error: GitHub PR checks unavailable");
+  const original = store.listOpenPolicyEvents()[0]!;
+  assert.equal(store.listFriction({ status: "open" }).length, 0);
+
+  const lane = store.createLane({ slug: "crawlab", name: "Crawlab" });
+  clock = "2026-11-27T13:01:00.000Z";
+  evaluatePolicyAndHealth(store, { now: clock });
+  const alert = store.listOpenPolicyEvents()[0];
+  assert.equal(alert?.laneId, lane.id);
+  assert.equal(alert?.summary, "Crawlab · org/crawlab-pro#9: CI error: GitHub PR checks unavailable");
+  assert.equal(alert?.id, original.id);
+  assert.equal(alert?.createdAt, original.createdAt);
+  assert.equal(store.listOpenPolicyEvents().length, 1);
+  assert.equal((alert?.detail as { laneSlug?: string }).laneSlug, "crawlab");
+  assert.equal(store.listFriction({ status: "open" }).length, 0);
+});
+
+test("attributes PR alerts through the linked thread's lane owner", (t) => {
+  const store = PlatformStore.open(":memory:", { now: () => now });
+  t.after(() => store.close());
+  const agent = store.upsertAgent({ id: "owner", label: "Owner", role: "manager", connectorKind: "t3",
+    hostId: "east", externalRef: "environment/nested-thread", status: "idle" });
+  const lane = store.createLane({ slug: "the-lane", name: "The lane", ownerAgentId: agent.id });
+  const repository = "org/unmatched-repository";
+  store.reconcileT3Host({ hostId: "east", label: "East", mcpUrl: "https://t3.example/mcp", originNamespace: null,
+    connectionState: "connected" }, [{
+    threadId: "nested-thread", runs: [], agent,
+    prs: [{ hostId: "east", threadId: "nested-thread", prHost: "GitHub.com", repository, number: 10,
+      url: "https://github.com/org/unmatched-repository/pull/10", source: "manual", state: "open", watching: true,
+      title: null, headBranch: null, baseBranch: null, isDraft: false }],
+  }], { observedAt: now });
+  store.recordGitHubPrCheck(repository, 10, { isDraft: false, headSha: "a".repeat(40), rollupState: "failure",
+    totalChecks: 1, failedChecks: 1 });
+
+  const alert = evaluatePolicyAndHealth(store, { now }).events[0];
+  assert.equal(alert?.laneId, lane.id);
+  assert.equal(alert?.summary, "The lane · org/unmatched-repository#10: 1/1 checks failed");
+  assert.equal((alert?.detail as { laneSlug?: string }).laneSlug, "the-lane");
 });
