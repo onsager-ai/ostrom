@@ -449,8 +449,8 @@
     for (const lane of lanes) {
       const managerStatus = ctx.agentsById.get(lane.ownerAgentId)?.status;
       const summary = laneSummary(lane, ctx);
-      const busy = managerStatus === "active" || managerStatus === "waiting"
-        || activeLaneIds.has(lane.id) || activeAgentIds.has(lane.ownerAgentId);
+      const busy = lane.status !== "paused" && (managerStatus === "active" || managerStatus === "waiting"
+        || activeLaneIds.has(lane.id) || (lane.ownerAgentId != null && activeAgentIds.has(lane.ownerAgentId)));
       (busy || summary.status === "blocked" || summary.blocker ? visible : hidden).push(lane);
     }
     return { visible, hidden };

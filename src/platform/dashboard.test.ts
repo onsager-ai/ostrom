@@ -359,7 +359,8 @@ test("Lane Board caps exceptions, keeps lane summaries current, and preserves dr
       } };
     const lane = { id: "release", slug: "crawlab", name: "Release", status: "active", ownerAgentId: "release-manager", priorityRank: 1, goal };
     const idleLane = { id: "idle", slug: "idle", name: "Quiet Lane", status: "active", ownerAgentId: "idle-manager", priorityRank: 5 };
-    const pausedLane = { id: "paused", slug: "paused", name: "Paused Lane", status: "paused", priorityRank: 6 };
+    const pausedLane = { id: "paused", slug: "paused", name: "Paused Lane", status: "paused",
+      ownerAgentId: "paused-manager", priorityRank: 6 };
     const decision = (title, urgency, day, laneId) => ({
       title, urgency, createdAt: "2026-11-" + day + "T00:00:00Z", laneId, recommendation: "Proceed",
     });
@@ -446,19 +447,21 @@ test("Lane Board caps exceptions, keeps lane summaries current, and preserves dr
 
     const waitingLane = { ...idleLane, id: "waiting", slug: "waiting", ownerAgentId: "waiting-manager" };
     const stalledLane = { ...idleLane, id: "stalled", slug: "stalled", ownerAgentId: null };
+    const unownedLane = { id: "unowned", slug: "unowned", status: "active", priorityRank: 7 };
     const blockedLane = { ...idleLane, id: "blocked", slug: "blocked", ownerAgentId: "blocked-manager" };
     const planLane = { ...pausedLane, id: "plan", slug: "plan", goal: { weeklyPlan: { blocker: "Need a fixture" } } };
-    const listing = [withoutPlan, idleLane, pausedLane, waitingLane, stalledLane, blockedLane, planLane];
+    const listing = [withoutPlan, idleLane, pausedLane, waitingLane, stalledLane, blockedLane, planLane, unownedLane];
     const partitionContext = context({ ...boardData, digest: { sections: { lanes: listing } }, health: {
       ...health, pendingOwnerDecisions: [],
       policyAlerts: [alert("Manager failed twice", "two_failure_stop", 29, { agentId: "blocked-manager" })],
       agents: [...health.agents, { ...manager, id: "waiting-manager", status: "waiting" },
-        { ...idleManager, id: "blocked-manager" }],
+        { ...idleManager, id: "blocked-manager" }, { ...manager, id: pausedLane.ownerAgentId }],
+      activeRuns: [{ id: "paused-run", agentId: pausedLane.ownerAgentId, laneId: pausedLane.id }],
       stalledRuns: [{ id: "stalled-run", laneId: stalledLane.id }],
     } });
     const partitioned = partitionBoardLanes(listing, partitionContext);
     assert.deepEqual(partitioned.visible.map((item) => item.id), [lane.id, waitingLane.id, stalledLane.id, blockedLane.id, planLane.id]);
-    assert.deepEqual(partitioned.hidden.map((item) => item.id), [idleLane.id, pausedLane.id]);
+    assert.deepEqual(partitioned.hidden.map((item) => item.id), [idleLane.id, pausedLane.id, unownedLane.id]);
     assert.equal(laneSummary(waitingLane, partitionContext).status, "waiting");
     assert.equal(laneSummary(blockedLane, partitionContext).status, "blocked");
     assert.equal(summarizeLaneLine2(laneSummary(blockedLane, partitionContext)), "Blocker: Manager failed twice");
