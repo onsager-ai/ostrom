@@ -46,6 +46,51 @@ test("keeps only the trailing failure streak open", () => {
   }
 });
 
+test("alerts once for stale open goals and resolves when progress or lane status changes", (t) => {
+  let clock = "2026-11-26T12:00:00.000Z";
+  const store = PlatformStore.open(":memory:", { now: () => clock });
+  t.after(() => store.close());
+  const lane = (id: string, status: "active" | "paused" | "archived" = "active") =>
+    store.createLane({ id, slug: id, name: `${id} lane`, status, priorityRank: 1 });
+  const active = lane("stale");
+  const paused = lane("paused", "paused");
+  const archived = lane("archived", "archived");
+  const pauseMe = lane("pause-me");
+  const recent = lane("recent");
+  const met = lane("met");
+  const goal = (laneId: string, id: string, metricCurrent: number | null = 0) => store.setGoal({
+    id, laneId, statement: "Make progress", metricName: "items", metricCurrent, metricTarget: 2,
+  });
+  const staleGoal = goal(active.id, "stale-goal");
+  goal(paused.id, "paused-goal");
+  goal(archived.id, "archived-goal");
+  goal(pauseMe.id, "pause-me-goal");
+  clock = "2026-11-26T13:00:00.000Z";
+  goal(recent.id, "recent-goal");
+  goal(met.id, "met-goal", 2);
+
+  clock = "2026-11-27T11:59:59.000Z";
+  assert.deepEqual(evaluatePolicyAndHealth(store, { now: clock }).events, []);
+  clock = "2026-11-27T12:00:00.000Z";
+  const exactlyStale = evaluatePolicyAndHealth(store, { now: clock });
+  assert.deepEqual(exactlyStale.events.map(({ laneId, ruleCode }) => [laneId, ruleCode]).sort(), [
+    [active.id, "goal_stale"], [pauseMe.id, "goal_stale"],
+  ].sort());
+  assert.equal(exactlyStale.events.find(({ laneId }) => laneId === active.id)?.summary,
+    "stale lane goal stale (no progress for 24h+)");
+  assert.deepEqual(evaluatePolicyAndHealth(store, { now: clock }).events, []);
+  assert.equal(store.listOpenPolicyEvents().filter(({ ruleCode }) => ruleCode === "goal_stale").length, 2);
+
+  clock = "2026-11-27T13:00:00.000Z";
+  store.setGoal({ id: staleGoal.id, laneId: active.id, statement: "Make progress", metricName: "items",
+    metricCurrent: 1, metricTarget: 2 });
+  assert.equal(evaluatePolicyAndHealth(store, { now: clock }).policyAlerts.some(({ ruleCode }) => ruleCode === "goal_stale"), false);
+
+  assert.equal(evaluatePolicyAndHealth(store, { now: clock }).policyAlerts.filter(({ ruleCode }) => ruleCode === "goal_stale").length, 1);
+  store.updateLane(pauseMe.slug, { status: "paused" });
+  assert.equal(evaluatePolicyAndHealth(store, { now: clock }).policyAlerts.some(({ ruleCode }) => ruleCode === "goal_stale"), false);
+});
+
 test("keeps repeated failures on live runs and the latest settled run", (t) => {
   const store = PlatformStore.open(":memory:", { now: () => now });
   t.after(() => store.close());

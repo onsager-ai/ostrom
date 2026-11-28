@@ -374,6 +374,7 @@ test("Lane Board caps exceptions, keeps lane summaries current, and preserves dr
     const laneAlert = alert("CI failed twice", "two_failure_stop", 24, { repository: "org/crawlab-pro" });
     const alerts = [
       alert("CI warning", "pr_green_ci", 29), laneAlert,
+      { ...alert("Quiet Lane goal stale (no progress for 24h+)", "goal_stale", 28), laneId: idleLane.id },
       alert("Routing exception", "authority_routing", 25), alert("Budget exceeded", "budget_exceeded", 23),
       alert("Budget warning", "budget_cap", 30, { level: "warning" }),
       alert("Draft CI failed", "pr_green_ci", 29, { repository: "Org/Idle", number: 6, isDraft: false }),
@@ -404,10 +405,11 @@ test("Lane Board caps exceptions, keeps lane summaries current, and preserves dr
     assert.equal(waiting.children[1].children[3].textContent, "View all 4 waiting on you →");
     assert.equal(waiting.children[1].children[3].href, "#system");
     assert.deepEqual(titles(flagged), ["Routing exception", "CI failed twice", "Budget exceeded"]);
-    assert.equal(flagged.children[1].children[3].textContent, "View all 5 alerts →");
-    assert.deepEqual(laneNames(lanes), ["Release"]);
+    assert.equal(flagged.children[1].children[3].textContent, "View all 6 alerts →");
+    assert.deepEqual(laneNames(lanes), ["Release", "Quiet Lane"]);
     assert.match(textIn(lanes), /Release blocked Ship the release Next: Review patch · Blocker: Get test data/);
-    assert.match(textIn(lanes), /Show all lanes \(2 hidden\)/);
+    assert.match(textIn(lanes), /Quiet Lane goal stale \(no progress for 24h\+\)/);
+    assert.match(textIn(lanes), /Show all lanes \(1 hidden\)/);
     assert.doesNotMatch(textIn(view), /Open in T3|Draft CI failed/);
     for (const link of [waiting.children[1].children[1], flagged.children[1].children[1], laneRows(lanes)[0].firstChild]) {
       assert.equal(link.tag, "a");
@@ -417,6 +419,15 @@ test("Lane Board caps exceptions, keeps lane summaries current, and preserves dr
       assert.equal(link.rel, "noopener noreferrer");
       assert.equal(link.children[1].textContent, "↗");
     }
+    location.hash = "#system";
+    renderView();
+    const systemAlertRows = view.children[3].children[1].children;
+    const goalAlertRow = systemAlertRows.find((node) => textIn(node).includes("Release goal stale"));
+    assert.ok(goalAlertRow);
+    assert.equal(goalAlertRow.href, "https://t3.example/threads/env/thread");
+    assert.equal(goalAlertRow.children[0].children[0].children[1].textContent, "Warning");
+    location.hash = "";
+    renderView();
     const toggle = (panel) => panel.children[1].children.at(-1).firstChild;
     toggle(lanes).onclick();
     currentContext = context(boardData);

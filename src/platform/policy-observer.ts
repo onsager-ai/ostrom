@@ -17,6 +17,7 @@ interface HealthOptions {
   now: Date | string;
   stallIdleMinutes?: number;
   tokenWarnDays?: number;
+  goalStaleHours?: number;
 }
 
 export function readPlatformHealth(store: PlatformStore, {
@@ -64,6 +65,7 @@ export function evaluatePolicyAndHealth(store: PlatformStore, options: HealthOpt
   const failureKeys: string[] = [];
   const authorityKeys: string[] = [];
   const ciKeys: string[] = [];
+  const goalKeys: string[] = [];
   const events = [];
 
   if (enabled.has(failureRule)) {
@@ -151,6 +153,30 @@ export function evaluatePolicyAndHealth(store: PlatformStore, options: HealthOpt
       }
     }
   }
+  if (enabled.has("goal_stale")) {
+    const configuredHours = store.listPolicyRules().find((rule) => rule.code === "goal_stale")?.params;
+    const policyHours = configuredHours !== null && typeof configuredHours === "object" && !Array.isArray(configuredHours)
+      ? configuredHours.staleHours : undefined;
+    const staleHours = options.goalStaleHours ?? (typeof policyHours === "number" && Number.isFinite(policyHours) && policyHours > 0
+      ? policyHours : 24);
+    for (const lane of store.listLanes()) {
+      if (lane.status !== "active") continue;
+      const goal = store.getLatestGoal(lane.id);
+      if (goal === null || (goal.metricTarget > 0 && goal.metricCurrent !== null
+        && goal.metricCurrent >= goal.metricTarget)) continue;
+      const updatedMs = Date.parse(goal.updatedAt);
+      if (!Number.isFinite(updatedMs) || timestamp - updatedMs < staleHours * 3_600_000) continue;
+      const key = `goal:${lane.id}:${goal.id}`;
+      goalKeys.push(key);
+      const event = store.recordDedupedPolicyEvent({
+        ruleCode: "goal_stale", laneId: lane.id,
+        summary: `${lane.name} goal stale (no progress for ${staleHours}h+)`,
+        detail: { laneSlug: lane.slug, goalId: goal.id, updatedAt: goal.updatedAt, staleHours },
+      }, key, now);
+      if (event !== null) events.push(event);
+    }
+  }
+  store.resolveInactivePolicyEvents("goal_stale", goalKeys, now);
   store.resolveInactivePolicyEvents(ciRule, ciKeys, now);
   events.push(...evaluateBudgets(store, now, enabled.has("budget_cap")));
   store.resolveInactivePolicyEvents(failureRule, failureKeys, now);

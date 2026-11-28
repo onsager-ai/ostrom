@@ -9,7 +9,7 @@ type Digest = ReturnType<typeof generateOwnerDigest>;
 type ReadPath = "/v1/health/summary" | "/v1/spend/summary" | "/v1/lanes" |
   "/v1/decisions?status=pending" | `/v1/digest?window=${DigestWindow}`;
 
-const policyCodes = ["authority_routing", "budget_cap", "pr_green_ci", "two_failure_stop"] as const;
+const policyCodes = ["authority_routing", "budget_cap", "goal_stale", "pr_green_ci", "two_failure_stop"] as const;
 const finite = (value: number | null) => Number.isFinite(value) ? value : null;
 const oneOf = (value: string, allowed: readonly string[]) => allowed.includes(value) ? value : null;
 const timestamp = (value: string) =>

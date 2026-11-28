@@ -349,7 +349,7 @@
   const sortOwnerDecisions = (decisions) => [...decisions].sort((a, b) =>
     urgencyRank[a.urgency] - urgencyRank[b.urgency] || newestFirst(a, b));
   function policySeverity({ ruleCode, detail }) {
-    return ruleCode === "pr_green_ci" || ruleCode === "budget_warning"
+    return ruleCode === "pr_green_ci" || ruleCode === "goal_stale" || ruleCode === "budget_warning"
       || (ruleCode === "budget_cap" && detail?.level === "warning") ? "warn" : "err";
   }
   const sortAlerts = (alerts) => [...alerts].sort((a, b) =>
