@@ -670,6 +670,9 @@ test("the preview follows the system theme and contains no write controls or out
   assert.doesNotMatch(html, /\bStalled\b/);
   assert.match(html, /Stall signal: unavailable \(awaiting Semon #788\)/);
   assert.match(html, /\.tile p\s*\{[^}]*-webkit-line-clamp:\s*2\b[^}]*overflow:\s*hidden/);
+  assert.match(html, /\.tabbar\s*\{[^}]*position:\s*fixed;[^}]*inset:\s*auto 0 0/);
+  assert.match(html, /main\s*\{[^}]*calc\(72px \+ env\(safe-area-inset-bottom\)\)/);
+  assert.match(html, /\.card-head \+ \.settled-prs \{ border-top: 0 \}/);
 });
 
 const previewDom = `
@@ -745,10 +748,12 @@ test("preview overview summarizes UTC activity, prioritizes goals, and renders S
         { id: "future", status: "offline", lastSeenAt: "2026-11-28T13:00:31Z" },
       ],
       activeRuns: [
+        { id: "0", agentId: "active", model: "openai/older", status: "waiting_input", startedAt: "2026-11-28T12:54:00Z" },
         { id: "1", agentId: "active", model: "openai/gpt-6.2-sol", status: "running", startedAt: "2026-11-28T12:55:00Z" },
-        { id: "2", agentId: "waiting", model: "google/gemini-4-neon", status: "waiting_approval" },
-        { id: "3", externalRunRef: "Input run", status: "waiting_input" },
-        { id: "4", externalRunRef: "Legacy run", status: "stalled" },
+        { id: "2", agentId: "waiting", model: "google/gemini-4-neon", status: "waiting_approval", updatedAt: "2026-11-28T12:57:00Z" },
+        { id: "2-a", agentId: "waiting", model: "google/gemini-newest", status: "waiting_approval", updatedAt: "2026-11-28T12:57:00Z" },
+        { id: "3", agentId: "input", externalRunRef: "Input run", status: "waiting_input" },
+        { id: "4", agentId: "legacy", externalRunRef: "Legacy run", status: "stalled" },
       ],
       stalledRuns: [{ id: "1" }, { id: "4" }],
     };
@@ -789,11 +794,12 @@ test("preview overview summarizes UTC activity, prioritizes goals, and renders S
     const fleet = fleetCard(ctx);
     assert.match(fleet.textContent, /1 active1 waiting1 recent idle1 offline/);
     assert.match(fleet.textContent, /Codex · gpt-6.2-solRunning5m/);
-    assert.match(fleet.textContent, /Gemini · gemini-4-neonWaiting for approval/);
+    assert.match(fleet.textContent, /Gemini · gemini-newestWaiting for approval/);
     assert.match(fleet.textContent, /Input runWaiting for input/);
     assert.match(fleet.textContent, /Legacy runStatus unavailable/);
     assert.match(fleet.textContent, /Stall signal: unavailable \(awaiting Semon #788\)/);
-    assert.doesNotMatch(fleet.textContent, /stalled/i);
+    assert.doesNotMatch(fleet.textContent, /stalled|older|gemini-4-neon/i);
+    assert.equal(descendants(fleet).filter((node) => node.className === "run-row").length, 4);
 
     const throughputPanel = throughputCard(ctx);
     const chart = descendants(throughputPanel).find((node) => node.tag === "svg" && node.attrs.role === "img");
@@ -807,7 +813,9 @@ test("preview overview summarizes UTC activity, prioritizes goals, and renders S
     assert.match(throughputPanel.textContent, /1 open frictionRepeated approval request/);
     assert.equal(throughput(activityByDay([], [], testingNow)).textContent, "No data yet");
 
-    ctx = { ...ctx, decisions: [], health: { ...health, activeRuns: [...health.activeRuns, ...health.activeRuns] } };
+    const extraRuns = Array.from({ length: 4 }, (_, i) => ({ id: "extra-" + i, agentId: "extra-" + i,
+      externalRunRef: "Extra run " + i, status: "running" }));
+    ctx = { ...ctx, decisions: [], health: { ...health, activeRuns: [...health.activeRuns, ...extraRuns] } };
     render();
     const visible = () => descendants(byId("view")).filter((node) => node.className === "run-row");
     const toggle = () => descendants(byId("view")).find((node) => node.dataset.focus === "overview-run-toggle");
@@ -961,6 +969,9 @@ test("preview lane detail renders the six sections and uses only safe GitHub PR 
     assert.equal(external.length, 9);
     assert(external.every((node) => /^https:\/\/github\.com\/org\/product\/pull\/\d+$/.test(node.href)
       && node.target === "_blank" && node.rel === "noopener noreferrer"));
+    const settledOnly = lanePrCard(lane, detail.prs.filter(isSettledPr));
+    assert.equal(settledOnly.children.length, 2);
+    assert.equal(settledOnly.children[1].className, "settled-prs");
 
     const history = descendants(view).find((node) => node.className === "goal-history");
     history.open = true;
@@ -994,7 +1005,7 @@ test("preview lane detail renders the six sections and uses only safe GitHub PR 
   `, { assert, URL });
 });
 
-test("preview fetches lane detail and weekly report data immediately on navigation and refreshes the active lane", async () => {
+test("preview fetches lane detail immediately on navigation and refreshes the active lane", async () => {
   const script = await dashboardScript("./dashboard-v2.html");
   const calls: string[] = [];
   let poll: (() => Promise<void>) | undefined;
@@ -1006,7 +1017,7 @@ test("preview fetches lane detail and weekly report data immediately on navigati
     recentAgents: [], spend: { status: "unavailable" }, decisions: [], alerts: [], friction: [], timeline: [] };
   const readFixture = (path: string) => {
     calls.push(path);
-    if (path === "/v1/digest?window=13:00Z" || path === "/v1/digest?window=weekly") return dailyDigest;
+    if (path === "/v1/digest?window=13:00Z") return dailyDigest;
     if (path === "/v1/health/summary") return health;
     if (path === "/v1/lanes/product/detail") return detail;
     if (path.startsWith("/v1/spend/summary")) return { status: "unavailable" };
@@ -1039,9 +1050,218 @@ test("preview fetches lane detail and weekly report data immediately on navigati
   await flushed();
   assert.match(browser.text, /Lane not found\./);
   assert.doesNotMatch(browser.text, /Product/);
+});
 
-  browser.navigate("#report");
-  assert.equal(calls.at(-1), "/v1/digest?window=weekly");
+test("preview report fetches the selected digest immediately and ignores a superseded response", async () => {
+  const script = await dashboardScript("./dashboard-v2.html");
+  const calls: string[] = [];
+  const weeklyResponse = Promise.withResolvers<void>();
+  const digest = (window: string, generatedAt: string) =>
+    ({ window, generatedAt, markdown: "# Digest " + window, sections: { lanes: [] } });
+  const digests = {
+    "/v1/digest?window=13:00Z": digest("13:00Z", "2026-11-28T13:00:00Z"),
+    "/v1/digest?window=01:00Z": digest("01:00Z", "2026-11-28T01:00:00Z"),
+    "/v1/digest?window=weekly": digest("weekly", "2026-11-28T13:00:00Z"),
+  };
+  const linkedPrs = [
+    { number: 1, lastWakeAt: "2026-11-28T12:00:00Z" },
+    { number: 2, lastWakeAt: "2026-11-27T04:00:00Z" },
+    { number: 3, lastWakeAt: "2026-11-24T12:00:00Z" },
+  ].map((pr) => ({ ...pr, state: "merged", prHost: "github.com", repository: "org/repo" }));
+  const health = { hosts: [], pendingOwnerDecisions: [], policyAlerts: [], budgets: [], agents: [], activeRuns: [] };
+  const browser = runInNewContext(String.raw`${previewDom}
+    document.documentElement.dataset.auth = "proxy";
+    location.hash = "#report";
+    ${script}
+    const controls = () => descendants(byId("view")).find((node) => node.className === "filterbar report-switch").children;
+    ({
+      choose(label) { controls().find((node) => node.textContent === label).onclick(); },
+      get labels() { return controls().map((node) => node.textContent).join("|"); },
+      get selected() { return controls().find((node) => node.attrs["aria-pressed"] === "true").textContent; },
+      get text() { return byId("view").textContent; },
+    })
+  `, {
+    AbortSignal, URL, setInterval() {}, setTimeout() {},
+    async fetch(path: string, options: RequestInit) {
+      assert.equal(options.method ?? "GET", "GET");
+      calls.push(path);
+      if (path === "/v1/digest?window=weekly") await weeklyResponse.promise;
+      const value = digests[path as keyof typeof digests] ?? (path === "/v1/prs" ? linkedPrs
+        : path === "/v1/health/summary" ? health : path.startsWith("/v1/spend/summary") ? { status: "unavailable" } : []);
+      return { ok: true, async json() { return value; } };
+    },
+  }) as { choose(label: string): void; labels: string; selected: string; text: string };
+  const flushed = () => new Promise<void>((resolve) => { setImmediate(resolve); });
   await flushed();
-  assert.match(browser.text, /Weekly digestGenerated 2026-11-28 13:00 UTC/);
+  assert.equal(calls.filter((path) => path.includes("/v1/digest")).length, 1);
+  assert.equal(calls[0], "/v1/digest?window=13:00Z");
+  assert.equal(browser.labels, "Daily · 01:00Z|Daily · 13:00Z|Weekly");
+  assert.equal(browser.selected, "Daily · 13:00Z");
+  assert.match(browser.text, /Shipped · 24h.*org\/repo #1/);
+  assert.doesNotMatch(browser.text, /org\/repo #[23]/);
+
+  browser.choose("Weekly");
+  assert.equal(calls.at(-1), "/v1/digest?window=weekly");
+  assert.match(browser.text, /Loading Weekly report/);
+  assert.doesNotMatch(browser.text, /org\/repo #1/);
+  browser.choose("Daily · 01:00Z");
+  assert.equal(calls.at(-1), "/v1/digest?window=01:00Z");
+  await flushed();
+  assert.match(browser.text, /Shipped · 24h.*org\/repo #2/);
+  assert.doesNotMatch(browser.text, /org\/repo #[13]/);
+  weeklyResponse.resolve();
+  await flushed();
+  assert.equal(browser.selected, "Daily · 01:00Z");
+  assert.doesNotMatch(browser.text, /# Digest weekly|7 days|org\/repo #3/);
+
+  browser.choose("Weekly");
+  await flushed();
+  assert.match(browser.text, /Shipped · 7 days.*org\/repo #1.*org\/repo #2.*org\/repo #3.*# Digest weekly/);
+  browser.choose("Daily · 13:00Z");
+  assert.equal(calls.at(-1), "/v1/digest?window=13:00Z");
+  await flushed();
+  assert.match(browser.text, /Shipped · 24h.*org\/repo #1/);
+  assert.doesNotMatch(browser.text, /org\/repo #[23]/);
+});
+
+test("preview executive report displays platform records, rollup coverage and the raw Markdown", async () => {
+  const script = await dashboardScript("./dashboard-v2.html");
+  await runInNewContext(String.raw`${previewDom}
+    let copied, selected, clipboardError;
+    const navigator = { clipboard: { async writeText(markdown) {
+      if (clipboardError) throw Error("Clipboard unavailable");
+      copied = markdown;
+    } } };
+    window.getSelection = () => ({ selectAllChildren(node) { selected = node; } });
+    ${script}
+    location.hash = "#report";
+    const lanes = Array.from({ length: 12 }, (_, i) => ({ id: "lane-" + i, slug: "lane-" + i, name: "Lane " + i,
+      status: i === 11 ? "paused" : "active", priorityRank: i }));
+    const decisions = [
+      { id: "approval", laneId: "lane-9", title: "Review <release>?", recommendation: "Read the release draft before responding.",
+        evidence: { due: "2026-11-29" } },
+      { id: "scope", laneId: "lane-9", title: "Choose release scope", recommendation: "Keep current scope." },
+      { id: "plan", laneId: "lane-8", title: "Approve the plan", recommendation: "Approve.", evidence: { due: "2026-11-27" } },
+    ];
+    const health = { hosts: [], pendingOwnerDecisions: decisions, agents: [], activeRuns: [],
+      policyAlerts: [{ laneId: "lane-9" }], budgets: [
+        { enabled: true, scopeKind: "team", period: "weekly", capUsd: 50, warnPct: 80, spendSource: "semon" },
+        { enabled: true, scopeKind: "lane", period: "weekly", capUsd: 2, warnPct: 80, spendSource: "semon" },
+      ] };
+    const goal = (id, laneId, info) => ({ id, laneId, weekStart: "2026-11-23", statement: "Plan " + laneId,
+      metricName: "Releases", metricCurrent: 2, metricTarget: 4, completedAt: null, ...info });
+    const goals = [
+      goal("risk", "lane-9", { statement: "Ship two updates", weeklyPlan: { due: "2026-11-30" } }),
+      goal("waiting", "lane-8", { metricCurrent: null, weeklyPlan: { targetDate: "2026-12-01" } }),
+      goal("boundary", "lane-4", { weekStart: "2026-11-16", statement: "Cut the release", completedAt: "2026-11-27T13:00:00Z" }),
+      goal("outside", "lane-4", { weekStart: "2026-11-16", statement: "Old release", completedAt: "2026-11-27T12:59:59Z" }),
+    ];
+    const pr = (number, lastWakeAt, info = {}) => ({ number, lastWakeAt, prHost: "github.com", repository: "org/repo", state: "merged",
+      title: "Change " + number, url: "https://github.com/org/repo/pull/" + number, ...info });
+    const linkedPrs = [
+      pr(7, "2026-11-28T12:30:00Z"),
+      pr(7, "2026-11-28T12:20:00Z", { title: "Stale duplicate" }),
+      pr(8, "2026-11-28T13:01:00Z"),
+      pr(9, "2026-11-28T13:01:01Z"),
+      pr(10, "2026-11-27T12:59:59Z"),
+      pr(11, "2026-11-28T12:31:00Z", { url: "https://github.com@foreign.example/org/repo/pull/11" }),
+      pr(12, "2026-11-28T12:00:00Z", { state: "closed" }),
+      pr(13, "2026-11-28T12:00:00Z", { state: "open" }),
+      pr(14, null),
+      ...Array.from({ length: 6 }, (_, i) => pr(20 + i, "2026-11-28T11:00:00Z")),
+    ];
+    const friction = Array.from({ length: 6 }, (_, i) => ({ kind: i ? "repeated_ask" : "policy_break",
+      summary: "Friction " + i, createdAt: "2026-11-28T12:00:00Z" }));
+    const rollup = (preferredUsd, coverage) => ({ status: "available", preferredUsd, coverage, observedAt: "2026-11-28T12:00:00Z" });
+    const spend = { daily: rollup(17.5, "complete"), weekly: rollup(51, "partial"), monthly: rollup(173.21, "complete") };
+    const markdown = "# Report\n\n<em>Literal digest Markdown</em>";
+    const reportDigest = { generatedAt: "2026-11-28T13:00:00Z", markdown, sections: { lanes } };
+    ctx = context({ digest: reportDigest, health, friction, linkedPrs, goals, spend }, testingNow);
+    routeResult = { endpoint: routeEndpoint(), value: reportDigest };
+    render();
+
+    const view = byId("view");
+    const get = (id) => descendants(view).find((node) => node.id === id);
+    const button = (label) => descendants(view).find((node) => node.tag === "button" && node.textContent === label);
+    const panel = (className) => descendants(view).find((node) => node.className === className);
+    assert.match(panel("card report-verdict").textContent, /Executive Verdict.*Shipped1024hDecisions3blocking 2 lanesSpend\$17\.50TodayComplete/);
+    const decisionsRows = descendants(view).filter((node) => node.href === "#decisions");
+    assert.equal(decisionsRows.length, 3);
+    assert.match(decisionsRows[0].textContent, /Lane 9Due Nov 29Review <release>\?Read the release draft/);
+    assert.match(decisionsRows[1].textContent, /No due date/);
+    assert.match(decisionsRows[2].textContent, /Overdue Nov 27/);
+    assert.equal(descendants(decisionsRows[0]).find((node) => node.className === "report-clamp muted").tag, "span");
+
+    assert.equal(get("report-shipped").children.length, 8);
+    assert.match(get("report-shipped").textContent, /org\/repo #8Change 8Merged.*org\/repo #7Change 7Merged/);
+    assert.doesNotMatch(get("report-shipped").textContent, /#9|#10|#12|#13|#14|Stale duplicate|Cut the release/);
+    const showShipped = button("Show all 10 shipped items");
+    assert.equal(showShipped.attrs["aria-expanded"], "false");
+    showShipped.onclick();
+    assert.equal(get("report-shipped").children.length, 10);
+    assert.equal(button("Show fewer shipped items").attrs["aria-controls"], "report-shipped");
+    assert.match(get("report-shipped").children.at(-1).textContent, /Lane 4Cut the releaseCompleted/);
+    assert.equal(get("report-shipped").children.at(-1).href, "#lane/lane-4");
+    assert.equal(get("report-shipped").children.find((node) => node.textContent.includes("#11")).href, undefined);
+    const external = descendants(view).filter((node) => node.tag === "a" && !node.href.startsWith("#"));
+    assert.equal(external.length, 8);
+    assert(external.every((node) => /^https:\/\/github\.com\/org\/repo\/pull\/\d+$/.test(node.href)
+      && node.target === "_blank" && node.rel === "noopener noreferrer"));
+
+    const score = descendants(view).filter((node) => node.className === "matrix-row report-score");
+    assert.equal(score.length, 12);
+    assert.equal(score[0].href, "#lane/lane-8");
+    assert.match(score[0].textContent, /Lane 8WaitingPlan lane-8—Dec 1/);
+    assert.equal(score[1].href, "#lane/lane-9");
+    assert.match(score[1].textContent, /Lane 9At riskShip two updates2\/4Nov 30/);
+    assert(descendants(score[1]).some((node) => node.attrs["aria-label"] === "Releases: 2/4"));
+    assert.match(score.at(-1).textContent, /Lane 11Paused/);
+    assert.match(view.textContent, /Weekly ScorecardWeek of Nov 23LaneDoneDue/);
+
+    assert.match(panel("card report-spend").textContent, /Spend & Harness FrictionPartialToday\$17\.50This week\$51\.00Month est\.\$173\.21/);
+    assert.match(view.textContent, /\$51\.00 \/ \$50\.00 · weekly capCap reached/);
+    assert.match(view.textContent, /By-model & by-lane breakdown: No data yet \(awaiting Semon rollup\)/);
+    assert.match(view.textContent, /Stall signal: unavailable \(awaiting Semon #788\)/);
+    assert.equal(get("report-friction").children.length, 5);
+    assert.match(get("report-friction").textContent, /policy break1h 0m agoFriction 0/);
+    button("Show all 6 open friction items").onclick();
+    assert.equal(get("report-friction").children.length, 6);
+    assert.match(get("report-friction").textContent, /Friction 5/);
+    assert.doesNotMatch(view.textContent, /Stalled|Open in T3/);
+    assert(descendants(view).every((node) => node.tag !== "form" && (node.tag !== "button" || node.type === "button" && !node.disabled)));
+
+    const raw = view.children.at(-1);
+    assert.equal(raw.tag, "details");
+    assert.equal(raw.children[0].textContent, "Raw Markdown Digest");
+    assert.equal(raw.open, false);
+    assert.equal(descendants(raw).find((node) => node.tag === "pre").textContent, markdown);
+    raw.open = true;
+    raw.ontoggle();
+    (async () => {
+      await button("Copy Markdown").onclick();
+      assert.equal(copied, markdown);
+      assert.match(raw.textContent, /Markdown copied\./);
+      clipboardError = true;
+      await button("Copy Markdown").onclick();
+      assert.equal(selected.tag, "pre");
+      assert.equal(selected.textContent, markdown);
+      assert.match(raw.textContent, /Markdown selected\./);
+
+      ctx = { ...ctx, linkedPrs: [], goals: [], decisions: [], friction: [],
+        health: { ...health, budgets: [] }, spend: {} };
+      render();
+      assert.equal(view.children.at(-1).open, true);
+      assert.match(view.textContent, /Shipped024hDecisions0none waitingSpend—TodayUnavailable/);
+      for (const empty of ["No owner decisions waiting", "No merged PRs or completed goals recorded in this window yet",
+        "No team budget configured", "No open friction items"]) assert(view.textContent.includes(empty));
+      ctx.spend.daily = rollup(null, "unknown");
+      render();
+      assert.match(panel("card report-verdict").textContent, /Spend—TodayUnknown/);
+      ctx.spend.weekly = spend.weekly;
+      reportWindow = "weekly";
+      routeResult = { endpoint: routeEndpoint(), value: reportDigest };
+      render();
+      assert.match(panel("card report-verdict").textContent, /Spend\$51\.00This weekPartial/);
+    })()
+  `, { assert, URL });
 });

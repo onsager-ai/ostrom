@@ -548,6 +548,23 @@ test("seeded policy rules observe, and the friction count uses UTC days and owne
   assert.equal(store.listFriction({ status: "open" }).at(-1)?.id, entry.id);
 });
 
+test("resolving policy events keeps friction open while any alert shares its rule and summary", (t) => {
+  const now = "2026-11-28T13:00:00.000Z";
+  const store = memory(t, () => now);
+  const ruleCode = "two_failure_stop";
+  const summary = "Worker failed two consecutive runs";
+  store.recordDedupedPolicyEvent({ ruleCode, summary }, "first", now, true);
+  store.recordDedupedPolicyEvent({ ruleCode, summary }, "second", now);
+  const correction = store.recordFriction({ kind: "correction", ruleCode, summary });
+  const otherRule = store.recordFriction({ kind: "policy_break", ruleCode: "pr_green_ci", summary });
+
+  store.resolveInactivePolicyEvents(ruleCode, ["second"], now);
+  assert.equal(store.listFriction({ status: "open" }).length, 3);
+  store.resolveInactivePolicyEvents(ruleCode, [], now);
+  assert.deepEqual(store.listFriction({ status: "open" }), [otherRule, correction]);
+  assert.deepEqual(store.listFriction({ status: "kept" }).map(({ kind, summary }) => [kind, summary]), [["policy_break", summary]]);
+});
+
 test("budgets are scoped by period and updates preserve their identity", (t) => {
   const store = memory(t);
   const input = { scopeKind: "team", period: "weekly", capUsd: 10, warnPct: 80, spendSource: "semon" } as const;

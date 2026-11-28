@@ -28,10 +28,16 @@ test("keeps only the trailing failure streak open", () => {
     assert.equal(store.listOpenPolicyEvents().length, 1);
     assert(store.hasOpenPolicyEvent("two_failure_stop", "streak:worker:f2"));
     assert.deepEqual(evaluatePolicyAndHealth(store, { now }).events, []);
+    const [firstFriction] = store.listFriction({ status: "open" });
+    assert(firstFriction);
+    assert.equal(firstFriction.kind, "policy_break");
+    assert.equal(firstFriction.summary, "Worker failed two consecutive runs");
 
     record("completed", 4, "completed");
     assert.deepEqual(evaluatePolicyAndHealth(store, { now }).policyAlerts, []);
     assert(!store.hasOpenPolicyEvent("two_failure_stop", "streak:worker:f2"));
+    assert.deepEqual(store.listFriction({ status: "open" }), []);
+    assert.deepEqual(store.listFriction({ status: "kept" }), [{ ...firstFriction, status: "kept" }]);
 
     record("f4", 5, "failed");
     record("f5", 6, "failed");
@@ -40,7 +46,10 @@ test("keeps only the trailing failure streak open", () => {
     assert.equal(store.listOpenPolicyEvents().length, 1);
     assert(store.hasOpenPolicyEvent("two_failure_stop", "streak:worker:f5"));
     assert.deepEqual(evaluatePolicyAndHealth(store, { now }).events, []);
-    assert.equal(store.listFriction({ status: "open" }).length, 2);
+    const [secondFriction] = store.listFriction({ status: "open" });
+    assert(secondFriction);
+    assert.notEqual(secondFriction.id, firstFriction.id);
+    assert.equal(store.listFriction({ status: "open" }).length, 1);
   } finally {
     store.close();
   }
@@ -202,9 +211,11 @@ test("GitHub draft state overrides linked T3 metadata and clears PR alerts", (t)
   assert.equal(refreshed.createdAt, twoFailureAlert.createdAt);
   assert.equal(store.listOpenPolicyEvents().length, 1);
   assert.equal(store.listFriction({ status: "open" }).length, frictionCount);
+  assert.equal(store.listFriction({ status: "open" })[0]?.summary, refreshed.summary);
 
   record(true, "b");
   assert.deepEqual(openRules(), []);
+  assert.deepEqual(store.listFriction({ status: "open" }), []);
   assert.equal(store.listT3ThreadPrs()[0]?.isDraft, false);
 });
 
