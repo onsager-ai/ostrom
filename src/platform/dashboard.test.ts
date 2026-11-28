@@ -36,6 +36,7 @@ test("serves the loopback page and proxies authenticated GETs only", async () =>
   const store = PlatformStore.open(":memory:");
   const api = await startPlatformApiServer({ store, socketPath });
   try {
+    const lane = store.createLane({ slug: "platform", name: "Platform" });
     store.upsertT3HostState({ hostId: "east", label: "<script>invalid()</script>", mcpUrl: "https://t3.example/mcp",
       originNamespace: null, connectionState: "connected" });
     const dashboard = await startPlatformDashboard({ socketPath, port: 0 });
@@ -86,6 +87,11 @@ test("serves the loopback page and proxies authenticated GETs only", async () =>
       assert.equal((await read(url, "/v1/decisions", headers, "POST")).status, 405);
       assert.equal((await read(url, "/v1/spend/rollups", headers, "POST")).status, 405);
       assert.equal((await read(url, "/v1/lanes/platform/goal/self", headers, "POST")).status, 405);
+      const detail = await read(url, "/v1/lanes/platform/detail", headers);
+      assert.equal(detail.status, 200);
+      assert.deepEqual(JSON.parse(detail.body).lane, lane);
+      assert.equal((await read(url, "/v1/lanes/platform/detail")).status, 401);
+      assert.equal((await read(url, "/v1/lanes/platform/detail", headers, "PUT")).status, 405);
       assert.equal((await read(url, "/v1/goals/audit?lane=platform", headers)).status, 404);
       assert.equal((await read(url, "/", {}, "HEAD")).status, 405);
       assert.equal((await read(url, "/v1/budgets", headers, "PUT")).status, 405);
@@ -676,7 +682,8 @@ const previewDom = `
       set textContent(value) { this.text = String(value); this.children = []; },
       setAttribute(key, value) { this.attrs[key] = String(value); },
       removeAttribute(key) { delete this.attrs[key]; },
-      querySelector() { return null; },
+      querySelector(name) { return descendants(this).slice(1).find((node) => node.tag === name) ?? null; },
+      focus() {},
     };
   }
   function descendants(node) {
@@ -694,7 +701,7 @@ const previewDom = `
     querySelectorAll() { return []; },
   };
   const location = { hash: "#overview" };
-  const window = { addEventListener() {} };
+  const window = { addEventListener(name, handler) { this[name] = handler; }, scrollTo() {} };
   const testingNow = Date.parse("2026-11-28T13:00:00Z");
 `;
 
@@ -703,25 +710,26 @@ test("preview overview summarizes UTC activity, prioritizes goals, and renders S
   runInNewContext(String.raw`${previewDom}
     ${script}
     const lanes = [
-      { id: "ongoing", name: "Ongoing", status: "active", priorityRank: 1 },
-      { id: "waiting", name: "Waiting lane", status: "active", priorityRank: 2 },
-      { id: "risk", name: "Risk lane", status: "active", priorityRank: 3 },
-      { id: "old", name: "Prior week", status: "active", priorityRank: 4 },
+      { id: "ongoing", slug: "ongoing", name: "Ongoing", status: "active", priorityRank: 1 },
+      { id: "waiting", slug: "waiting", name: "Waiting lane", status: "active", priorityRank: 2 },
+      { id: "risk", slug: "risk", name: "Risk lane", status: "active", priorityRank: 3 },
+      { id: "old", slug: "old", name: "Prior week", status: "active", priorityRank: 4 },
     ];
     const weekStart = "2026-11-23";
     const goals = [
       { laneId: "ongoing", weekStart, metricCurrent: 3, metricTarget: 8, metricName: "Items", weeklyPlan: { targetDate: "2026-11-29" } },
       { laneId: "waiting", weekStart, metricCurrent: 1, metricTarget: 4, metricName: "Checks" },
       { laneId: "risk", weekStart, metricCurrent: 0, metricTarget: 1, metricName: "Releases" },
-      { laneId: "old", weekStart: "2026-11-16", metricCurrent: 99, metricTarget: 99, statement: "Reviewed release", completedAt: "2026-11-28T03:00:00Z" },
+      { laneId: "old", weekStart: "2026-11-16", metricCurrent: 99, metricTarget: 99, statement: "Reviewed release", completedAt: "2026-11-28T13:00:20Z" },
+      { laneId: "old", weekStart: "2026-11-16", statement: "Beyond clock grace", completedAt: "2026-11-28T13:00:31Z" },
       { laneId: "old", weekStart: "2026-11-16", statement: "Other goal", completedAt: "2026-11-23T03:00:00Z" },
     ];
     function pr(number, lastWakeAt, state = "merged") {
       return { prHost: "github.com", repository: "org/project", number, lastWakeAt, state, title: "PR " + number };
     }
     const linkedPrs = [
-      pr(7, "2026-11-28T08:00:00Z"), pr(7, "2026-11-28T09:00:00Z"), pr(3, "2026-11-22T00:00:00Z"),
-      pr(1, "2026-11-21T23:59:59Z"), pr(2, "not a date"), pr(4, "2026-11-28T14:00:00Z"),
+      pr(7, "2026-11-28T08:00:00Z"), pr(7, "2026-11-28T13:00:25Z"), pr(3, "2026-11-22T00:00:00Z"),
+      pr(1, "2026-11-21T23:59:59Z"), pr(2, "not a date"), pr(4, "2026-11-28T13:00:31Z"),
       pr(9, "2026-11-28T11:00:00Z", "open"),
     ];
     const risk = { laneId: "risk", summary: "Checks failing", detail: { repository: "org/project", number: 10 } };
@@ -730,9 +738,10 @@ test("preview overview summarizes UTC activity, prioritizes goals, and renders S
       agents: [
         { id: "active", status: "active", label: "Running agent" },
         { id: "waiting", status: "waiting", label: "Waiting agent", lastSeenAt: "2026-11-20T09:00:00Z" },
-        { id: "recent", status: "idle", lastSeenAt: "2026-11-27T13:00:00Z" },
-        { id: "old", status: "idle", lastSeenAt: "2026-11-27T12:59:59Z" },
-        { id: "offline", status: "offline", lastSeenAt: "2026-11-28T09:00:00Z" },
+        { id: "recent", status: "idle", lastSeenAt: "2026-11-27T12:59:30Z" },
+        { id: "old", status: "idle", lastSeenAt: "2026-11-27T12:59:29Z" },
+        { id: "offline", status: "offline", lastSeenAt: "2026-11-28T13:00:20Z" },
+        { id: "future", status: "offline", lastSeenAt: "2026-11-28T13:00:31Z" },
       ],
       activeRuns: [
         { id: "1", agentId: "active", model: "openai/gpt-6.2-sol", status: "running", startedAt: "2026-11-28T12:55:00Z" },
@@ -745,7 +754,7 @@ test("preview overview summarizes UTC activity, prioritizes goals, and renders S
     const rollup = (preferredUsd, coverage = "complete") =>
       ({ status: "available", preferredUsd, coverage, observedAt: "2026-11-28T12:00:00Z" });
     const spend = { daily: rollup(17.5), weekly: rollup(51, "partial"), monthly: rollup(173.21) };
-    ctx = context({ digest: { sections: { lanes } }, health, goals, linkedPrs, spend,
+    ctx = context({ digest: { generatedAt: "2026-11-28T12:59:30Z", sections: { lanes } }, health, goals, linkedPrs, spend,
       friction: [{ summary: "Repeated approval request" }] }, testingNow);
 
     const summary = summaryTiles(ctx);
@@ -761,6 +770,7 @@ test("preview overview summarizes UTC activity, prioritizes goals, and renders S
     const laneText = goalsCard(ctx, true).textContent;
     assert.match(laneText, /Waiting on owner.*Risk laneAt risk.*OngoingActive3\/8Nov 29.*Prior weekNo goal/);
     assert.doesNotMatch(laneText, /99\/99/);
+    assert.equal(overview({ ...ctx, decisions: [] }).flatMap(descendants).filter((node) => node.href === "#lane/ongoing").length, 2);
 
     const cost = spendCard(ctx);
     assert.match(cost.textContent, /PartialToday\$17\.50This week\$51\.00Month est\.\$173\.21/);
@@ -789,6 +799,7 @@ test("preview overview summarizes UTC activity, prioritizes goals, and renders S
     assert(chart);
     assert.equal(descendants(chart).filter((node) => node.tag === "rect").length, 2);
     assert.equal(descendants(chart).filter((node) => node.tag === "circle").length, 2);
+    assert.notEqual(chart.attrs.preserveAspectRatio, "none");
     assert.match(chart.attrs["aria-label"], /Nov 22: 1 PR merged, 0 goals completed/);
     assert.match(chart.attrs["aria-label"], /Nov 28: 1 PR merged, 1 goal completed/);
     assert.match(throughputPanel.textContent, /2 PRs merged2 goals completed/);
@@ -842,4 +853,176 @@ test("preview decisions filter by real due dates and blockers and render read-on
     assert.equal(articles().length, 1);
     assert.match(articles()[0].textContent, /Approve <review>\?/);
   `, { assert, URL });
+});
+
+test("preview lane directory filters stored goals and links to the in-Ostrom lane view", async () => {
+  const script = await dashboardScript("./dashboard-v2.html");
+  runInNewContext(String.raw`${previewDom}
+    ${script}
+    const lanes = [
+      { lane: { id: "prod", slug: "prod", name: "Product", status: "active", goal: {
+        statement: "Ship the release", metricName: "PRs", metricCurrent: 2, metricTarget: 3,
+        weeklyPlan: { due: "2026-11-30" },
+      } } },
+      { lane: { id: "ops", slug: "ops", name: "Operations", status: "active", goal: {
+        statement: "Review access", metricName: "Checks", metricCurrent: 0, metricTarget: 1,
+      } } },
+      { lane: { id: "docs", slug: "docs", name: "Docs", status: "active", ownerAgentId: "manager" } },
+      { lane: { id: "paused", slug: "paused", name: "Paused lane", status: "paused" } },
+      { lane: { id: "archive", slug: "archive", name: "Archived lane", status: "archived" } },
+    ];
+    ctx = { lanes, decisions: [], alerts: [{ laneId: "ops" }], health: { agents: [{ id: "manager", status: "waiting" }] } };
+    location.hash = "#lanes";
+    render();
+    const view = byId("view");
+    const visibleLanes = () => descendants(view).filter((node) => node.className === "lane-row");
+    const button = (label) => descendants(view).find((node) => node.tag === "button" && node.textContent === label);
+    assert.equal(visibleLanes().map((row) => row.href).join(","), "#lane/prod,#lane/ops,#lane/docs,#lane/paused,#lane/archive");
+    assert.match(visibleLanes()[0].textContent, /ProductActiveShip the releaseDone 2\/3Due Nov 30›/);
+    assert(descendants(visibleLanes()[0]).some((node) => node.attrs["aria-label"] === "PRs: 2/3"));
+    for (const [name, slug] of [["At risk", "ops"], ["Waiting", "docs"], ["Active", "prod"], ["Paused", "paused"]]) {
+      button(name).onclick();
+      assert.equal(button(name).attrs["aria-pressed"], "true");
+      assert.equal(visibleLanes().map((row) => row.href).join(","), "#lane/" + slug);
+    }
+    button("All").onclick();
+    const search = descendants(view).find((node) => node.tag === "input");
+    search.value = " ACCESS ";
+    search.oninput();
+    assert.equal(visibleLanes().map((row) => row.href).join(","), "#lane/ops");
+    button("Paused").onclick();
+    assert.match(view.textContent, /No lanes match these filters\./);
+  `, { assert });
+});
+
+test("preview lane detail renders the six sections and uses only safe GitHub PR links", async () => {
+  const script = await dashboardScript("./dashboard-v2.html");
+  runInNewContext(String.raw`${previewDom}
+    ${script}
+    location.hash = "#lane/%70roduct";
+    assert.equal(routeEndpoint(), "/v1/lanes/product/detail");
+    const lane = { id: "product", name: "Product", status: "active" };
+    const goal = { id: "current", statement: "Publish an update", metricName: "Releases", metricCurrent: 1, metricTarget: 2,
+      weeklyPlan: { nextStep: "Review the draft", blockers: ["Release notes"], due: "2026-11-30" } };
+    const prior = { id: "prior", statement: "Cut the previous release", metricName: "Releases", metricCurrent: 1, metricTarget: 1,
+      weekStart: "2026-11-16", completedAt: "2026-11-22T11:30:00Z" };
+    const pr = (number, info = {}) => ({ number, repository: "org/product", title: "Update " + number,
+      url: "https://github.com/org/product/pull/" + number, state: "open", ...info });
+    const detail = { lane, goal, goalHistory: [goal, prior], prs: [pr(4, { rollupState: "success" }),
+      pr(7, { rollupState: "failure", failedChecks: 1, totalChecks: 25, consecutiveFailures: 2 }),
+      pr(5, { rollupState: "pending", consecutiveFailures: 2 }),
+      pr(8, { url: "https://github.com/org/product/pull/8?redirect=invalid" }),
+      pr(9, { url: "http://github.com/org/product/pull/9" }),
+      pr(10, { url: "https://github.com@other.example/org/product/pull/10" }),
+      pr(11, { url: "https://github.com/org/../pull/11" }),
+      ...Array.from({ length: 6 }, (_, index) => pr(20 + index, { state: index ? "closed" : "merged" }))],
+      activeRuns: [], recentAgents: [], spend: { status: "unavailable" },
+      decisions: [{ id: "review", laneId: lane.id, authority: "owner", status: "pending", urgency: "blocking_today",
+        title: "Approve the release?", recommendation: "Approve", options: ["Approve", "Defer"],
+        evidence: { due: "2026-11-28T14:00:00Z", blocks: ["Rollout"] } },
+      { id: "resolved", laneId: lane.id, authority: "owner", status: "approved", title: "Old decision" }],
+      alerts: [{ summary: "Two check failures" }], friction: [{ summary: "Clarify scope" }], timeline: [
+        { kind: "goal_completed", at: "2026-11-22T11:30:00Z", summary: "Goal completed · Cut the previous release" },
+      ] };
+    routeResult = { endpoint: routeEndpoint(), value: detail };
+    render();
+    const view = byId("view");
+    assert.equal(descendants(view).find((node) => node.className === "lineup lane-back").href, "#lanes");
+    assert(navItems.filter(({ key }) => key === "lanes").every(({ link }) => link.attrs["aria-current"] === "page"));
+    assert.equal(descendants(view).filter((node) => node.tag === "h2").map((node) => node.textContent).join("|"),
+      "Current Goal & Next Step|Recent PRs & Merges|Running Workers|Lane Spend|Decisions & Blockers|Activity Timeline");
+    assert.match(view.textContent, /At riskProduct.*Publish an updateDone 1\/2Due Nov 30Next: Review the draft/);
+    assert.match(view.textContent, /Goal History · 1Cut the previous releaseWeek of 2026-11-16 · Releases 1\/1Completed/);
+    assert.match(view.textContent, /#7 Update 7org\/product · 1\/25 checks failed · 2 consecutive headsFailing›#5 Update 5org\/product · re-runningPending›#4/);
+    assert.match(view.textContent, /Merged & closed · 6.*mergedMerged/);
+    assert.match(view.textContent, /No active runs on ProductStall signal: unavailable \(awaiting Semon #788\)/);
+    assert.match(view.textContent, /No data yet · awaiting per-lane Semon rollup/);
+    assert.match(view.textContent, /Approve the release\?RecommendedApproveOptionsDeferBlocks RolloutRead-only · Answer in chat/);
+    assert.match(view.textContent, /Goal completed · Cut the previous release2026-11-22 11:30:00 UTC/);
+    for (const label of ["Two check failures", "Release notes", "Clarify scope"]) assert(view.textContent.includes(label));
+    assert.doesNotMatch(view.textContent, /Old decision|Stalled/);
+    assert(!descendants(view).some((node) => ["button", "form", "input"].includes(node.tag)));
+    const external = descendants(view).filter((node) => node.tag === "a" && node.href !== "#lanes");
+    assert.equal(external.length, 9);
+    assert(external.every((node) => /^https:\/\/github\.com\/org\/product\/pull\/\d+$/.test(node.href)
+      && node.target === "_blank" && node.rel === "noopener noreferrer"));
+
+    const history = descendants(view).find((node) => node.className === "goal-history");
+    history.open = true;
+    history.ontoggle();
+    detail.activeRuns = [
+      { agentLabel: "Manager", model: "gpt-6.2-sol", status: "running", isLaneOwner: true,
+        startedAt: new Date(Date.now() - 300_000).toISOString() },
+      { agentLabel: "Worker", model: "google/gemini-4-neon", status: "waiting_input" },
+    ];
+    detail.spend = { status: "available", coverage: "partial", preferredUsd: 12.5 };
+    render();
+    assert(descendants(view).find((node) => node.className === "goal-history").open);
+    assert.match(view.textContent, /LanesAt riskCodex · gpt-6\.2-solProduct/);
+    assert.match(view.textContent, /ManagerCodex · gpt-6\.2-solRunning5mWorkerGemini · gemini-4-neonWaiting for input/);
+    assert.match(view.textContent, /Lane Spend\$12\.50Coverage: partialThis week · Semon · USD/);
+
+    routeResult.value = { lane, goal: null, goalHistory: [], prs: [], activeRuns: [], recentAgents: [],
+      spend: { status: "unavailable" }, decisions: [], alerts: [], friction: [], timeline: [] };
+    render();
+    for (const label of ["No prior goals recorded yet", "No linked PRs yet", "No open blockers or decisions", "No recent activity recorded yet"]) {
+      assert(view.textContent.includes(label));
+    }
+    location.hash = "#lane/%ZZ";
+    assert.equal(routeEndpoint(), null);
+    render();
+    assert.match(view.textContent, /Lane not found\./);
+  `, { assert, URL });
+});
+
+test("preview fetches lane detail and weekly report data immediately on navigation and refreshes the active lane", async () => {
+  const script = await dashboardScript("./dashboard-v2.html");
+  const calls: string[] = [];
+  let poll: (() => Promise<void>) | undefined;
+  const generatedAt = "2026-11-28T13:00:00Z";
+  const sections = { lanes: [], decisions: [], policyAlerts: [], interventionsByDay: [], openFrictionCount: 0 };
+  const dailyDigest = { generatedAt, sections };
+  const health = { hosts: [], pendingOwnerDecisions: [], policyAlerts: [], budgets: [], agents: [], activeRuns: [] };
+  const detail = { lane: { name: "Product", status: "active" }, goal: null, goalHistory: [], prs: [], activeRuns: [],
+    recentAgents: [], spend: { status: "unavailable" }, decisions: [], alerts: [], friction: [], timeline: [] };
+  const readFixture = (path: string) => {
+    calls.push(path);
+    if (path === "/v1/digest?window=13:00Z" || path === "/v1/digest?window=weekly") return dailyDigest;
+    if (path === "/v1/health/summary") return health;
+    if (path === "/v1/lanes/product/detail") return detail;
+    if (path.startsWith("/v1/spend/summary")) return { status: "unavailable" };
+    if (path === "/v1/friction?status=open" || path === "/v1/prs" || path === "/v1/goals") return [];
+    throw new Error(`Unexpected dashboard request ${path}`);
+  };
+  const browser = runInNewContext(String.raw`${previewDom}
+    document.documentElement.dataset.auth = "proxy";
+    ${script}
+    ({ navigate(hash) { location.hash = hash; window.hashchange(); }, get text() { return byId("view").textContent; } })
+  `, { AbortSignal, setInterval() {}, setTimeout(callback: () => Promise<void>) { poll = callback; },
+    async fetch(path: string) {
+      if (path === "/v1/lanes/missing/detail") { calls.push(path); return { ok: false, status: 404 }; }
+      const value = readFixture(path);
+      return { ok: true, async json() { return value; } };
+    } }) as { navigate: (hash: string) => void; text: string };
+  const flushed = () => new Promise<void>((resolve) => { setImmediate(resolve); });
+  await flushed();
+  assert(poll);
+  assert.equal(calls.length, 8);
+  browser.navigate("#lane/product");
+  assert.equal(calls.at(-1), "/v1/lanes/product/detail");
+  await flushed();
+  assert.match(browser.text, /Product.*No active runs on Product/);
+  await poll();
+  assert.equal(calls.filter((path) => path === "/v1/lanes/product/detail").length, 2);
+
+  browser.navigate("#lane/missing");
+  assert.equal(calls.at(-1), "/v1/lanes/missing/detail");
+  await flushed();
+  assert.match(browser.text, /Lane not found\./);
+  assert.doesNotMatch(browser.text, /Product/);
+
+  browser.navigate("#report");
+  assert.equal(calls.at(-1), "/v1/digest?window=weekly");
+  await flushed();
+  assert.match(browser.text, /Weekly digestGenerated 2026-11-28 13:00 UTC/);
 });

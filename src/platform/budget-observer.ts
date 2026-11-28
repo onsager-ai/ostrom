@@ -10,8 +10,9 @@ type SpendSummary = Omit<ReturnType<PlatformStore["summarizeSpend"]>, "coverage"
   snapshotId?: string | null;
 };
 
-export function readSpendSummary(store: PlatformStore, filter: SpendSummaryFilter, now: Date | string): SpendSummary {
-  const summary = store.summarizeSpend(filter, now);
+export function readSpendSummary(store: PlatformStore, filter: SpendSummaryFilter, now: Date | string,
+  { rollupOnly = false }: { rollupOnly?: boolean } = {}): SpendSummary {
+  const summary = store.summarizeSpend(filter, now, { includeSessionSnapshots: !rollupOnly });
   if (summary.snapshotCount === 0) {
     const rollup = store.getSpendRollup(filter, summary.since);
     if (rollup !== null) {

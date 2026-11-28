@@ -132,7 +132,7 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 16px
 .run-row strong { display: block }
 .model { display: inline-flex; align-items: center; gap: 5px; font-size: 13px; color: var(--muted) }
 .model .icon { width: 15px; height: 15px }
-.chart { display: block; width: 100%; height: 92px; overflow: visible }
+.chart { display: block; width: 100%; height: auto; overflow: visible }
 .chart rect { fill: var(--accent); opacity: .7 }
 .chart circle { fill: var(--green); stroke: var(--surface); stroke-width: 1.5 }
 .chart line { stroke: var(--line-strong); stroke-width: 1; vector-effect: non-scaling-stroke }
@@ -154,6 +154,42 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 16px
 .options li { border: 1px solid var(--line); border-radius: 7px; padding: 7px 9px }
 .chip { min-height: 44px; color: var(--accent-text) }
 .chip:hover { border-color: var(--accent) }
+.lane-directory { display: grid; gap: 8px }
+.lane-search {
+  width: 100%; min-height: 44px; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--line-strong);
+  background: var(--surface); color: var(--ink); font: inherit;
+}
+.lane-row, .detail-row {
+  display: flex; align-items: center; gap: 9px; min-width: 0; padding: 9px 12px; border-bottom: 1px solid var(--line);
+}
+.lane-row:last-child, .detail-row:last-child { border-bottom: 0; border-radius: 0 0 11px 11px }
+.lane-row:hover, a.detail-row:hover, a.matrix-row:hover { background: var(--raised) }
+.lane-row .row-copy, .detail-row .row-copy { flex: 1; min-width: 0; display: grid; gap: 3px }
+.row-mark { display: grid; flex: none; width: 29px; height: 29px; place-items: center; border-radius: 7px;
+  background: var(--raised); border: 1px solid var(--line) }
+.row-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 9px }
+.row-meta .meter { flex: 1 0 42px }
+.row-meta .mono { white-space: nowrap }
+.row-end { display: flex; flex-wrap: wrap; justify-content: end; align-items: center; gap: 4px 7px }
+.detail-row .row-end { max-width: 42% }
+.lane-top { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 4px 10px }
+.lane-back { min-height: 44px; padding-inline: 5px; color: var(--accent-text); font-weight: 600 }
+.lane-back:hover { text-decoration: underline }
+.lane-goal { font-size: 19px; font-weight: 650; line-height: 1.3; letter-spacing: -.02em }
+.goal-history, .settled-prs { border-top: 1px solid var(--line) }
+.disclosure-label { min-height: 44px; padding: 10px 12px; color: var(--accent-text); cursor: pointer; font-weight: 600 }
+.history-heading { padding-inline: 12px }
+.lane-blockers .decision-card { box-shadow: none }
+.timeline { list-style: none; margin: 0; padding: 0 }
+.timeline li { position: relative; padding: 7px 0 7px 33px; min-height: 48px }
+.timeline li::before { content: ""; position: absolute; top: 20px; bottom: -12px; left: 11px; border-left: 1px solid var(--line-strong) }
+.timeline li:last-child::before { display: none }
+.timeline li .row-mark { position: absolute; top: 7px; left: 0; width: 23px; height: 23px; border-radius: 50%; z-index: 1 }
+.timeline .icon { width: 14px; height: 14px }
+.timeline time { display: block; color: var(--muted) }
+@media (min-width: 640px) {
+  .lane-detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)) }
+}
 @media (min-width: 960px) {
   .shell { grid-template-columns: 220px minmax(0, 1fr); grid-template-rows: 48px 1fr }
   .app-header { grid-area: 1 / 2; justify-content: space-between; padding-inline: 22px }
@@ -232,6 +268,8 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 16px
     codex: "M4 5h16v14H4z M7 9l3 3-3 3m6 0h4",
     gemini: "M12 2c1 6 4 9 10 10-6 1-9 4-10 10-1-6-4-9-10-10 6-1 9-4 10-10Z",
     claude: "M12 2v20M2 12h20M5 5l14 14M5 19 19 5",
+    back: "M20 12H5m6-6-6 6 6 6",
+    arrow: "M4 12h15m-6-6 6 6-6 6",
   };
   const byId = (id) => document.getElementById(id);
   function el(tag, text = "", className = "") {
@@ -264,6 +302,8 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 16px
   }
   const body = (...children) => group("div", "card-body stack", ...children);
   const dayMs = 86_400_000;
+  const clockGraceMs = 60_000;
+  const stallSignal = "Stall signal: unavailable (awaiting Semon #788)";
   const utcDay = (time) => new Date(time).toISOString().slice(0, 10);
   const monday = (now) => utcDay(now - ((new Date(now).getUTCDay() + 6) % 7) * dayMs);
   const dayFormat = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
@@ -290,7 +330,7 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 16px
     const merged = new Map();
     for (const pr of linkedPrs) {
       const time = Date.parse(pr.lastWakeAt);
-      if (pr.state !== "merged" || !Number.isFinite(time) || time > now || !byDay.has(utcDay(time))) continue;
+      if (pr.state !== "merged" || !Number.isFinite(time) || time > now + clockGraceMs || !byDay.has(utcDay(time))) continue;
       const key = `${pr.prHost}/${pr.repository}/${pr.number}`.toLowerCase();
       if (!merged.has(key) || time > merged.get(key).time) {
         merged.set(key, { time, label: text(pr.title) ?? `${pr.repository} #${pr.number}` });
@@ -299,7 +339,7 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 16px
     for (const item of merged.values()) byDay.get(utcDay(item.time)).prs.push(item);
     for (const goal of goals) {
       const time = Date.parse(goal.completedAt);
-      if (Number.isFinite(time) && time <= now) {
+      if (Number.isFinite(time) && time <= now + clockGraceMs) {
         byDay.get(utcDay(time))?.goals.push({ time, label: goal.statement });
       }
     }
@@ -329,16 +369,18 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 16px
     }).sort((a, b) => a.rank - b.rank || a.lane.priorityRank - b.lane.priorityRank || a.lane.name.localeCompare(b.lane.name));
   }
 
-  function context({ digest, health, friction, linkedPrs, goals, spend, weeklyDigest }, now) {
+  function context({ digest, health, friction, linkedPrs, goals, spend }, now) {
     const lanes = digest.sections.lanes;
     const decisions = health.pendingOwnerDecisions;
     const alerts = health.policyAlerts;
-    const week = monday(now);
+    const generatedAt = Date.parse(digest.generatedAt);
+    const observedAt = Number.isFinite(generatedAt) ? generatedAt : now;
+    const week = monday(observedAt);
     return {
-      now, digest, weeklyDigest, health, friction, spend, week, decisions, alerts,
+      now, observedAt, digest, health, friction, spend, week, decisions, alerts,
       lanes: laneRows(lanes, goals, decisions, alerts, week),
       laneNames: new Map(lanes.map(({ id, name }) => [id, name])),
-      activity: activityByDay(linkedPrs, goals, now),
+      activity: activityByDay(linkedPrs, goals, observedAt),
     };
   }
 
@@ -383,6 +425,13 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 16px
     return bar;
   }
 
+  function laneLink(lane, className, ...children) {
+    const link = group("a", className, ...children);
+    link.href = `#lane/${encodeURIComponent(lane.slug)}`;
+    link.dataset.focus = `${className}:${lane.id}`;
+    return link;
+  }
+
   function goalTable(rows) {
     if (!rows.length) return body(note("No lanes registered."));
     const columns = group("div", "matrix-row matrix-head", ...["Lane", "", "Done", "Due"].map((label) => el("span", label)));
@@ -394,7 +443,7 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 16px
       const name = group("span", "", el("span", lane.name), el("span", status, `goal-status ${tone}`));
       const laneCell = group("div", "lineup", icon(mark, tone), name);
       const progressLabel = goal ? `${goal.metricName}: ${progress}` : "No current-week goal";
-      return group("div", "matrix-row", laneCell, meter(goal?.metricCurrent, goal?.metricTarget, progressLabel, tone),
+      return laneLink(lane, "matrix-row", laneCell, meter(goal?.metricCurrent, goal?.metricTarget, progressLabel, tone),
         el("span", progress, "mono"), el("span", due ? dayFormat.format(due.time) : "—", "mono muted"));
     }));
   }
@@ -456,7 +505,7 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 16px
 
   function modelBadge(run) {
     const model = text(run.model)?.split("/").filter(Boolean).at(-1);
-    const harness = (run.semonIdentity?.nativeHarness ?? run.connectorKind ?? "").toLowerCase();
+    const harness = (run.harness ?? run.semonIdentity?.nativeHarness ?? run.connectorKind ?? "").toLowerCase();
     const provider = /^gpt-|^o[1-9](-|$)|^codex/.test(model ?? "") ? "codex"
       : /^gemini/.test(model ?? "") ? "gemini" : /^claude/.test(model ?? "") ? "claude"
         : { codex: "codex", claude: "claude", gemini: "gemini" }[harness];
@@ -464,10 +513,18 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 16px
     return provider ? group("span", "model", icon(provider), el("span", label)) : el("span", label, "model");
   }
 
-  function fleetCard({ health, now }) {
+  const runStatusTags = { running: ["Running", "good"], waiting_input: ["Waiting for input", "warn"],
+    waiting_approval: ["Waiting for approval", "warn"] };
+  const runStatus = (status) => tag(...(runStatusTags[status] ?? ["Status unavailable", "muted"]));
+  function runElapsed(run, now) {
+    const started = Date.parse(run.startedAt);
+    return Number.isFinite(started) ? el("span", duration(now - started), "mono micro muted") : el("span", "", "muted");
+  }
+
+  function fleetCard({ health, now, observedAt }) {
     const recentAgents = health.agents.filter((agent) => {
       const seen = Date.parse(agent.lastSeenAt);
-      return agent.status === "active" || agent.status === "waiting" || (seen >= now - dayMs && seen <= now);
+      return agent.status === "active" || agent.status === "waiting" || (seen >= observedAt - dayMs && seen <= observedAt + clockGraceMs);
     });
     const states = [["active", "active", "good"], ["waiting", "waiting", "warn"],
       ["idle", "recent idle", "accent"], ["offline", "offline", "muted"]];
@@ -485,19 +542,14 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 16px
       legend.append(group("span", "lineup", el("i", "", `dot ${tone}`), el("span", `${count} ${label}`)));
     }
     const agents = new Map(health.agents.map((agent) => [agent.id, agent]));
-    const statusTags = { running: ["Running", "good"], waiting_input: ["Waiting for input", "warn"],
-      waiting_approval: ["Waiting for approval", "warn"] };
     const runs = health.activeRuns.map((run) => {
       const label = agents.get(run.agentId)?.label ?? run.externalRunRef;
-      const started = Date.parse(run.startedAt);
-      const elapsed = Number.isFinite(started) ? duration(now - started) : "—";
       return group("li", "run-row", group("div", "", el("strong", label), modelBadge(run)),
-        group("div", "lineup", tag(...(statusTags[run.status] ?? ["Status unavailable", "muted"])),
-          el("span", elapsed, "mono micro muted")));
+        group("div", "lineup", runStatus(run.status), runElapsed(run, now)));
     });
     return card("Fleet health", "activity", body(bar, legend, note("Last 24h · older idle excluded"), el("h3", "Active runs"),
       runs.length ? group("ul", "rows", ...runs) : note("No active runs."),
-      note("Stall signal: unavailable (awaiting Semon #788)")));
+      note(stallSignal)));
   }
 
   function throughput(days) {
@@ -506,7 +558,7 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 16px
     if (!max) return note("No data yet");
     const labels = counts.map(({ day, prs, goals }) =>
       `${dayFormat.format(Date.parse(day))}: ${plural(prs, "PR")} merged, ${plural(goals, "goal")} completed`);
-    const chart = svg("svg", { class: "chart", viewBox: "0 0 350 90", preserveAspectRatio: "none", role: "img",
+    const chart = svg("svg", { class: "chart", viewBox: "0 0 350 90", role: "img",
       "aria-label": labels.join(". ") });
     chart.append(svg("line", { x1: 0, x2: 350, y1: 82, y2: 82 }));
     for (const [index, { prs, goals }] of counts.entries()) {
@@ -546,19 +598,22 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 16px
     return text(value, value?.label, value?.title, value?.text, value?.summary, value?.description) ?? JSON.stringify(value);
   }
 
+  function githubPr(value) {
+    if (typeof value !== "string" || URL.parse(value)?.href !== value) return null;
+    return /^https:\/\/github\.com\/([a-z\d-]+\/[\w.-]+)\/pull\/([1-9]\d*)$/i.exec(value);
+  }
+
   function prChip(value) {
-    const url = typeof value === "string" ? URL.parse(value) : null;
-    if (!url || url.protocol !== "https:" || url.host !== "github.com" || url.username || url.password) return null;
-    const path = /^\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)\/?$/.exec(url.pathname);
+    const path = githubPr(value);
     if (!path) return null;
     const link = group("a", "tag chip", icon("branch"), el("span", `${path[1]} #${path[2]}`));
-    link.href = url.href;
+    link.href = value;
     link.target = "_blank";
     link.rel = "noopener noreferrer";
     return link;
   }
 
-  function decisionCard(decision, ctx) {
+  function decisionCard(decision, ctx, heading = "h2") {
     const due = decisionDue(decision);
     const lane = ctx.laneNames.get(decision.laneId) ?? "Team";
     const tags = group("div", "badges", tag(lane, "accent"));
@@ -567,7 +622,7 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 16px
       tags.append(tag(`${overdue ? "Overdue" : "Due"} ${due.label}`, overdue ? "bad" : soon(due, ctx.now) ? "warn" : "muted"));
     }
     tags.append(tag(...urgencyTags[decision.urgency]));
-    const info = body(tags, el("h2", decision.title), group("div", "recommendation",
+    const info = body(tags, el(heading, decision.title), group("div", "recommendation",
       el("h3", "Recommended"), el("p", decision.recommendation)));
     if (Array.isArray(decision.options) && decision.options.length) {
       const options = decision.options.map(jsonText).filter((option, index) => index !== 0 || option !== decision.recommendation);
@@ -609,6 +664,210 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 16px
       : group("div", "card", body(note(ctx.decisions.length ? "No decisions match this filter." : "No pending owner decisions.")))];
   }
 
+  const laneStates = {
+    risk: ["At risk", "warn", "alert"], waiting: ["Waiting", "accent", "decision"],
+    active: ["Active", "good", "activity"], paused: ["Paused", "muted", "pause"],
+    archived: ["Archived", "muted", "layers"],
+  };
+  const values = (value) => Array.isArray(value) ? value : [value];
+  function planBlockers(goal) {
+    const plan = planFor(goal);
+    return !goal || goal.completedAt ? [] : [...values(plan?.blocker), ...values(plan?.blockers)]
+      .filter(Boolean).map(jsonText);
+  }
+
+  function laneState(lane, goal, alerts, waiting) {
+    if (lane.status === "paused" || lane.status === "archived") return lane.status;
+    if (alerts || planBlockers(goal).length) return "risk";
+    return waiting ? "waiting" : "active";
+  }
+
+  const rowMark = (mark, tone = "muted") => group("span", `row-mark ${tone}`, icon(mark));
+  const progress = (goal) => `${goal.metricCurrent ?? "—"}/${goal.metricTarget}`;
+  function goalProgress(goal, tone) {
+    const plan = planFor(goal);
+    const due = dueDate(plan?.due) ?? dueDate(plan?.targetDate);
+    return group("div", "row-meta", meter(goal.metricCurrent, goal.metricTarget, `${goal.metricName}: ${progress(goal)}`, tone),
+      el("span", `Done ${progress(goal)}`, "mono"), el("span", `Due ${due ? dayFormat.format(due.time) : "—"}`, "mono muted"));
+  }
+
+  let laneFilter = "all";
+  let laneSearch = "";
+  function lanesDirectory(ctx) {
+    const pending = new Set(ctx.decisions.map(({ laneId }) => laneId));
+    const atRisk = new Set(ctx.alerts.map(({ laneId }) => laneId));
+    const waiting = new Set(ctx.health.agents.filter(({ status }) => status === "waiting").map(({ id }) => id));
+    const search = el("input", "", "lane-search");
+    search.type = "search";
+    search.placeholder = "Search lanes";
+    search.setAttribute("aria-label", "Search lanes");
+    search.dataset.focus = "lane-search";
+    search.value = laneSearch;
+    const list = el("div");
+    function updateRows() {
+      const query = laneSearch.trim().toLowerCase();
+      const rows = ctx.lanes.flatMap(({ lane, goal: weeklyGoal }) => {
+        const goal = lane.goal ?? weeklyGoal;
+        const state = laneState(lane, goal, atRisk.has(lane.id), pending.has(lane.id) || waiting.has(lane.ownerAgentId));
+        if (laneFilter !== "all" && laneFilter !== state) return [];
+        if (query && ![lane.name, lane.slug, goal?.statement].some((value) => value?.toLowerCase().includes(query))) return [];
+        const [label, tone, mark] = laneStates[state];
+        return [laneLink(lane, "lane-row", rowMark(mark, tone), group("div", "row-copy",
+          group("div", "row-meta", el("strong", lane.name), tag(label, tone)),
+          note(goal?.statement ?? "No goal recorded"), ...(goal ? [goalProgress(goal, tone)] : [])), el("span", "›", "accent"))];
+      });
+      list.replaceChildren(...(rows.length ? rows : [body(note(ctx.lanes.length ? "No lanes match these filters." : "No lanes registered."))]));
+    }
+    const filters = [["all", "All"], ...Object.entries(laneStates).filter(([key]) => key !== "archived")
+      .map(([key, [label]]) => [key, label])];
+    const buttons = filters.map(([key, label]) => {
+      const button = el("button", label);
+      button.type = "button";
+      button.dataset.focus = `lane-filter:${key}`;
+      button.setAttribute("aria-pressed", String(laneFilter === key));
+      button.onclick = () => {
+        laneFilter = key;
+        for (const item of buttons) item.setAttribute("aria-pressed", String(item === button));
+        updateRows();
+      };
+      return button;
+    });
+    search.oninput = () => { laneSearch = search.value; updateRows(); };
+    updateRows();
+    return [el("h1", "Lanes"), group("div", "lane-directory", search, group("div", "filterbar", ...buttons)),
+      card("Lane directory", "layers", list)];
+  }
+
+  const openDisclosures = new Set();
+  function disclosure(key, label, className, ...children) {
+    const summary = el("summary", label, "disclosure-label");
+    summary.dataset.focus = key;
+    const panel = group("details", className, summary, ...children);
+    panel.open = openDisclosures.has(key);
+    panel.ontoggle = () => {
+      if (panel.open) openDisclosures.add(key);
+      else openDisclosures.delete(key);
+    };
+    return panel;
+  }
+
+  function laneGoalCard(lane, goal, history) {
+    const current = goal && !goal.completedAt ? goal : null;
+    const plan = planFor(current);
+    const next = text(plan?.nextStep, plan?.next,
+      ...(Array.isArray(current?.weeklyPlan) ? [plan, plan?.title, plan?.summary, plan?.text] : []));
+    const prior = history.filter(({ id }) => id !== current?.id);
+    const rows = prior.map((entry) => group("li", "detail-row", rowMark(entry.completedAt ? "check" : "target", entry.completedAt ? "good" : "muted"),
+      group("div", "row-copy", el("strong", entry.statement), note(`Week of ${entry.weekStart} · ${entry.metricName} ${progress(entry)}`)),
+      ...(entry.completedAt ? [tag("Completed", "good")] : [])));
+    return card("Current Goal & Next Step", "target", current ? body(el("p", current.statement, "lane-goal"),
+      goalProgress(current, "accent"), ...(next ? [group("p", "lineup", icon("arrow", "accent"), el("span", `Next: ${next}`))] : []))
+      : body(note("No active goal recorded")), rows.length
+      ? disclosure(`goal-history:${lane.id}`, `Goal History · ${rows.length}`, "goal-history", group("ul", "rows", ...rows))
+      : group("div", "card-foot stack", el("h3", "Goal History"), note("No prior goals recorded yet")));
+  }
+
+  const prStates = { failure: ["Failing", "bad"], error: ["CI unavailable", "warn"],
+    pending: ["Pending", "accent"], success: ["Passing", "good"] };
+  const isSettledPr = (pr) => pr.state === "merged" || pr.state === "closed" || pr.rollupState === "closed";
+  function prCause(pr) {
+    if (isSettledPr(pr)) return pr.state === "merged" ? "merged" : "closed";
+    switch (pr.rollupState) {
+    case "failure": {
+      const count = pr.totalChecks > 0 && pr.failedChecks > 0 ? `${pr.failedChecks}/${pr.totalChecks} checks failed` : "Checks failed";
+      return pr.consecutiveFailures > 0 ? `${count} · ${plural(pr.consecutiveFailures, "consecutive head")}` : count;
+    }
+    case "error": return pr.lastError ?? "GitHub PR checks unavailable";
+    case "pending": return pr.consecutiveFailures > 0 ? "re-running" : "Checks pending";
+    case "success": return "Checks passed";
+    default: return "No CI observation";
+    }
+  }
+  function prRow(pr) {
+    const settled = isSettledPr(pr);
+    const state = settled ? (pr.state === "merged" ? ["Merged", "good"] : ["Closed", "muted"])
+      : prStates[pr.rollupState] ?? (pr.isDraft ? ["Draft", "muted"] : [pr.state === "open" ? "Open" : "State unavailable", "muted"]);
+    const link = githubPr(pr.url);
+    const row = group(link ? "a" : "div", "detail-row", rowMark(settled && pr.state === "merged" ? "check" : "branch", state[1]),
+      group("div", "row-copy", el("strong", `#${pr.number}${pr.title ? ` ${pr.title}` : ""}`),
+        note(`${pr.repository} · ${prCause(pr)}`)), group("span", "row-end", tag(...state), ...(link ? [el("span", "›", "accent")] : [])));
+    if (link) {
+      row.href = pr.url;
+      row.target = "_blank";
+      row.rel = "noopener noreferrer";
+      row.dataset.focus = pr.url;
+    }
+    return row;
+  }
+
+  function lanePrCard(lane, prs) {
+    if (!prs.length) return card("Recent PRs & Merges", "branch", body(note("No linked PRs yet")));
+    const priority = (pr) => ["failure", "error"].includes(pr.rollupState) ? 0 : pr.rollupState === "pending" ? 1 : 2;
+    const recent = (a, b) => (b.lastWakeAt ?? b.lastCheckedAt ?? "").localeCompare(a.lastWakeAt ?? a.lastCheckedAt ?? "")
+      || b.number - a.number;
+    const open = prs.filter((pr) => !isSettledPr(pr)).sort((a, b) => priority(a) - priority(b) || recent(a, b));
+    const settled = prs.filter(isSettledPr).sort(recent);
+    return card("Recent PRs & Merges", "branch", group("div", "", ...open.map(prRow), ...(settled.length <= 5 ? settled.map(prRow) : [])),
+      ...(settled.length > 5 ? [disclosure(`settled-prs:${lane.id}`, `Merged & closed · ${settled.length}`, "settled-prs", ...settled.map(prRow))] : []));
+  }
+
+  function laneRunsCard(lane, runs, now) {
+    const rows = runs.map((run) => group("li", "detail-row", rowMark(run.status === "running" ? "activity" : "clock",
+      run.status === "running" ? "good" : "muted"), group("div", "row-copy", el("strong", run.agentLabel), modelBadge(run)),
+      group("div", "row-end", runStatus(run.status), runElapsed(run, now))));
+    return card("Running Workers", "activity", rows.length ? group("ul", "rows", ...rows) : body(note(`No active runs on ${lane.name}`)),
+      group("div", "card-foot", note(stallSignal)));
+  }
+
+  function laneSpendCard(spend) {
+    if (spend.status !== "available") return card("Lane Spend", "wallet", body(note("No data yet · awaiting per-lane Semon rollup")));
+    const total = Number.isFinite(spend.preferredUsd) ? usd.format(spend.preferredUsd) : "Unpriced";
+    return card("Lane Spend", "wallet", body(group("div", "row-meta", el("strong", total, "lane-goal"),
+      tag(`Coverage: ${spend.coverage}`, spend.coverage === "complete" ? "good" : "warn")), note("This week · Semon · USD")));
+  }
+
+  function laneBlockersCard(detail, pending, now) {
+    const notices = [...new Set([...detail.alerts.map(({ summary }) => summary), ...planBlockers(detail.goal),
+      ...detail.friction.map(({ summary }) => summary)])];
+    const decisions = pending.map((decision) => decisionCard(decision, { now, laneNames: new Map([[detail.lane.id, detail.lane.name]]) }, "h3"));
+    return card("Decisions & Blockers", "decision", group("div", "card-body stack lane-blockers",
+      ...decisions, ...(notices.length ? [group("ul", "rows", ...notices.map((summary) =>
+        group("li", "lineup", icon("alert", "warn"), el("span", summary))))] : []),
+      ...(!decisions.length && !notices.length ? [note("No open blockers or decisions")] : [])));
+  }
+
+  const timelineIcons = { goal_updated: ["target", "accent"], goal_completed: ["check", "good"],
+    decision_created: ["decision", "accent"], decision_answered: ["check", "good"], policy_alert: ["alert", "warn"],
+    pr_wake: ["branch", "muted"], pr_merged: ["branch", "good"] };
+  function laneTimeline(events) {
+    const rows = events.map(({ kind, at, summary }) => {
+      const time = el("time", `${new Date(at).toISOString().slice(0, 19).replace("T", " ")} UTC`);
+      time.dateTime = at;
+      return group("li", "", rowMark(...timelineIcons[kind]), el("p", summary), time);
+    });
+    return card("Activity Timeline", "clock", body(rows.length ? group("ol", "timeline", ...rows) : note("No recent activity recorded yet")));
+  }
+
+  function laneDetailView(result, slug, now) {
+    const back = group("a", "lineup lane-back", icon("back"), el("span", "Lanes"));
+    back.href = "#lanes";
+    back.dataset.focus = "lane-back";
+    const top = group("div", "lane-top", back);
+    const detail = result?.value;
+    if (!detail) return [top, el("h1", "Lane"), note(!slug || result?.error?.status === 404 ? "Lane not found."
+      : result?.error ? `Lane data unavailable. ${result.error.message}` : "Loading lane…")];
+    const { lane, goal, goalHistory, prs, activeRuns, recentAgents, spend, decisions, alerts, timeline } = detail;
+    const pending = decisions.filter(({ authority, status }) => authority === "owner" && status === "pending");
+    const waiting = pending.length > 0 || recentAgents.some(({ id, status }) => id === lane.ownerAgentId && status === "waiting");
+    const [stateLabel, tone] = laneStates[laneState(lane, goal, alerts.length, waiting)];
+    const modeledRuns = activeRuns.filter((run) => run.model && run.status !== "unknown");
+    const manager = modeledRuns.find((run) => run.isLaneOwner) ?? modeledRuns.find((run) => run.role === "manager");
+    top.append(group("div", "badges", tag(stateLabel, tone), ...(manager ? [modelBadge(manager)] : [])));
+    return [top, el("h1", lane.name), ...(result.error ? [note(`Stale lane data. ${result.error.message}`)] : []),
+      group("div", "grid lane-detail-grid", laneGoalCard(lane, goal, goalHistory), lanePrCard(lane, prs),
+        laneRunsCard(lane, activeRuns, now), laneSpendCard(spend), laneBlockersCard(detail, pending, now), laneTimeline(timeline))];
+  }
+
   function overview(ctx) {
     const top = group("div", "hero", group("div", "", el("h1", "Overview"), note(dateFormat.format(ctx.now))),
       tag(`Week of ${dayFormat.format(Date.parse(ctx.week))}`));
@@ -623,7 +882,7 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 16px
       group("section", "stack", el("h2", "Decisions needed"), ...(decisions.length ? decisions : [note("No pending owner decisions.")])),
       card("Active alerts & priority lanes", "alert", body(alerts,
         ...(priorities.length ? [group("ul", "rows", ...priorities.map(({ lane, status }) =>
-          el("li", `${lane.name} · ${status}`)))] : []))));
+          group("li", "", laneLink(lane, "lineup", el("span", `${lane.name} · ${status}`), el("span", "›", "accent")))))] : []))));
     return [top, summaryTiles(ctx), visuals, extras];
   }
 
@@ -651,7 +910,26 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 16px
     lanes: ["Lanes", "Lanes", "layers"],
     report: ["Reports", "Report", "report"],
   };
-  const route = () => Object.hasOwn(routes, location.hash.slice(1)) ? location.hash.slice(1) : "overview";
+  function route() {
+    const hash = location.hash.slice(1);
+    if (hash.startsWith("lane/")) return "lane";
+    return Object.hasOwn(routes, hash) ? hash : "overview";
+  }
+  function laneSlug() {
+    try {
+      const slug = decodeURIComponent(location.hash.slice("#lane/".length));
+      return /^[a-z\d][\w.-]{0,127}$/i.test(slug) ? slug : null;
+    } catch {
+      return null;
+    }
+  }
+  function routeEndpoint() {
+    const selected = route();
+    if (selected === "report") return "/v1/digest?window=weekly";
+    if (selected !== "lane") return null;
+    const slug = laneSlug();
+    return slug === null ? null : `/v1/lanes/${encodeURIComponent(slug)}/detail`;
+  }
   function navigation(mobile) {
     return Object.entries(routes).map(([key, [desktopLabel, mobileLabel, mark]]) => {
       const badge = el("span", "", "nav-count");
@@ -667,22 +945,36 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 16px
   function render() {
     const selected = route();
     for (const { key, badge, link, mobile } of navItems) {
-      if (key === selected) link.setAttribute("aria-current", "page");
+      if (key === (selected === "lane" ? "lanes" : selected)) link.setAttribute("aria-current", "page");
       else link.removeAttribute("aria-current");
       const count = key === "decisions" ? ctx?.decisions.length : key === "lanes" && !mobile ? ctx?.lanes.length : undefined;
       badge.hidden = count === undefined || (mobile && count === 0);
       badge.textContent = count ?? "";
     }
     const view = byId("view");
-    const focus = document.activeElement?.dataset?.focus;
-    const nodes = !ctx ? [el("h1", routes[selected][0])]
-      : selected === "decisions" ? decisionsView(ctx)
-        : selected === "lanes" ? [el("h1", "Lanes"), note("Full Lane Detail arrives in Slice 2."), goalsCard(ctx)]
-          : selected === "report" ? [el("h1", "Reports"), note("The full Executive Report arrives in Slice 3."),
-            group("div", "grid", digestCard("Daily digest · 13:00Z", ctx.digest), digestCard("Weekly digest", ctx.weeklyDigest))]
-            : overview(ctx);
+    const active = document.activeElement;
+    const focus = active?.dataset?.focus;
+    const result = routeResult?.endpoint === routeEndpoint() ? routeResult : undefined;
+    const nodes = selected === "lane" ? laneDetailView(result, laneSlug(), Date.now())
+      : selected === "report" ? [el("h1", "Reports"), note("The full Executive Report arrives in Slice 3."),
+        group("div", "grid", ...(ctx ? [digestCard("Daily digest · 13:00Z", ctx.digest)] : []),
+          digestCard("Weekly digest", result?.value ?? (result?.error ? null : undefined)))]
+        : !ctx ? [el("h1", routes[selected][0])]
+          : selected === "decisions" ? decisionsView(ctx)
+            : selected === "lanes" ? lanesDirectory(ctx) : overview(ctx);
     view.replaceChildren(...nodes);
-    if (focus) [...view.querySelectorAll("[data-focus]")].find((node) => node.dataset.focus === focus)?.focus({ preventScroll: true });
+    const heading = view.querySelector("h1");
+    if (heading) {
+      heading.tabIndex = -1;
+      heading.dataset.focus = "route-heading";
+    }
+    if (focus) {
+      const replacement = [...view.querySelectorAll("[data-focus]")].find((node) => node.dataset.focus === focus);
+      replacement?.focus({ preventScroll: true });
+      if (focus === "lane-search" && Number.isInteger(active.selectionStart)) {
+        replacement?.setSelectionRange(active.selectionStart, active.selectionEnd);
+      }
+    }
   }
 
   async function read(path) {
@@ -691,12 +983,14 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 16px
       cache: "no-store", redirect: "error", signal: AbortSignal.timeout(10_000),
     });
     if (response.status === 401 || response.status === 403) throw new Error("Dashboard authorization failed.");
-    if (!response.ok) throw new Error(`Platform returned HTTP ${response.status}.`);
+    if (!response.ok) throw Object.assign(new Error(`Platform returned HTTP ${response.status}.`), { status: response.status });
     return response.json();
   }
 
   const refreshMs = 8_000;
   let ctx;
+  let routeResult;
+  let routeRequest;
   let lastSuccess;
   let refreshFailed = false;
   const hostCount = () => `${ctx.health.hosts.filter(({ connectionState }) => connectionState === "connected").length}/${ctx.health.hosts.length}`;
@@ -721,10 +1015,30 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 16px
     banner.textContent = message;
     banner.hidden = false;
   }
-  async function refresh() {
+  async function refreshRoute() {
+    const endpoint = routeEndpoint();
+    if (endpoint === null || routeRequest?.endpoint === endpoint) return;
+    const request = { endpoint };
+    routeRequest = request;
     try {
-      const loadWeekly = route() === "report";
-      const [digest, health, friction, linkedPrs, goals, daily, weekly, monthly, weeklyDigest] = await Promise.all([
+      const value = await read(endpoint);
+      if (routeRequest === request) routeResult = { endpoint, value };
+    } catch (error) {
+      if (routeRequest === request) {
+        const value = routeResult?.endpoint === endpoint && error.status !== 404 ? routeResult.value : undefined;
+        routeResult = { endpoint, value, error };
+      }
+    } finally {
+      if (routeRequest === request) {
+        routeRequest = undefined;
+        if (routeEndpoint() === endpoint) render();
+      }
+    }
+  }
+  async function refresh() {
+    void refreshRoute();
+    try {
+      const [digest, health, friction, linkedPrs, goals, daily, weekly, monthly] = await Promise.all([
         read("/v1/digest?window=13:00Z"),
         read("/v1/health/summary"),
         read("/v1/friction?status=open"),
@@ -733,10 +1047,9 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 16px
         read("/v1/spend/summary?period=daily&source=semon"),
         read("/v1/spend/summary?period=weekly&source=semon"),
         read("/v1/spend/summary?period=monthly&source=semon"),
-        loadWeekly ? read("/v1/digest?window=weekly").catch(() => null) : ctx?.weeklyDigest,
       ]);
       const now = Date.now();
-      ctx = context({ digest, health, friction, linkedPrs, goals, spend: { daily, weekly, monthly }, weeklyDigest }, now);
+      ctx = context({ digest, health, friction, linkedPrs, goals, spend: { daily, weekly, monthly } }, now);
       render();
       lastSuccess = now;
       refreshFailed = false;
@@ -756,14 +1069,13 @@ main { width: min(100%, 728px); min-width: 0; margin-inline: auto; padding: 16px
   for (const node of document.querySelectorAll("[data-icon]")) node.append(icon(node.dataset.icon));
   window.addEventListener("hashchange", () => {
     render();
+    if (token || proxyAuth) void refreshRoute();
     window.scrollTo(0, 0);
-    const heading = byId("view").querySelector("h1");
-    heading.tabIndex = -1;
-    heading.focus({ preventScroll: true });
+    byId("view").querySelector("h1")?.focus({ preventScroll: true });
   });
   render();
   if (token || proxyAuth) {
-    byId("view").append(el("p", "Loading dashboard…", "muted loading"));
+    if (route() !== "lane" && route() !== "report") byId("view").append(el("p", "Loading dashboard…", "muted loading"));
     void refresh();
     setInterval(updateAge, 1_000);
   } else {

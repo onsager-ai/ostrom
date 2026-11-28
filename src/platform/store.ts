@@ -618,7 +618,7 @@ export class PlatformStore {
 
   listGoals(laneId?: string): Goal[] {
     const select = `SELECT ${goalColumns} FROM goal`;
-    const order = "ORDER BY week_start DESC, updated_at DESC, id DESC";
+    const order = "ORDER BY week_start DESC, (completed_at IS NOT NULL), updated_at DESC, rowid DESC, id DESC";
     const rows = laneId === undefined ? this.all<GoalRow>(`${select} ${order}`)
       : this.all<GoalRow>(`${select} WHERE lane_id = ? ${order}`, laneId);
     return rows.map(goalFromRow);
@@ -788,7 +788,7 @@ export class PlatformStore {
       .run(JSON.stringify(sessionUids));
   }
 
-  summarizeSpend(filter: SpendSummaryFilter, now: Date | string) {
+  summarizeSpend(filter: SpendSummaryFilter, now: Date | string, { includeSessionSnapshots = true } = {}) {
     const { scopeKind, scopeId, period, source } = filter;
     validateSpendFilter(filter);
     const { since, until } = spendWindow(period, now);
@@ -825,9 +825,9 @@ export class PlatformStore {
       count(*) FILTER (WHERE billed_usd IS NULL AND source_reported_usd IS NULL AND usd_est IS NOT NULL) AS estimatedCount,
       count(*) FILTER (WHERE billed_usd IS NULL AND source_reported_usd IS NOT NULL) AS reportedCount,
       count(billed_usd) AS billedCount, group_concat(DISTINCT s.coverage) AS coverage
-    FROM sessions LEFT JOIN spend_snapshot s ON s.session_uid = sessions.uid AND s.source = ?
+    FROM sessions LEFT JOIN spend_snapshot s ON s.session_uid = sessions.uid AND s.source = ? AND ?
     WHERE sessions.started_at >= julianday(?) AND sessions.started_at <= julianday(?)`,
-    scopeKind, scopeKind, scopeId, scopeKind, scopeId, source, since, until, source, since, until) };
+    scopeKind, scopeKind, scopeId, scopeKind, scopeId, source, since, until, source, Number(includeSessionSnapshots), since, until) };
   }
 
   upsertAgent(input: UpsertAgentInput): Agent {

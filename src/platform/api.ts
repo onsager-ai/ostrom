@@ -6,6 +6,7 @@ import { dirname, isAbsolute, join } from "node:path";
 
 import { readSpendSummary } from "./budget-observer.ts";
 import { generateOwnerDigest, isDigestWindow } from "./digest.ts";
+import { readLaneDetail } from "./lane-detail.ts";
 import { readPlatformHealth } from "./policy-observer.ts";
 import { DecisionStateError, PlatformForbiddenError, PlatformNotFoundError, PlatformValidationError } from "./store.ts";
 import type {
@@ -126,9 +127,10 @@ export async function dispatchPlatformRequest(
     if (entry === null) throw new PlatformNotFoundError(`lane ${slug} not found`);
     return ok(store.listGoalAuditEvents(entry.id));
   }
-  const lane = /^\/v1\/lanes\/([^/]+)(?:\/(goal|goal\/complete|goal\/self))?$/.exec(route);
+  const lane = /^\/v1\/lanes\/([^/]+)(?:\/(detail|goal|goal\/complete|goal\/self))?$/.exec(route);
   const laneAction = lane?.[2];
   if (lane?.[1] !== undefined && ((laneAction === undefined && (get || put))
+    || (get && laneAction === "detail")
     || (put && laneAction === "goal") || (post && (laneAction === "goal/complete" || laneAction === "goal/self")))) {
     const slug = decodeURIComponent(lane[1]);
     if (put && laneAction === undefined) return ok(store.updateLane(slug, await body<UpdateLaneInput>()));
@@ -143,6 +145,7 @@ export async function dispatchPlatformRequest(
     }
     const entry = store.getLaneBySlug(slug);
     if (entry === null) throw new PlatformNotFoundError(`lane ${slug} not found`);
+    if (get && laneAction === "detail") return ok(readLaneDetail(store, entry, new Date()));
     if (get) return ok({ ...entry, goal: store.getLatestGoal(entry.id) });
     if (put) return ok(store.setGoal({ ...await body<Omit<SetGoalInput, "laneId">>(), laneId: entry.id }));
     const payload = await readBody(true);
