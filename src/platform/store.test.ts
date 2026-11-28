@@ -506,7 +506,7 @@ test("completes a goal and keeps its history when replaced in the same week", (t
   assert.deepEqual(store.listGoals(lane.id), [completedReplacement, completed, completedEarlier]);
 });
 
-test("lists goal history by descending week, update time and ID, with an optional lane filter", (t) => {
+test("lists goal history by week, open goals first, then update and insertion order, with an optional lane filter", (t) => {
   let now = "2026-11-27T04:00:00.000Z";
   const store = memory(t, () => now);
   const product = store.createLane({ slug: "product", name: "Product" });
@@ -519,8 +519,8 @@ test("lists goal history by descending week, update time and ID, with an optiona
   const latest = store.setGoal({ ...input, laneId: docs.id, id: "goal-b" });
   const earlierWeek = store.setGoal({ ...input, laneId: product.id, weekStart: "2026-11-16" });
 
-  assert.deepEqual(store.listGoals(), [latest, first, replacement, earlierWeek]);
-  assert.deepEqual(store.listGoals(product.id), [first, replacement, earlierWeek]);
+  assert.deepEqual(store.listGoals(), [latest, replacement, first, earlierWeek]);
+  assert.deepEqual(store.listGoals(product.id), [replacement, first, earlierWeek]);
   assert.deepEqual(store.listGoals(docs.id), [latest]);
   assert.deepEqual(store.listGoals("unknown"), []);
 });
