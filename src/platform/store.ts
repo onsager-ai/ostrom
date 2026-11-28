@@ -1180,7 +1180,14 @@ export class PlatformStore {
         ON CONFLICT (rule_code, dedupe_key) WHERE resolved_at IS NULL AND dedupe_key IS NOT NULL DO NOTHING
         RETURNING ${policyEventColumns}`, newId("pol"), input.ruleCode, input.laneId ?? null, input.summary,
       encode(input.detail ?? null, "detail"), at, key);
-      if (row === null) return null;
+      if (row === null) {
+        this.db.prepare(`UPDATE policy_event SET lane_id = ?, summary = ?, detail_json = ?
+          WHERE rule_code = ? AND dedupe_key = ? AND resolved_at IS NULL
+            AND (lane_id IS NOT ? OR summary IS NOT ? OR detail_json IS NOT ?)`)
+          .run(input.laneId ?? null, input.summary, encode(input.detail ?? null, "detail"),
+            input.ruleCode, key, input.laneId ?? null, input.summary, encode(input.detail ?? null, "detail"));
+        return null;
+      }
       if (friction) this.db.prepare(`INSERT INTO friction_entry (id, kind, summary, status, lane_id, rule_code, created_at)
         VALUES (?, 'policy_break', ?, 'open', ?, ?, ?)`).run(
         newId("fric"), row.summary, row.laneId, row.ruleCode, at);

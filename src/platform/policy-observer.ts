@@ -127,29 +127,53 @@ export function evaluatePolicyAndHealth(store: PlatformStore, options: HealthOpt
 
   const ciRule = "pr_green_ci";
   const targets = new Map(store.listGitHubPrTargets().map((pr) => [`${pr.repository}#${pr.number}`, pr]));
+  const lanes = store.listLanes();
+  const laneBySlug = new Map(lanes.map((lane) => [lane.slug.toLocaleLowerCase(), lane]));
+  const laneAliases: Record<string, string> = {
+    "agent-workbench": "awb", "crawlab-pro": "crawlab", "crawlab-docs": "crawlab",
+  };
+  const threadLane = new Map<string, string>();
+  const agents = store.listAgents();
+  for (const pr of store.listT3ThreadPrs()) {
+    const agent = agents.find((candidate) => candidate.hostId === pr.hostId
+      && candidate.externalRef.endsWith(`/${pr.threadId}`));
+    if (agent?.laneId !== null && agent?.laneId !== undefined) {
+      threadLane.set(`${pr.repository.toLocaleLowerCase()}#${pr.number}`, agent.laneId);
+    }
+  }
   for (const pr of store.listGitHubPrChecks()) {
     const name = `${pr.repository}#${pr.number}`;
     const target = targets.get(name);
     if (target === undefined || pr.isDraft || pr.rollupState === "closed" || pr.rollupState === "success") continue;
     const key = `github:${name}`;
-    const detail = { ...pr };
+    const repositoryName = pr.repository.split("/").at(-1)?.toLocaleLowerCase() ?? "";
+    const lane = laneBySlug.get(repositoryName)
+      ?? laneBySlug.get(laneAliases[repositoryName] ?? "")
+      ?? lanes.find((candidate) => candidate.id === threadLane.get(`${pr.repository.toLocaleLowerCase()}#${pr.number}`));
+    const detail = { ...pr, laneSlug: lane?.slug ?? null };
+    const cause = pr.rollupState === "error"
+      ? (pr.lastError ? `CI error: ${pr.lastError}` : "CI could not be checked")
+      : pr.totalChecks > 0 && pr.failedChecks > 0 ? `${pr.failedChecks}/${pr.totalChecks} checks failed` : "CI failed";
+    const prefix = lane === undefined ? "" : `${lane.name} · `;
     const streakKey = `${key}:${pr.failureStreak}`;
-    if (enabled.has(failureRule) && pr.consecutiveFailures >= 2
-      && (target.watching || store.hasOpenPolicyEvent(failureRule, streakKey))) {
+    const twoFailureStop = enabled.has(failureRule) && pr.consecutiveFailures >= 2
+      && (target.watching || store.hasOpenPolicyEvent(failureRule, streakKey));
+    if (twoFailureStop) {
       failureKeys.push(streakKey);
       const event = store.recordDedupedPolicyEvent({
-        ruleCode: failureRule, summary: `${name} failed CI on consecutive heads`, detail,
+        ruleCode: failureRule, laneId: lane?.id ?? null,
+        summary: `${prefix}${name}: ${cause} (${pr.consecutiveFailures} consecutive heads)`, detail,
       }, streakKey, now, true);
       if (event !== null) events.push(event);
     }
-    if (enabled.has(ciRule) && (
+    if (!twoFailureStop && enabled.has(ciRule) && (
       pr.rollupState === "failure" || pr.rollupState === "error"
       || (pr.rollupState === "pending" && store.hasOpenPolicyEvent(ciRule, key))
     )) {
       ciKeys.push(key);
       if (pr.rollupState !== "pending") {
         const event = store.recordDedupedPolicyEvent({
-          ruleCode: ciRule, summary: `${name} CI ${pr.rollupState === "error" ? "could not be checked" : "failed"}`, detail,
+          ruleCode: ciRule, laneId: lane?.id ?? null, summary: `${prefix}${name}: ${cause}`, detail,
         }, key, now);
         if (event !== null) events.push(event);
       }

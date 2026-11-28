@@ -152,6 +152,7 @@ test("GitHub draft state overrides linked T3 metadata and clears PR alerts", (t)
   const hostId = "east";
   const repository = "org/repo";
   const number = 42;
+  const lane = store.createLane({ slug: "repo", name: "Repo lane" });
   store.reconcileT3Host({ hostId, label: "East", mcpUrl: "https://t3.example/mcp", originNamespace: null,
     connectionState: "connected" }, [{
     threadId: "thread", runs: [], agent: { id: "manager", label: "Manager", role: "manager", connectorKind: "t3",
@@ -169,9 +170,40 @@ test("GitHub draft state overrides linked T3 metadata and clears PR alerts", (t)
   assert.deepEqual(openRules(), []);
   record(false);
   assert.deepEqual(openRules(), ["pr_green_ci"]);
+  assert.equal(store.listOpenPolicyEvents()[0]?.summary, "Repo lane · org/repo#42: 1/1 checks failed");
+  assert.equal(store.listOpenPolicyEvents()[0]?.laneId, lane.id);
+  assert.equal((store.listOpenPolicyEvents()[0]?.detail as { laneSlug?: string }).laneSlug, "repo");
   record(false, "b");
-  assert.deepEqual(openRules(), ["pr_green_ci", "two_failure_stop"]);
+  assert.deepEqual(openRules(), ["two_failure_stop"]);
+  assert.equal(store.listOpenPolicyEvents()[0]?.summary,
+    "Repo lane · org/repo#42: 1/1 checks failed (2 consecutive heads)");
   record(true, "b");
   assert.deepEqual(openRules(), []);
   assert.equal(store.listT3ThreadPrs()[0]?.isDraft, false);
+});
+
+test("refreshes open PR alert attribution and resolves it when lane attribution appears", (t) => {
+  const store = PlatformStore.open(":memory:", { now: () => now });
+  t.after(() => store.close());
+  const repository = "org/crawlab-pro";
+  store.reconcileT3Host({ hostId: "east", label: "East", mcpUrl: "https://t3.example/mcp", originNamespace: null,
+    connectionState: "connected" }, [{
+    threadId: "thread", runs: [], agent: { id: "manager", label: "Manager", role: "manager", connectorKind: "t3",
+      hostId: "east", externalRef: "environment/thread", status: "idle" },
+    prs: [{ hostId: "east", threadId: "thread", prHost: "github.com", repository, number: 9,
+      url: "https://github.com/org/crawlab-pro/pull/9", source: "manual", state: "open", watching: true,
+      title: null, headBranch: null, baseBranch: null, isDraft: false }],
+  }], { observedAt: now });
+  store.recordGitHubPrCheck(repository, 9, { isDraft: false, headSha: "a".repeat(40), rollupState: "error",
+    totalChecks: 0, failedChecks: 0 });
+  evaluatePolicyAndHealth(store, { now });
+  assert.equal(store.listOpenPolicyEvents()[0]?.summary, "org/crawlab-pro#9: CI could not be checked");
+
+  const lane = store.createLane({ slug: "crawlab", name: "Crawlab" });
+  evaluatePolicyAndHealth(store, { now });
+  const alert = store.listOpenPolicyEvents()[0];
+  assert.equal(alert?.laneId, lane.id);
+  assert.equal(alert?.summary, "Crawlab · org/crawlab-pro#9: CI error: GitHub PR checks unavailable");
+  assert.equal((alert?.detail as { laneSlug?: string }).laneSlug, "crawlab");
+  assert.equal(store.listFriction({ status: "open" }).length, 1);
 });
