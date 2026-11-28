@@ -8,11 +8,11 @@ import { migrate } from "./migrations.ts";
 import {
   agentRoles, agentStatuses, budgetPeriods, budgetScopes, connectorKinds, decisionAuthorities,
   decisionCategories, decisionStatuses, decisionUrgencies, frictionKinds, frictionStatuses,
-  isSemonKey, laneStatuses, runStatuses, spendSources,
+  isSemonKey, laneStatuses, runStatuses, spendSources, spendWindow,
 } from "./types.ts";
 import type {
   Agent, Budget, Decision, DecisionEvent, DecisionStatus, DecisionVerification, FrictionEntry,
-  FrictionStatus, Goal, JsonValue, Lane, LaneStatus, PolicyEvent, PolicyRule, Run, SpendSnapshot,
+  FrictionStatus, Goal, JsonValue, Lane, LaneStatus, PolicyEvent, PolicyRule, Run, SpendRollup, SpendSnapshot,
   GitHubPrCheck, GitHubPrObservation, SemonSessionIdentity, SpendSummaryFilter, T3HostState, T3PendingWait, T3ThreadPr,
 } from "./types.ts";
 
@@ -107,6 +107,10 @@ const spendColumns = `session_uid AS sessionUid, source, input_tokens AS inputTo
   output_tokens AS outputTokens, cached_tokens AS cachedTokens, usd_est AS usdEst,
   source_reported_usd AS sourceReportedUsd, billed_usd AS billedUsd, coverage,
   snapshot_id AS snapshotId, as_of AS asOf, observed_at AS observedAt`;
+const spendRollupColumns = `scope_kind AS scopeKind, nullif(scope_id, '') AS scopeId, period, since, until, source,
+  session_count AS sessionCount, unpriced_count AS unpricedCount, incomplete_count AS incompleteCount,
+  usd_est AS usdEst, source_reported_usd AS sourceReportedUsd, billed_usd AS billedUsd, preferred_usd AS preferredUsd,
+  coverage, snapshot_id AS snapshotId, as_of AS asOf, observed_at AS observedAt`;
 const agentColumns = `id, role, lane_id AS laneId, connector_kind AS connectorKind,
   host_id AS hostId, external_ref AS externalRef, label, status, last_seen_at AS lastSeenAt,
   updated_at AS updatedAt`;
@@ -162,6 +166,25 @@ function number(value: unknown, field: string, { integer = false, min = -Infinit
 
 function optionalNumber(value: unknown, field: string, range?: { integer?: boolean; min?: number }): void {
   if (value !== null && value !== undefined) number(value, field, range);
+}
+
+function isoTimestamp(value: string, field: string): string {
+  if (typeof value !== "string"
+    || !/^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)
+    || new Date(`${value.slice(0, 10)}T00:00:00Z`).toJSON()?.slice(0, 10) !== value.slice(0, 10)) {
+    throw new PlatformValidationError(`invalid ${field}: expected an ISO timestamp`);
+  }
+  const normalized = new Date(value).toJSON();
+  if (normalized === null) throw new PlatformValidationError(`invalid ${field}: expected an ISO timestamp`);
+  return normalized;
+}
+
+function validateSpendFilter({ scopeKind, scopeId, period, source }: SpendSummaryFilter): void {
+  choice(scopeKind, budgetScopes, "scopeKind");
+  choice(period, budgetPeriods, "period");
+  choice(source, spendSources, "source");
+  if (scopeKind !== "team") nonEmpty(scopeId, "scopeId");
+  else if (scopeId !== null) throw new PlatformValidationError("team spend does not accept scopeId");
 }
 
 function optionalBoolean(value: unknown, field: string): void {
@@ -623,6 +646,48 @@ export class PlatformStore {
     return this.get<SpendSnapshot>(`SELECT ${spendColumns} FROM spend_snapshot WHERE session_uid = ?`, sessionUid);
   }
 
+  upsertSpendRollup(input: SpendRollup): SpendRollup {
+    validateSpendFilter(input);
+    const { scopeKind, scopeId, period, source, sessionCount, unpricedCount, incompleteCount,
+      usdEst, sourceReportedUsd, billedUsd, preferredUsd, coverage, snapshotId, asOf } = input;
+    const since = isoTimestamp(input.since, "since");
+    const until = isoTimestamp(input.until, "until");
+    const observedAt = isoTimestamp(input.observedAt, "observedAt");
+    if (Date.parse(since) > Date.parse(until)) throw new PlatformValidationError("since must not be after until");
+    number(sessionCount, "sessionCount", { integer: true, min: 0 });
+    number(unpricedCount, "unpricedCount", { integer: true, min: 0 });
+    number(incompleteCount, "incompleteCount", { integer: true, min: 0 });
+    if (usdEst !== null) number(usdEst, "usdEst", { min: 0 });
+    if (sourceReportedUsd !== null) number(sourceReportedUsd, "sourceReportedUsd", { min: 0 });
+    if (billedUsd !== null) number(billedUsd, "billedUsd", { min: 0 });
+    optionalNumber(preferredUsd, "preferredUsd", { min: 0 });
+    optionalText(coverage, "coverage");
+    optionalText(snapshotId, "snapshotId");
+    optionalText(asOf, "asOf");
+    return this.write<SpendRollup>(`INSERT INTO spend_rollup (scope_kind, scope_id, period, since, until, source,
+      session_count, unpriced_count, incomplete_count, usd_est, source_reported_usd, billed_usd, preferred_usd,
+      coverage, snapshot_id, as_of, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (scope_kind, scope_id, period, since, source) DO UPDATE SET until = excluded.until,
+        session_count = excluded.session_count, unpriced_count = excluded.unpriced_count,
+        incomplete_count = excluded.incomplete_count, usd_est = excluded.usd_est, source_reported_usd = excluded.source_reported_usd,
+        billed_usd = excluded.billed_usd, preferred_usd = excluded.preferred_usd, coverage = excluded.coverage,
+        snapshot_id = excluded.snapshot_id, as_of = excluded.as_of, observed_at = excluded.observed_at
+      RETURNING ${spendRollupColumns}`, scopeKind, scopeId ?? "", period, since, until, source, sessionCount, unpricedCount,
+    incompleteCount, usdEst, sourceReportedUsd, billedUsd, preferredUsd ?? null, coverage ?? null, snapshotId ?? null,
+    asOf ?? null, observedAt);
+  }
+
+  upsertSpendRollups(inputs: readonly SpendRollup[]): SpendRollup[] {
+    return this.transaction(() => inputs.map((input) => this.upsertSpendRollup(input)));
+  }
+
+  getSpendRollup(filter: SpendSummaryFilter, since: string): SpendRollup | null {
+    validateSpendFilter(filter);
+    return this.get<SpendRollup>(`SELECT ${spendRollupColumns} FROM spend_rollup
+      WHERE scope_kind = ? AND scope_id = ? AND period = ? AND since = ? AND source = ?`,
+    filter.scopeKind, filter.scopeId ?? "", filter.period, isoTimestamp(since, "since"), filter.source);
+  }
+
   markSemonRefreshFailed(sessionUids: readonly string[]): void {
     this.db.prepare(`UPDATE spend_snapshot SET refresh_failed = 1
       WHERE source = 'semon' AND session_uid IN (SELECT value FROM json_each(?))`)
@@ -631,17 +696,8 @@ export class PlatformStore {
 
   summarizeSpend(filter: SpendSummaryFilter, now: Date | string) {
     const { scopeKind, scopeId, period, source } = filter;
-    choice(scopeKind, budgetScopes, "scopeKind");
-    choice(period, budgetPeriods, "period");
-    choice(source, spendSources, "source");
-    if (scopeKind !== "team") nonEmpty(scopeId, "scopeId");
-    else if (scopeId !== null) throw new PlatformValidationError("team spend does not accept scopeId");
-
-    const until = new Date(now).toISOString();
-    const start = new Date(`${until.slice(0, 10)}T00:00:00Z`);
-    if (period === "weekly") start.setUTCDate(start.getUTCDate() - ((start.getUTCDay() + 6) % 7));
-    if (period === "monthly") start.setUTCDate(1);
-    const since = start.toISOString();
+    validateSpendFilter(filter);
+    const { since, until } = spendWindow(period, now);
 
     return { ...filter, since, until, ...this.write<{
       sessionCount: number; snapshotCount: number; unpricedCount: number; incompleteCount: number;

@@ -317,6 +317,28 @@ const migrations = [
       VALUES ('goal_stale', 'goal_stale', 'team-policy.md §3', 'observe', '{"staleHours":24}', 1,
         strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`);
   },
+  `
+  CREATE TABLE IF NOT EXISTS spend_rollup (
+    scope_kind TEXT NOT NULL CHECK (scope_kind IN ('team', 'lane', 'agent')),
+    scope_id TEXT NOT NULL,
+    period TEXT NOT NULL CHECK (period IN ('daily', 'weekly', 'monthly')),
+    since TEXT NOT NULL,
+    until TEXT NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('semon', 'magpie')),
+    session_count INTEGER NOT NULL,
+    unpriced_count INTEGER NOT NULL,
+    incomplete_count INTEGER NOT NULL,
+    usd_est REAL,
+    source_reported_usd REAL,
+    billed_usd REAL,
+    preferred_usd REAL,
+    coverage TEXT,
+    snapshot_id TEXT,
+    as_of TEXT,
+    observed_at TEXT NOT NULL,
+    PRIMARY KEY (scope_kind, scope_id, period, since, source)
+  ) STRICT;
+  `,
 ];
 
 // Read the version with the writer lock held so simultaneous opens cannot apply the same migration.

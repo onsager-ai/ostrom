@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { PlatformApiClient, startPlatformApiServer } from "./api.ts";
 import { runPlatformCli } from "./cli.ts";
 import { PlatformStore } from "./store.ts";
-import type { Decision, DecisionVerification, FrictionEntry, Goal, Lane, PolicyRule } from "./types.ts";
+import type { Decision, DecisionVerification, FrictionEntry, Goal, Lane, PolicyRule, SpendRollup } from "./types.ts";
 
 async function cli(argv: string[]) {
   let stdout = "";
@@ -134,6 +134,17 @@ for (const transport of ["db", "socket"]) {
       "--scope", "lane", "--scope-id", lane.id);
     assert.equal(spend.status, "unavailable");
     assert.equal(spend.billedUsd, null);
+    const rollup: SpendRollup = {
+      scopeKind: "team", scopeId: null, period: "daily", source: "semon", since: "2026-11-27T00:00:00.000Z",
+      until: "2026-11-27T13:00:00.000Z", observedAt: "2026-11-27T13:00:00.000Z", snapshotId: "generation", asOf: null,
+      usdEst: 9, preferredUsd: 9, sourceReportedUsd: null, billedUsd: null, coverage: "partial",
+      sessionCount: 1, unpricedCount: 2, incompleteCount: 2,
+    };
+    assert.deepEqual(await call("spend", "record-rollup", "--rollup", JSON.stringify(rollup)), rollup);
+    const batch = [{ ...rollup, usdEst: 10, preferredUsd: 10 }, { ...rollup, period: "monthly", since: "2026-11-01T00:00:00.000Z" }];
+    assert.deepEqual(await call("spend", "record-rollup", "--rollup", JSON.stringify(batch)), batch);
+    assert.deepEqual(store.getSpendRollup(rollup, rollup.since), batch[0]);
+    assert.equal((await run("spend", "record-rollup", "--rollup", "{bad")).code, 2);
     assert.notEqual((await run("spend", "summary", "--scope-id", "../unsafe")).code, 0);
     assert.notEqual((await run("spend", "summary", "--period", "yearly")).code, 0);
     assert.notEqual((await run("budget", "set", "--scope", "team", "--period", "weekly",
@@ -146,6 +157,33 @@ for (const transport of ["db", "socket"]) {
     assert.equal((await run("goal", "set", "platform", "--statement", "Goal", "--metric", "Count", "--target", "NaN")).code, 2);
   });
 }
+
+test("spend query-semon emits a JSON array through a local Semon binary", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "ostrom-semon-"));
+  t.after(() => { rmSync(directory, { recursive: true, force: true }); });
+  const path = join(directory, "mock semon");
+  const schema = { tables: [{ name: "fact_step", columns: ["session_uid", "ts", "usage_owner", "price_status", "usd_est",
+    "price_version"].map((name) => ({ name })) }] };
+  writeFileSync(path, `#!/bin/sh
+[ "$1" = "query" ] || exit 1
+case "$2" in
+  schema) printf '%s\\n' '${JSON.stringify(schema)}' ;;
+  sql) [ "$4" = "--params" ] || exit 1
+       printf '%s\\n' '{"truncated":false,"snapshot":"generation","rows":[[2,4,1,3,2,1.75]]}' ;;
+  *) exit 1 ;;
+esac
+`, { mode: 0o700 });
+  const result = await cli(["spend", "query-semon", "--semon-bin", path]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.stderr, "");
+  const rollups = JSON.parse(result.stdout) as SpendRollup[];
+  assert.deepEqual(rollups.map(({ period }) => period), ["daily", "weekly", "monthly"]);
+  assert(rollups.every(({ scopeKind, scopeId, source, coverage, preferredUsd }) =>
+    scopeKind === "team" && scopeId === null && source === "semon" && coverage === "partial" && preferredUsd === 1.75));
+  const failure = await cli(["spend", "query-semon", "--semon-bin", join(directory, "missing")]);
+  assert.equal(failure.code, 1);
+  assert.equal(failure.stdout, "");
+});
 
 test("the CLI entry point serves the requested database and shuts down on SIGTERM", async (t) => {
   const directory = mkdtempSync(join(tmpdir(), "ostrom-serve-"));

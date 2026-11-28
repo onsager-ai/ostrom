@@ -16,7 +16,7 @@ import { defaultHostsConfigPath, loadPlatformHosts } from "./config.ts";
 import type { PlatformT3Host } from "./config.ts";
 import { startPlatformDashboard } from "./dashboard.ts";
 import { pollGitHubPrs } from "./github-observer.ts";
-import { SemonCliSpendSource, refreshSpendSnapshots } from "./spend.ts";
+import { SemonCliSpendSource, querySemonTeamRollups, refreshSpendSnapshots } from "./spend.ts";
 import { isDigestWindow } from "./digest.ts";
 import { evaluatePolicyAndHealth } from "./policy-observer.ts";
 import { startStatusMcp } from "./status-mcp.ts";
@@ -47,6 +47,8 @@ const usage = `usage: ostrom-platform [--db <path> | --socket <path>] [--json] <
   budget list
   run link-semon <run-id> --session-uid UID
   spend summary [--scope team|lane|agent] [--scope-id ID] [--period daily|weekly|monthly] [--source semon|magpie]
+  spend query-semon [--semon-bin <path>]
+  spend record-rollup --rollup JSON
   friction add --kind KIND --summary TEXT [--lane SLUG] [--rule CODE]
   friction list [--status STATUS]
   auth t3 <host-id> --pairing-code <code> [--hosts-config <path>] [--tokens-dir <path>]
@@ -114,6 +116,8 @@ const commands = new Map<string, { operands: number; flags: string }>([
   ["run link-semon", { operands: 1, flags: "session-uid" }],
   ["budget list", { operands: 0, flags: "" }],
   ["spend summary", { operands: 0, flags: "scope scope-id period source" }],
+  ["spend query-semon", { operands: 0, flags: "semon-bin" }],
+  ["spend record-rollup", { operands: 0, flags: "rollup" }],
   ["policy list", { operands: 0, flags: "" }],
   ["friction add", { operands: 0, flags: "kind summary lane rule" }],
   ["friction list", { operands: 0, flags: "status" }],
@@ -272,6 +276,8 @@ async function execute(call: Call, command: string, operand: string, flags: Map<
       return { data: await call("GET", withQuery("/v1/spend/summary", {
         scopeKind: optional("scope"), scopeId: scopeId(), period: optional("period"), source: optional("source"),
       })) };
+    case "spend record-rollup":
+      return { data: await call("POST", "/v1/spend/rollups", parseJson(required("rollup"), "rollup")) };
     case "policy list":
       return { data: await call("GET", "/v1/policy/rules") };
     case "friction add":
@@ -503,6 +509,12 @@ export async function runPlatformCli(argv: readonly string[], io: CliIO = {}): P
     }
 
     if (db !== undefined && socket !== undefined) throw new UsageError("choose --db or --socket");
+    if (command === "spend query-semon") {
+      const bin = flags.get("--semon-bin") ?? "semon";
+      if (bin.trim() === "") throw new UsageError("--semon-bin requires a non-empty path");
+      stdout.write(`${JSON.stringify(await querySemonTeamRollups(bin, new Date()))}\n`);
+      return 0;
+    }
     const store = db === undefined ? undefined : PlatformStore.open(db);
     try {
       const client = new PlatformApiClient(socket ?? defaultPlatformSocketPath(env));

@@ -263,3 +263,27 @@ export interface SpendSummaryFilter {
   period: BudgetPeriod;
   source: SpendSourceKind;
 }
+
+export interface SpendRollup extends SpendSummaryFilter {
+  since: string;
+  until: string;
+  sessionCount: number;
+  unpricedCount: number;
+  incompleteCount: number;
+  usdEst: number | null;
+  sourceReportedUsd: number | null;
+  billedUsd: number | null;
+  preferredUsd?: number | null;
+  coverage: string | null;
+  snapshotId: string | null;
+  asOf: string | null;
+  observedAt: string;
+}
+
+export function spendWindow(period: BudgetPeriod, now: Date | string): { since: string; until: string } {
+  const until = new Date(now).toISOString();
+  const start = new Date(`${until.slice(0, 10)}T00:00:00Z`);
+  if (period === "weekly") start.setUTCDate(start.getUTCDate() - ((start.getUTCDay() + 6) % 7));
+  if (period === "monthly") start.setUTCDate(1);
+  return { since: start.toISOString(), until };
+}

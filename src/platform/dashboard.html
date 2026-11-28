@@ -415,15 +415,22 @@
     return node;
   }
 
-  const money = (amount) => amount.toLocaleString("en-US", { maximumFractionDigits: 2 });
+  const money = (amount, minimumFractionDigits = 0) =>
+    amount.toLocaleString("en-US", { minimumFractionDigits, maximumFractionDigits: 2 });
   const spendUnavailable = "Unavailable · Semon not enabled on this host";
+  const semonRollup = (spend) => spend.source === "semon" && spend.observedAt !== undefined;
   function spendMeter({ budgets, spend }) {
     const budget = budgets.find((item) => item.enabled && item.scopeKind === "team" && item.period === "monthly");
     const summary = budget?.spend ?? spend;
     const cap = budget?.capUsd;
     const amount = summary.status === "available" ? summary.preferredUsd : null;
-    const readout = amount == null ? (summary.status === "unavailable" ? spendUnavailable : "Unavailable · No priced sessions")
-      : cap == null ? `USD ${money(amount)} estimated` : `USD ${money(amount)} / ${money(cap)} monthly`;
+    const count = summary.sessionCount;
+    const coverage = summary.coverage === "partial" ? " · partial" : "";
+    const estimated = summary.billedUsd == null && summary.sourceReportedUsd == null;
+    const unit = semonRollup(summary) ? "steps" : "sessions";
+    const readout = amount == null ? (summary.status === "unavailable" ? spendUnavailable : `Unavailable · No priced ${unit}`)
+      : cap == null ? `USD ${money(amount, 2)}${estimated ? " est." : ""} monthly · ${count.toLocaleString("en-US")} ${count === 1 ? "session" : "sessions"}${coverage}`
+      : `USD ${money(amount, 2)} / ${money(cap)} monthly${estimated ? " · est." : ""}${coverage}`;
     const node = element("section", "", "panel section spend");
     const track = element("div", "", "meter-track");
     if (amount != null && cap > 0) {
@@ -602,10 +609,12 @@
     }));
   }
   function spendRow(title, spend) {
+    const unpriced = semonRollup(spend) ? `${spend.unpricedCount} unpriced steps across ${spend.sessionCount} sessions`
+      : `${spend.unpricedCount} of ${spend.sessionCount} sessions unpriced`;
     const detail = spend.status === "unavailable" ? spendUnavailable
       : `Estimated USD ${spend.usdEst ?? "unknown"} · Reported USD ${spend.sourceReportedUsd ?? "unknown"} · `
       + `Billed USD ${spend.billedUsd ?? "unknown"} · Coverage ${spend.coverage ?? "unknown"} · `
-      + `${spend.unpricedCount} of ${spend.sessionCount} sessions unpriced · ${spend.unlinkedRunCount} unlinked runs · `
+      + `${unpriced} · ${spend.unlinkedRunCount} unlinked runs · `
       + `${spend.missingSnapshotCount} runs missing a snapshot · ${spend.staleSnapshotCount} stale snapshots`;
     return row(title, detail);
   }

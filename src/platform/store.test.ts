@@ -9,6 +9,7 @@ import type { TestContext } from "node:test";
 import { unavailableSpendSource } from "./spend.ts";
 import { DecisionStateError, PlatformStore, PlatformValidationError } from "./store.ts";
 import type { CreateDecisionInput } from "./store.ts";
+import type { SpendRollup } from "./types.ts";
 
 const request = {
   title: "Approve the weekly plan",
@@ -51,7 +52,7 @@ test("the host URL migration preserves existing rows and later URL updates", (t)
   const original = store.upsertT3HostState(host);
   assert.equal(original.webUrl, null);
   db.exec(`ALTER TABLE t3_host_state DROP COLUMN web_url;
-    DELETE FROM platform_schema_version WHERE version >= (SELECT max(version) - 2 FROM platform_schema_version)`);
+    DELETE FROM platform_schema_version WHERE version >= 5`);
   const upgraded = PlatformStore.open(path);
   const webUrl = "https://t3-east.example";
   try {
@@ -76,7 +77,7 @@ test("the PR draft migration preserves existing checks and persists draft change
   store.recordGitHubPrCheck("org/repo", 7, check);
   const before = store.listGitHubPrChecks();
   db.exec(`ALTER TABLE github_pr_check DROP COLUMN is_draft;
-    DELETE FROM platform_schema_version WHERE version >= (SELECT max(version) - 1 FROM platform_schema_version)`);
+    DELETE FROM platform_schema_version WHERE version >= 6`);
   const upgraded = PlatformStore.open(path);
   try {
     assert.deepEqual(upgraded.listGitHubPrChecks(), before);
@@ -86,7 +87,7 @@ test("the PR draft migration preserves existing checks and persists draft change
   } finally {
     upgraded.close();
   }
-  db.exec("DELETE FROM platform_schema_version WHERE version >= (SELECT max(version) - 1 FROM platform_schema_version)");
+  db.exec("DELETE FROM platform_schema_version WHERE version >= 6");
   const reopened = PlatformStore.open(path);
   try {
     assert.equal(reopened.listGitHubPrChecks()[0]?.isDraft, true);
@@ -98,9 +99,9 @@ test("the PR draft migration preserves existing checks and persists draft change
 });
 
 test("the goal stale policy migration seeds existing databases", (t) => {
-  const { store, db, path } = disk(t);
+  const { db, path } = disk(t);
   db.exec(`DELETE FROM policy_rule WHERE code = 'goal_stale';
-    DELETE FROM platform_schema_version WHERE version = (SELECT max(version) FROM platform_schema_version)`);
+    DELETE FROM platform_schema_version WHERE version >= 7`);
   const upgraded = PlatformStore.open(path);
   try {
     const rule = upgraded.listPolicyRules().find(({ code }) => code === "goal_stale");
@@ -111,6 +112,49 @@ test("the goal stale policy migration seeds existing databases", (t) => {
     assert.equal(rule?.enabled, true);
   } finally {
     upgraded.close();
+  }
+});
+
+test("the spend rollup migration is idempotent and preserves per-session snapshots", (t) => {
+  const { store, db, path } = disk(t);
+  const snapshot = store.upsertSpendSnapshot({ sessionUid: "session-1", source: "semon", usdEst: 8 });
+  db.exec("DROP TABLE spend_rollup; DELETE FROM platform_schema_version WHERE version >= 8");
+  const rollup: SpendRollup = {
+    scopeKind: "team", scopeId: null, period: "daily", source: "semon", since: "2026-11-27T00:00:00.000Z",
+    until: "2026-11-27T13:00:00.000Z", observedAt: "2026-11-27T13:00:00.000Z", sessionCount: 2,
+    unpricedCount: 3, incompleteCount: 4, usdEst: 8, sourceReportedUsd: null, billedUsd: null, preferredUsd: 8,
+    coverage: "partial", snapshotId: "generation-1", asOf: null,
+  };
+  const upgraded = PlatformStore.open(path);
+  try {
+    assert.equal(upgraded.getSpendRollup(rollup, rollup.since), null);
+    assert.deepEqual(upgraded.upsertSpendRollup(rollup), rollup);
+    assert.equal(db.prepare("SELECT scope_id FROM spend_rollup").get()?.["scope_id"], "");
+    assert.equal(db.prepare("SELECT strict FROM pragma_table_list WHERE name = 'spend_rollup'").get()?.["strict"], 1);
+  } finally {
+    upgraded.close();
+  }
+  db.exec("DELETE FROM platform_schema_version WHERE version >= 8");
+  const reopened = PlatformStore.open(path);
+  try {
+    assert.deepEqual(reopened.getSpendRollup(rollup, "2026-11-27T00:00:00Z"), rollup);
+    assert.deepEqual(reopened.getSpendSnapshot(snapshot.sessionUid), snapshot);
+    const updated = { ...rollup, usdEst: 9, preferredUsd: 9, snapshotId: "generation-2" };
+    assert.deepEqual(reopened.upsertSpendRollup(updated), updated);
+    assert.deepEqual(reopened.getSpendRollup(rollup, rollup.since), updated);
+    assert.equal(db.prepare("SELECT count(*) AS count FROM spend_rollup").get()?.["count"], 1);
+    assert.equal(reopened.getSpendRollup({ ...rollup, source: "magpie" }, rollup.since), null);
+    assert.equal(reopened.getSpendRollup({ ...rollup, period: "monthly" }, rollup.since), null);
+    assert.equal(reopened.getSpendRollup({ ...rollup, scopeKind: "agent", scopeId: "agent-1" }, rollup.since), null);
+    assert.equal(reopened.getSpendRollup(rollup, "2026-11-26T00:00:00Z"), null);
+    for (const input of [
+      { scopeKind: "other" }, { scopeId: "" }, { scopeKind: "lane" }, { scopeKind: "agent", scopeId: 42 },
+      { period: "yearly" }, { source: "other" }, { sessionCount: -1 }, { unpricedCount: 1.5 }, { incompleteCount: Infinity },
+      { usdEst: -1 }, { sourceReportedUsd: "8" }, { billedUsd: NaN }, { preferredUsd: Infinity },
+      { since: "2026-11-31T00:00:00Z" }, { until: "2026-11-26T00:00:00Z" }, { observedAt: "yesterday" },
+    ]) assert.throws(() => reopened.upsertSpendRollup({ ...rollup, ...input } as SpendRollup), PlatformValidationError);
+  } finally {
+    reopened.close();
   }
 });
 
