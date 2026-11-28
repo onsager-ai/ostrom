@@ -12,7 +12,7 @@ import type {
   AnswerDecisionInput, CreateDecisionInput, CreateLaneInput, DecisionFilter, PlatformStore,
   RecordFrictionInput, SetGoalInput, SupersedeDecisionInput, UpdateLaneInput, UpsertBudgetInput,
 } from "./store.ts";
-import type { FrictionStatus, SpendSummaryFilter } from "./types.ts";
+import type { FrictionStatus, SpendRollup, SpendSummaryFilter } from "./types.ts";
 
 const bodyLimit = 1024 * 1024;
 type Method = "GET" | "POST" | "PUT";
@@ -68,6 +68,11 @@ export async function dispatchPlatformRequest(
   if (get && route === "/v1/waits") return ok(store.listOpenT3Waits());
   if (get && route === "/v1/prs") return ok(store.listT3ThreadPrs());
   if (get && route === "/v1/github/prs") return ok(store.listGitHubPrChecks());
+  if (post && route === "/v1/spend/rollups") {
+    const payload = await readBody();
+    return ok(Array.isArray(payload) ? store.upsertSpendRollups(payload.map(objectBody<SpendRollup>))
+      : store.upsertSpendRollup(objectBody<SpendRollup>(payload)));
+  }
   if (get && route === "/v1/spend/summary") {
     const filter = {
       scopeKind: query.get("scopeKind") ?? "team", scopeId: query.get("scopeId"),

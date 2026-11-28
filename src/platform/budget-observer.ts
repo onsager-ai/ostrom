@@ -1,8 +1,34 @@
 import type { PlatformStore } from "./store.ts";
 import type { PolicyEvent, SpendSummaryFilter } from "./types.ts";
 
-export function readSpendSummary(store: PlatformStore, filter: SpendSummaryFilter, now: Date | string) {
+type SpendSummary = Omit<ReturnType<PlatformStore["summarizeSpend"]>, "coverage"> & {
+  status: "available" | "unavailable";
+  coverage: "complete" | "partial" | "unknown";
+  sourceCoverage: string | null;
+  observedAt?: string;
+  asOf?: string | null;
+  snapshotId?: string | null;
+};
+
+export function readSpendSummary(store: PlatformStore, filter: SpendSummaryFilter, now: Date | string): SpendSummary {
   const summary = store.summarizeSpend(filter, now);
+  if (summary.snapshotCount === 0) {
+    const rollup = store.getSpendRollup(filter, summary.since);
+    if (rollup !== null) {
+      const observedAt = Date.parse(rollup.observedAt);
+      const stale = !Number.isFinite(observedAt) || new Date(now).getTime() - observedAt > 24 * 3_600_000;
+      const preferredUsd = rollup.preferredUsd ?? rollup.billedUsd ?? rollup.sourceReportedUsd ?? rollup.usdEst;
+      const complete = !stale && rollup.incompleteCount === 0 && rollup.unpricedCount === 0 && rollup.coverage === "complete";
+      return {
+        ...summary, status: "available", sessionCount: rollup.sessionCount, snapshotCount: rollup.sessionCount,
+        unpricedCount: rollup.unpricedCount, incompleteCount: rollup.incompleteCount,
+        staleSnapshotCount: stale ? rollup.sessionCount : 0,
+        usdEst: rollup.usdEst, sourceReportedUsd: rollup.sourceReportedUsd, billedUsd: rollup.billedUsd,
+        preferredUsd, coverage: preferredUsd === null ? "unknown" : complete ? "complete" : "partial",
+        sourceCoverage: rollup.coverage, observedAt: rollup.observedAt, asOf: rollup.asOf, snapshotId: rollup.snapshotId,
+      };
+    }
+  }
   const status = summary.snapshotCount === 0 ? "unavailable" as const : "available" as const;
   return {
     ...summary, status, sourceCoverage: summary.coverage,

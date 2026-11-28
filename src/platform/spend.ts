@@ -2,8 +2,8 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 import type { PlatformStore } from "./store.ts";
-import { isSemonKey } from "./types.ts";
-import type { SemonSessionIdentity, SpendSnapshot } from "./types.ts";
+import { budgetPeriods, isSemonKey, spendWindow } from "./types.ts";
+import type { SemonSessionIdentity, SpendRollup, SpendSnapshot } from "./types.ts";
 
 export type SpendLookup =
   | { status: "available"; snapshot: Readonly<SpendSnapshot> }
@@ -42,6 +42,62 @@ interface SemonQuery {
   truncated: boolean;
 }
 
+async function readSemonSchema(bin: string, run: SemonRunner): Promise<Map<string, Set<string>>> {
+  const result = JSON.parse(await run(bin, ["query", "schema"])) as {
+    tables: { name: string; columns: { name: string }[] }[];
+  };
+  return new Map(result.tables.map(({ name, columns }) => [name, new Set(columns.map((column) => column.name))]));
+}
+
+function requireSemonFields(schema: Map<string, Set<string>>, table: string, required: readonly string[]): Set<string> {
+  const fields = schema.get(table);
+  if (fields === undefined || !required.every((column) => fields.has(column))) throw new Error("unsupported Semon schema");
+  return fields;
+}
+
+async function readSemonQuery(bin: string, run: SemonRunner, sql: string, params: string[] = []): Promise<SemonQuery> {
+  const result = JSON.parse(await run(bin, ["query", "sql", sql, ...params])) as SemonQuery;
+  if (result.truncated !== false || !Array.isArray(result.rows) || result.rows.length > 2
+    || !result.rows.every(Array.isArray)) throw new Error("invalid Semon query result");
+  return result;
+}
+
+const rollupSql = `SELECT
+  count(DISTINCT session_uid) AS session_count,
+  count(*) FILTER (WHERE usage_owner = 'exclusive') AS exclusive_steps,
+  count(*) FILTER (WHERE usage_owner = 'exclusive' AND price_status = 'priced') AS priced_steps,
+  count(*) FILTER (WHERE usage_owner = 'exclusive' AND price_status = 'unpriced') AS unpriced_steps,
+  count(*) FILTER (WHERE usage_owner <> 'exclusive') AS non_exclusive_steps,
+  sum(usd_est) FILTER (WHERE usage_owner = 'exclusive' AND price_status = 'priced') AS priced_usd_est
+FROM fact_step
+WHERE epoch_ms(ts) >= ? AND epoch_ms(ts) < ?`;
+
+export async function querySemonTeamRollups(bin: string, now: Date | string, run: SemonRunner = runSemon): Promise<SpendRollup[]> {
+  requireSemonFields(await readSemonSchema(bin, run), "fact_step", [
+    "session_uid", "ts", "usage_owner", "price_status", "usd_est", "price_version",
+  ]);
+  const rollups: SpendRollup[] = [];
+  for (const period of budgetPeriods) {
+    const { since, until } = spendWindow(period, now);
+    const params = JSON.stringify([Date.parse(since), Date.parse(until)]);
+    const result = await readSemonQuery(bin, run, rollupSql, ["--params", params]);
+    const row = result.rows[0];
+    if (result.rows.length !== 1 || row?.length !== 6) throw new Error("invalid Semon spend rollup result");
+    const sessionCount = rollupCount(row[0]);
+    const unpricedCount = rollupCount(row[3]);
+    const incompleteCount = rollupCount(unpricedCount + rollupCount(row[4]));
+    const usdEst = money(row[5], 0);
+    rollups.push({
+      scopeKind: "team", scopeId: null, period, source: "semon", since, until, sessionCount, unpricedCount, incompleteCount,
+      usdEst, sourceReportedUsd: null, billedUsd: null, preferredUsd: usdEst,
+      // One origin's priced exclusive steps cannot establish complete team spend.
+      coverage: "partial", snapshotId: metadata(result.snapshot_id ?? result.snapshot),
+      asOf: metadata(result.as_of), observedAt: until,
+    });
+  }
+  return rollups;
+}
+
 export class SemonCliSpendSource implements SpendSource {
   private readonly bin: string;
   private readonly run: SemonRunner;
@@ -53,22 +109,12 @@ export class SemonCliSpendSource implements SpendSource {
   }
 
   private async fields(table: string, required: readonly string[]): Promise<Set<string>> {
-    if (this.schema === undefined) {
-      const result = JSON.parse(await this.run(this.bin, ["query", "schema"])) as {
-        tables: { name: string; columns: { name: string }[] }[];
-      };
-      this.schema = new Map(result.tables.map(({ name, columns }) => [name, new Set(columns.map((column) => column.name))]));
-    }
-    const fields = this.schema.get(table);
-    if (fields === undefined || !required.every((column) => fields.has(column))) throw new Error("unsupported Semon schema");
-    return fields;
+    this.schema ??= await readSemonSchema(this.bin, this.run);
+    return requireSemonFields(this.schema, table, required);
   }
 
   private async query(sql: string): Promise<SemonQuery> {
-    const result = JSON.parse(await this.run(this.bin, ["query", "sql", sql])) as SemonQuery;
-    if (result.truncated !== false || !Array.isArray(result.rows) || result.rows.length > 2
-      || !result.rows.every(Array.isArray)) throw new Error("invalid Semon query result");
-    return result;
+    return readSemonQuery(this.bin, this.run, sql);
   }
 
   async supportsSessionIdentity(): Promise<boolean> {
@@ -137,9 +183,14 @@ function tokenCount(value: unknown): number | null {
   throw new Error("invalid Semon token count");
 }
 
-function money(value: unknown): number | null {
+function rollupCount(value: unknown): number {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return value;
+  throw new Error("invalid Semon spend rollup count");
+}
+
+function money(value: unknown, min = -Infinity): number | null {
   if (value === null) return null;
-  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "number" && Number.isFinite(value) && value >= min) return value;
   throw new Error("invalid Semon cost");
 }
 

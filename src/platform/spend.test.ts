@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { PlatformStore } from "./store.ts";
-import { SemonCliSpendSource, refreshSpendSnapshots } from "./spend.ts";
+import { SemonCliSpendSource, querySemonTeamRollups, refreshSpendSnapshots } from "./spend.ts";
 
 const factColumns = [
   "session_uid", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_5m_tokens",
@@ -11,6 +11,52 @@ const factColumns = [
 const dimColumns = ["session_uid", "origin_namespace", "native_harness", "native_session_id"];
 const schema = (...tables: [string, string[]][]) => ({ tables: tables.map(([name, cols]) =>
   ({ name, columns: cols.map((column) => ({ name: column })) })) });
+
+const stepColumns = ["session_uid", "ts", "usage_owner", "price_status", "usd_est", "price_version"];
+
+test("Semon queries priced exclusive steps over half-open UTC spend windows", async () => {
+  const now = "2026-12-03T03:15:45.678+08:00";
+  const until = "2026-12-02T19:15:45.678Z";
+  const starts = ["2026-12-02T00:00:00.000Z", "2026-11-30T00:00:00.000Z", "2026-12-01T00:00:00.000Z"];
+  const sql = `SELECT
+  count(DISTINCT session_uid) AS session_count,
+  count(*) FILTER (WHERE usage_owner = 'exclusive') AS exclusive_steps,
+  count(*) FILTER (WHERE usage_owner = 'exclusive' AND price_status = 'priced') AS priced_steps,
+  count(*) FILTER (WHERE usage_owner = 'exclusive' AND price_status = 'unpriced') AS unpriced_steps,
+  count(*) FILTER (WHERE usage_owner <> 'exclusive') AS non_exclusive_steps,
+  sum(usd_est) FILTER (WHERE usage_owner = 'exclusive' AND price_status = 'priced') AS priced_usd_est
+FROM fact_step
+WHERE epoch_ms(ts) >= ? AND epoch_ms(ts) < ?`;
+  const calls: string[][] = [];
+  const rollups = await querySemonTeamRollups("/path/with spaces/semon", now, async (bin, args) => {
+    assert.equal(bin, "/path/with spaces/semon");
+    calls.push(args);
+    if (args[1] === "schema") return JSON.stringify(schema(["fact_step", stepColumns]));
+    const index = calls.length - 2;
+    assert.deepEqual(args, ["query", "sql", sql, "--params", JSON.stringify([Date.parse(starts[index]!), Date.parse(until)])]);
+    return JSON.stringify({ truncated: false, snapshot: `generation-${index}`, coverage: "complete",
+      rows: [[2, 4, index === 0 ? 0 : 1, 3, 2, index === 0 ? null : 1.75]] });
+  });
+  assert.deepEqual(calls[0], ["query", "schema"]);
+  assert.equal(calls.length, 4);
+  assert.deepEqual(rollups, ["daily", "weekly", "monthly"].map((period, index) => ({
+    scopeKind: "team", scopeId: null, period, source: "semon", since: starts[index], until, observedAt: until,
+    sessionCount: 2, unpricedCount: 3, incompleteCount: 5, usdEst: index === 0 ? null : 1.75,
+    preferredUsd: index === 0 ? null : 1.75, sourceReportedUsd: null, billedUsd: null,
+    coverage: "partial", snapshotId: `generation-${index}`, asOf: null,
+  })));
+});
+
+test("Semon rollups reject an unsupported schema or truncated result", async () => {
+  const now = "2026-11-27T13:00:00Z";
+  await assert.rejects(querySemonTeamRollups("semon", now, async (_bin, args) => {
+    assert.deepEqual(args, ["query", "schema"]);
+    return JSON.stringify(schema(["fact_step", stepColumns.slice(0, -1)]));
+  }), /unsupported Semon schema/);
+  await assert.rejects(querySemonTeamRollups("semon", now, async (_bin, args) => JSON.stringify(args[1] === "schema"
+    ? schema(["fact_step", stepColumns])
+    : { truncated: true, rows: [[2, 4, 1, 3, 2, 1.75]] })), /invalid Semon query result/);
+});
 
 test("Semon validates schema, resolves exact native identity and loads only the session aggregate", async () => {
   const calls: string[][] = [];

@@ -8,7 +8,8 @@ import type { TestContext } from "node:test";
 
 import { PlatformApiClient, PlatformApiError, startPlatformApiServer } from "./api.ts";
 import { PlatformStore } from "./store.ts";
-import type { Decision, DecisionVerification, Goal, Lane } from "./types.ts";
+import { spendWindow } from "./types.ts";
+import type { Decision, DecisionVerification, Goal, Lane, SpendRollup } from "./types.ts";
 
 const entry = {
   title: "Release approval", authority: "owner", urgency: "blocking_today",
@@ -206,4 +207,31 @@ test("the Unix API writes budgets and exposes spend and GitHub PR observations",
   });
   assert.deepEqual(await client.request("GET", "/v1/github/prs"), store.listGitHubPrChecks());
   await assert.rejects(client.request("PUT", "/v1/github/prs", {}), { status: 404 });
+});
+
+test("the Unix API upserts individual rollups and applies a batch atomically", async (t) => {
+  const { store, socketPath, client } = await fixture(t);
+  const now = new Date();
+  const rollup: SpendRollup = {
+    scopeKind: "team", scopeId: null, period: "monthly", source: "semon", ...spendWindow("monthly", now),
+    observedAt: now.toISOString(), sessionCount: 2, unpricedCount: 3, incompleteCount: 4,
+    usdEst: 8, sourceReportedUsd: null, billedUsd: null, preferredUsd: 8, coverage: "partial", snapshotId: "generation", asOf: null,
+  };
+  const route = "/v1/spend/rollups";
+  const posted = await rawPost(socketPath, route, JSON.stringify(rollup));
+  assert.equal(posted.status, 200);
+  assert.deepEqual(posted.data, rollup);
+  const summary = await client.request<{ status: string; preferredUsd: number; coverage: string }>("GET", "/v1/spend/summary");
+  assert.equal(summary.status, "available");
+  assert.equal(summary.preferredUsd, 8);
+  assert.equal(summary.coverage, "partial");
+
+  const weekly: SpendRollup = { ...rollup, ...spendWindow("weekly", now), period: "weekly" };
+  const updated = { ...rollup, usdEst: 9, preferredUsd: 9 };
+  await assert.rejects(client.request("POST", route, [updated, { ...weekly, incompleteCount: -1 }]), { status: 400 });
+  assert.deepEqual(store.getSpendRollup(rollup, rollup.since), rollup);
+  assert.equal(store.getSpendRollup(weekly, weekly.since), null);
+  assert.deepEqual(await client.request("POST", route, [updated, weekly]), [updated, weekly]);
+  assert.deepEqual(store.getSpendRollup(weekly, weekly.since), weekly);
+  await assert.rejects(client.request("POST", route, null), { status: 400 });
 });

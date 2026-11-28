@@ -6,6 +6,7 @@ import { readSpendSummary } from "./budget-observer.ts";
 import { generateOwnerDigest } from "./digest.ts";
 import { evaluatePolicyAndHealth } from "./policy-observer.ts";
 import { PlatformStore } from "./store.ts";
+import type { SpendRollup } from "./types.ts";
 
 const now = "2026-11-27T13:00:00Z";
 const filter = { scopeKind: "team", scopeId: null, period: "weekly", source: "semon" } as const;
@@ -63,6 +64,68 @@ test("budget summaries use UTC calendar windows and deduplicate session UIDs wit
   assert.equal(missing.status, "unavailable");
   assert.equal(missing.preferredUsd, null);
   assert.equal(missing.unpricedCount, 3);
+});
+
+test("spend falls back to the matching rollup only when per-run snapshots are absent", (t) => {
+  const { store, addRun } = fixture(t);
+  const rollup: SpendRollup = {
+    ...filter, since: "2026-11-23T00:00:00.000Z", until: "2026-11-27T12:00:00.000Z",
+    sessionCount: 5, unpricedCount: 0, incompleteCount: 0, coverage: "complete", usdEst: 10,
+    sourceReportedUsd: 8, billedUsd: 6, preferredUsd: 12, snapshotId: "generation", asOf: "2026-11-27T11:00:00.000Z",
+    observedAt: "2026-11-27T12:00:00.000Z",
+  };
+  const read = () => readSpendSummary(store, filter, now);
+  assert.equal(read().status, "unavailable");
+  store.upsertSpendRollup(rollup);
+  assert.deepEqual(read(), {
+    ...filter, since: rollup.since, until: "2026-11-27T13:00:00.000Z", status: "available", coverage: "complete",
+    sourceCoverage: "complete", sessionCount: 5, snapshotCount: 5, staleSnapshotCount: 0, unpricedCount: 0,
+    incompleteCount: 0, unlinkedRunCount: 0, missingSnapshotCount: 0, incompleteRunCount: 0,
+    usdEst: 10, sourceReportedUsd: 8, billedUsd: 6, preferredUsd: 12, estimatedCount: 0, reportedCount: 0, billedCount: 0,
+    snapshotId: rollup.snapshotId, asOf: rollup.asOf, observedAt: rollup.observedAt,
+  });
+  assert.equal(readSpendSummary(store, filter, "2026-11-28T12:00:00.000Z").coverage, "complete");
+  const old = readSpendSummary(store, filter, "2026-11-28T12:00:00.001Z");
+  assert.equal(old.status, "available");
+  assert.equal(old.staleSnapshotCount, 5);
+  assert.equal(old.coverage, "partial");
+  assert.equal(readSpendSummary(store, filter, "2026-11-30T13:00:00Z").status, "unavailable");
+
+  for (const incomplete of [{ unpricedCount: 1 }, { incompleteCount: 1 }, { coverage: "partial" }]) {
+    store.upsertSpendRollup({ ...rollup, ...incomplete });
+    assert.equal(read().coverage, "partial");
+  }
+  const { preferredUsd, ...withoutPreferred } = rollup;
+  store.upsertSpendRollup(withoutPreferred);
+  assert.equal(read().preferredUsd, 6);
+  store.upsertSpendRollup({ ...withoutPreferred, usdEst: null, sourceReportedUsd: null, billedUsd: null });
+  assert.equal(read().coverage, "unknown");
+
+  store.upsertSpendRollup(rollup);
+  addRun("one", "uid");
+  store.upsertSpendSnapshot({ sessionUid: "uid", source: "semon", usdEst: 3, coverage: "complete" });
+  assert.equal(read().preferredUsd, 3);
+  assert.equal(read().snapshotCount, 1);
+  assert.equal(read().observedAt, undefined);
+});
+
+test("a partial or stale rollup cannot clear budget alerts", (t) => {
+  const { store } = fixture(t);
+  store.upsertBudget(policy);
+  const rollup: SpendRollup = {
+    ...filter, since: "2026-11-23T00:00:00Z", until: now, observedAt: now,
+    sessionCount: 10, unpricedCount: 0, incompleteCount: 0, coverage: "partial",
+    usdEst: 12, sourceReportedUsd: null, billedUsd: null, asOf: null, snapshotId: null,
+  };
+  const alerts = () => evaluatePolicyAndHealth(store, { now }).policyAlerts.length;
+  store.upsertSpendRollup(rollup);
+  assert.equal(alerts(), 2);
+  store.upsertSpendRollup({ ...rollup, usdEst: 1 });
+  assert.equal(alerts(), 2);
+  store.upsertSpendRollup({ ...rollup, usdEst: 1, coverage: "complete", observedAt: "2026-11-26T12:00:00Z" });
+  assert.equal(alerts(), 2);
+  store.upsertSpendRollup({ ...rollup, usdEst: 1, coverage: "complete" });
+  assert.equal(alerts(), 0);
 });
 
 test("budget warnings and breaches dedupe, survive incomplete recovery, and resolve on confirmed recovery or disable", (t) => {

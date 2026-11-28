@@ -17,12 +17,13 @@ function data(value: JsonValue): string {
   return markdownText(JSON.stringify(value));
 }
 
-function spendLine(spend: { usdEst: number | null; sourceReportedUsd: number | null; billedUsd: number | null;
-  coverage: string | null; unpricedCount: number; sessionCount: number; unlinkedRunCount: number;
-  missingSnapshotCount: number; staleSnapshotCount: number }): string {
+function spendLine(spend: ReturnType<typeof readPlatformHealth>["spend"]): string {
+  const unpriced = spend.source === "semon" && spend.observedAt !== undefined
+    ? `${spend.unpricedCount} unpriced steps across ${spend.sessionCount} sessions`
+    : `${spend.unpricedCount} of ${spend.sessionCount} sessions unpriced`;
   return `Estimated USD ${spend.usdEst ?? "unknown"} · Reported USD ${spend.sourceReportedUsd ?? "unknown"} · `
     + `Billed USD ${spend.billedUsd ?? "unknown"} · Coverage ${markdownText(spend.coverage ?? "unknown")} · `
-    + `${spend.unpricedCount} of ${spend.sessionCount} sessions unpriced · `
+    + `${unpriced} · `
     + `${spend.unlinkedRunCount} unlinked runs · ${spend.missingSnapshotCount} runs missing a snapshot · `
     + `${spend.staleSnapshotCount} stale snapshots`;
 }

@@ -70,6 +70,7 @@ test("serves the loopback page and proxies authenticated GETs only", async () =>
       assert.equal((await read(url, "/v1/hosts", { ...headers, host: "localhost:" + url.port })).status, 403);
       assert.equal((await read(url, "/v1/hosts", { ...headers, origin: "https://foreign.example" })).status, 403);
       assert.equal((await read(url, "/v1/decisions", headers, "POST")).status, 405);
+      assert.equal((await read(url, "/v1/spend/rollups", headers, "POST")).status, 405);
       assert.equal((await read(url, "/", {}, "HEAD")).status, 405);
       assert.equal((await read(url, "/v1/budgets", headers, "PUT")).status, 405);
       assert.equal((await read(url, "/v1/lanes/platform", headers, "PUT")).status, 405);
@@ -445,9 +446,14 @@ test("Lane Board caps exceptions, keeps lane summaries current, and preserves dr
     toggle(expanded).onclick();
     assert.deepEqual(laneNames(view.children[2]), ["Release", "Stale Lane"]);
     assert.match(textIn(spend), /Unavailable · Semon not enabled on this host/);
-    assert.match(textIn(spendMeter({ spend: { status: "available", preferredUsd: 4.5 }, budgets: [] })), /USD 4.5 estimated/);
-    assert.match(textIn(spendMeter({ spend: health.spend, budgets: [{ enabled: true, scopeKind: "team",
-      period: "monthly", capUsd: 12, spend: { status: "available", preferredUsd: 4.5 } }] })), /USD 4.5 \/ 12 monthly/);
+    const estimate = { status: "available", preferredUsd: 4496.166422454997, sessionCount: 1672, coverage: "partial",
+      source: "semon", observedAt: "2026-11-27T13:00:00Z", unpricedCount: 1700 };
+    assert.match(textIn(spendMeter({ spend: estimate, budgets: [] })), /USD 4,496[.]17 est[.] monthly · 1,672 sessions · partial/);
+    assert.match(textIn(spendRow("Team monthly", estimate)), /1700 unpriced steps across 1672 sessions/);
+    assert.match(textIn(spendMeter({ spend: { ...estimate, preferredUsd: null }, budgets: [] })), /No priced steps/);
+    const capped = spendMeter({ spend: health.spend, budgets: [{ enabled: true, scopeKind: "team",
+      period: "monthly", capUsd: 12, spend: { ...estimate, preferredUsd: 4.5 } }] });
+    assert(textIn(capped).includes("USD 4.50 / 12 monthly · est. · partial"));
     assert.equal(byId("owner-digest").hidden, true);
     assert.equal(descendants(view).some((node) => node.textContent === "Hosts"), false);
     const withoutPlan = { ...lane, goal: null };
