@@ -155,6 +155,12 @@ for (const transport of ["db", "socket"]) {
     assert.deepEqual(await call("friction", "list", "--status", "open"), [friction]);
     assert.equal((await run("lane", "list", "--status", "open")).code, 2);
     assert.equal((await run("goal", "set", "platform", "--statement", "Goal", "--metric", "Count", "--target", "NaN")).code, 2);
+    assert.equal((await run("goal", "complete", "platform", "--current", "NaN")).code, 2);
+    const completed = await call<Goal>("goal", "complete", "platform", "--week", goal.weekStart, "--current", "2");
+    assert.ok(completed.completedAt);
+    assert.deepEqual(completed, { ...goal, completedAt: completed.completedAt, updatedAt: completed.completedAt, metricCurrent: 2 });
+    assert.deepEqual(await call("lane", "show", "platform"), { ...reprioritized, goal: completed });
+    assert.notEqual((await run("goal", "complete", "platform")).code, 0);
   });
 }
 

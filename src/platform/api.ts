@@ -9,7 +9,7 @@ import { generateOwnerDigest, isDigestWindow } from "./digest.ts";
 import { readPlatformHealth } from "./policy-observer.ts";
 import { DecisionStateError, PlatformNotFoundError, PlatformValidationError } from "./store.ts";
 import type {
-  AnswerDecisionInput, CreateDecisionInput, CreateLaneInput, DecisionFilter, PlatformStore,
+  AnswerDecisionInput, CompleteGoalOptions, CreateDecisionInput, CreateLaneInput, DecisionFilter, PlatformStore,
   RecordFrictionInput, SetGoalInput, SupersedeDecisionInput, UpdateLaneInput, UpsertBudgetInput,
 } from "./store.ts";
 import type { FrictionStatus, SpendRollup, SpendSummaryFilter } from "./types.ts";
@@ -50,7 +50,7 @@ function objectBody<T extends object>(body: unknown): T {
 }
 
 export async function dispatchPlatformRequest(
-  store: PlatformStore, method: string | undefined, path: string, readBody: () => Promise<unknown>,
+  store: PlatformStore, method: string | undefined, path: string, readBody: (allowEmpty?: boolean) => Promise<unknown>,
 ): Promise<{ status: number; body: unknown }> {
   // Split the query before decoding identifiers so dot segments reach store validation.
   const separator = path.indexOf("?");
@@ -112,14 +112,18 @@ export async function dispatchPlatformRequest(
     if (get) return ok(store.listLanes());
     if (post) return created(store.createLane(await body<CreateLaneInput>()));
   }
-  const lane = /^\/v1\/lanes\/([^/]+)(\/goal)?$/.exec(route);
-  if (lane?.[1] !== undefined && (put || (get && lane[2] === undefined))) {
+  const lane = /^\/v1\/lanes\/([^/]+)(?:\/(goal|goal\/complete))?$/.exec(route);
+  const laneAction = lane?.[2];
+  if (lane?.[1] !== undefined && ((laneAction === undefined && (get || put))
+    || (put && laneAction === "goal") || (post && laneAction === "goal/complete"))) {
     const slug = decodeURIComponent(lane[1]);
-    if (put && lane[2] === undefined) return ok(store.updateLane(slug, await body<UpdateLaneInput>()));
+    if (put && laneAction === undefined) return ok(store.updateLane(slug, await body<UpdateLaneInput>()));
     const entry = store.getLaneBySlug(slug);
     if (entry === null) throw new PlatformNotFoundError(`lane ${slug} not found`);
     if (get) return ok({ ...entry, goal: store.getLatestGoal(entry.id) });
-    return ok(store.setGoal({ ...await body<Omit<SetGoalInput, "laneId">>(), laneId: entry.id }));
+    if (put) return ok(store.setGoal({ ...await body<Omit<SetGoalInput, "laneId">>(), laneId: entry.id }));
+    const payload = await readBody(true);
+    return ok(store.completeGoal(entry.id, payload === undefined ? undefined : objectBody<CompleteGoalOptions>(payload)));
   }
   if (get && route === "/v1/policy/rules") return ok(store.listPolicyRules());
   if (get && route === "/v1/policy/events") return ok(store.listPolicyEvents(Object.fromEntries(query)));
@@ -141,7 +145,7 @@ export async function dispatchPlatformRequest(
   throw new PlatformNotFoundError("route not found");
 }
 
-async function requestBody(request: IncomingMessage): Promise<unknown> {
+async function requestBody(request: IncomingMessage, allowEmpty = false): Promise<unknown> {
   const tooLarge = () => new PlatformApiError(413, "request body exceeds 1 MiB");
   if (Number(request.headers["content-length"]) > bodyLimit) throw tooLarge();
   const chunks: Buffer[] = [];
@@ -151,6 +155,7 @@ async function requestBody(request: IncomingMessage): Promise<unknown> {
     if (size > bodyLimit) throw tooLarge();
     chunks.push(chunk);
   }
+  if (allowEmpty && size === 0) return undefined;
   return JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
 }
 
@@ -210,7 +215,7 @@ export async function startPlatformApiServer({ store, socketPath }: {
   }
   const server = createServer(async (request, response) => {
     try {
-      const result = await dispatchPlatformRequest(store, request.method, request.url ?? "/", () => requestBody(request));
+      const result = await dispatchPlatformRequest(store, request.method, request.url ?? "/", (allowEmpty) => requestBody(request, allowEmpty));
       reply(response, result.status, result.body);
     } catch (error) {
       const failure = apiError(error);

@@ -499,7 +499,7 @@
       if (goal.metricName.trim().toLowerCase() !== "unknown") {
         panel.append(element("p", `${goal.metricName} · ${goal.metricCurrent ?? "unknown"}/${goal.metricTarget}${goal.metricUnit ? " " + goal.metricUnit : ""}`, "row-detail"));
       }
-      panel.append(element("p", `Week of ${goal.weekStart} · ${goal.approvedDecisionId ? "Approved" : "Unapproved"}`, "row-detail"));
+      panel.append(element("p", `Week of ${goal.weekStart} · ${goal.approvedDecisionId ? "Approved" : "Unapproved"}${goal.completedAt ? " · Completed" : ""}`, "row-detail"));
     } else {
       panel.append(element("p", "No weekly goal"));
     }

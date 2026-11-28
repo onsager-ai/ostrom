@@ -54,6 +54,7 @@ export interface Goal {
   weekStart: string;
   weeklyPlan: JsonValue;
   approvedDecisionId: string | null;
+  completedAt: string | null;
   updatedAt: string;
 }
 

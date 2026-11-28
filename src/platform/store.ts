@@ -30,7 +30,12 @@ type OptionalFields<T, K extends keyof T> = Omit<T, K> & Partial<Pick<T, K>>;
 
 export type CreateLaneInput = OptionalFields<Omit<Lane, "createdAt" | "updatedAt">, "id" | "status" | "ownerAgentId" | "priorityRank">;
 export type UpdateLaneInput = Partial<Pick<Lane, "name" | "status" | "ownerAgentId" | "priorityRank">>;
-export type SetGoalInput = OptionalFields<Omit<Goal, "updatedAt">, "id" | "metricUnit" | "metricCurrent" | "weekStart" | "weeklyPlan" | "approvedDecisionId">;
+export type SetGoalInput = OptionalFields<Omit<Goal, "updatedAt" | "completedAt">, "id" | "metricUnit" | "metricCurrent" | "weekStart" | "weeklyPlan" | "approvedDecisionId">;
+export interface CompleteGoalOptions {
+  weekStart?: string;
+  metricCurrent?: number | null;
+}
+
 export type CreateDecisionInput = Pick<Decision, "authority" | "category" | "urgency" | "title" | "recommendation" | "requestedBy">
   & Partial<Pick<Decision, "id" | "laneId" | "evidence" | "options">>;
 export type DecisionFilter = Partial<Pick<Decision, "status" | "authority" | "urgency" | "laneId">>;
@@ -92,7 +97,7 @@ const laneColumns = `id, slug, name, status, owner_agent_id AS ownerAgentId,
 const goalColumns = `id, lane_id AS laneId, statement, metric_name AS metricName,
   metric_unit AS metricUnit, metric_current AS metricCurrent, metric_target AS metricTarget,
   week_start AS weekStart, weekly_plan_json AS weeklyPlan, approved_decision_id AS approvedDecisionId,
-  updated_at AS updatedAt`;
+  completed_at AS completedAt, updated_at AS updatedAt`;
 const decisionColumns = `id, lane_id AS laneId, authority, category, urgency, title,
   evidence_json AS evidence, recommendation, options_json AS options, status, requested_by AS requestedBy,
   decided_by AS decidedBy, answer_json AS answer, rationale, superseded_by_id AS supersededById,
@@ -168,6 +173,16 @@ function optionalNumber(value: unknown, field: string, range?: { integer?: boole
   if (value !== null && value !== undefined) number(value, field, range);
 }
 
+function validateWeekStart(week: unknown): void {
+  if (typeof week !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(week)) {
+    throw new PlatformValidationError("weekStart must be a YYYY-MM-DD date");
+  }
+  const date = new Date(week);
+  if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== week) {
+    throw new PlatformValidationError("weekStart must be a valid date");
+  }
+}
+
 function isoTimestamp(value: string, field: string): string {
   if (typeof value !== "string"
     || !/^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)
@@ -216,6 +231,10 @@ function decisionFromRow(row: DecisionRow): Decision {
 
 function goalFromRow(row: GoalRow): Goal {
   return { ...row, weeklyPlan: decode(row.weeklyPlan) };
+}
+
+export function goalStaleKey(laneId: string, goalId: string): string {
+  return `goal:${laneId}:${goalId}`;
 }
 
 function runFromRow(row: RunRow): Run {
@@ -477,13 +496,7 @@ export class PlatformStore {
     nonEmpty(id, "id");
     const time = this.now();
     const week = input.weekStart === undefined ? weekOf(time) : input.weekStart;
-    if (typeof week !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(week)) {
-      throw new PlatformValidationError("weekStart must be a YYYY-MM-DD date");
-    }
-    const date = new Date(week);
-    if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== week) {
-      throw new PlatformValidationError("weekStart must be a valid date");
-    }
+    validateWeekStart(week);
     const weeklyPlan = encode(input.weeklyPlan ?? null, "weeklyPlan");
     const metricUnit = input.metricUnit ?? null;
     const approvedDecisionId = input.approvedDecisionId ?? null;
@@ -497,7 +510,8 @@ export class PlatformStore {
         if (decision.category !== "weekly_plan" || (decision.laneId !== null && decision.laneId !== input.laneId)) {
           throw new PlatformValidationError(`decision ${approvedDecisionId} must approve a weekly plan for this lane or the team`);
         }
-        const previous = this.get<GoalRow>(`SELECT ${goalColumns} FROM goal WHERE lane_id = ? AND week_start = ?`, input.laneId, week);
+        const previous = this.get<GoalRow>(`SELECT ${goalColumns} FROM goal WHERE lane_id = ? AND week_start = ?
+          ORDER BY (completed_at IS NOT NULL), updated_at DESC, rowid DESC LIMIT 1`, input.laneId, week);
         if (previous?.approvedDecisionId === approvedDecisionId
           && (previous.statement !== input.statement || previous.metricName !== input.metricName
             || previous.metricUnit !== metricUnit || previous.metricTarget !== input.metricTarget
@@ -508,7 +522,7 @@ export class PlatformStore {
       const row = this.write<GoalRow>(`INSERT INTO goal (id, lane_id, statement, metric_name, metric_unit,
         metric_current, metric_target, week_start, weekly_plan_json, approved_decision_id, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT (lane_id, week_start) DO UPDATE SET statement = excluded.statement,
+        ON CONFLICT (lane_id, week_start) WHERE completed_at IS NULL DO UPDATE SET statement = excluded.statement,
           metric_name = excluded.metric_name, metric_unit = excluded.metric_unit,
           metric_current = excluded.metric_current, metric_target = excluded.metric_target,
           weekly_plan_json = excluded.weekly_plan_json, approved_decision_id = excluded.approved_decision_id,
@@ -519,15 +533,35 @@ export class PlatformStore {
     });
   }
 
+  completeGoal(laneId: string, { weekStart, metricCurrent }: CompleteGoalOptions = {}): Goal {
+    nonEmpty(laneId, "laneId");
+    if (weekStart !== undefined) validateWeekStart(weekStart);
+    optionalNumber(metricCurrent, "metricCurrent");
+    const time = this.now();
+    return this.transaction(() => {
+      const row = this.get<GoalRow>(`UPDATE goal SET completed_at = ?, updated_at = ?,
+        metric_current = CASE WHEN ? THEN ? ELSE metric_current END
+        WHERE id = (
+          SELECT id FROM goal WHERE lane_id = ? AND completed_at IS NULL AND week_start = coalesce(?, week_start)
+          ORDER BY week_start DESC, updated_at DESC, rowid DESC LIMIT 1
+        ) RETURNING ${goalColumns}`, time, time, Number(metricCurrent !== undefined), metricCurrent ?? null,
+      laneId, weekStart ?? null);
+      if (row === null) throw new PlatformNotFoundError(`no open goal for lane ${laneId}`);
+      this.db.prepare(`UPDATE policy_event SET resolved_at = ?
+        WHERE rule_code = 'goal_stale' AND dedupe_key = ? AND resolved_at IS NULL`).run(time, goalStaleKey(laneId, row.id));
+      return goalFromRow(row);
+    });
+  }
+
   getLatestGoal(laneId: string): Goal | null {
     const row = this.get<GoalRow>(`SELECT ${goalColumns} FROM goal WHERE lane_id = ?
-      ORDER BY week_start DESC LIMIT 1`, laneId);
+      ORDER BY (completed_at IS NOT NULL), week_start DESC, updated_at DESC, rowid DESC LIMIT 1`, laneId);
     return row === null ? null : goalFromRow(row);
   }
 
   listGoals(laneId?: string): Goal[] {
     return this.all<GoalRow>(`SELECT ${goalColumns} FROM goal WHERE lane_id = coalesce(?, lane_id)
-      ORDER BY week_start DESC, lane_id`, laneId ?? null).map(goalFromRow);
+      ORDER BY week_start DESC, (completed_at IS NOT NULL), updated_at DESC, rowid DESC, lane_id`, laneId ?? null).map(goalFromRow);
   }
 
   listPolicyRules(): PolicyRule[] {

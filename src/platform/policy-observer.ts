@@ -1,4 +1,5 @@
 import { evaluateBudgets, readBudgetsAndSpend } from "./budget-observer.ts";
+import { goalStaleKey } from "./store.ts";
 import type { PlatformStore } from "./store.ts";
 import type { Decision, Run } from "./types.ts";
 
@@ -163,11 +164,11 @@ export function evaluatePolicyAndHealth(store: PlatformStore, options: HealthOpt
     for (const lane of store.listLanes()) {
       if (lane.status !== "active") continue;
       const goal = store.getLatestGoal(lane.id);
-      if (goal === null || (goal.metricTarget > 0 && goal.metricCurrent !== null
+      if (goal === null || goal.completedAt !== null || (goal.metricTarget > 0 && goal.metricCurrent !== null
         && goal.metricCurrent >= goal.metricTarget)) continue;
       const updatedMs = Date.parse(goal.updatedAt);
       if (!Number.isFinite(updatedMs) || timestamp - updatedMs < staleHours * 3_600_000) continue;
-      const key = `goal:${lane.id}:${goal.id}`;
+      const key = goalStaleKey(lane.id, goal.id);
       goalKeys.push(key);
       const event = store.recordDedupedPolicyEvent({
         ruleCode: "goal_stale", laneId: lane.id,

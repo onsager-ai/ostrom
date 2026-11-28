@@ -136,6 +136,32 @@ test("invalid JSON, values, and oversized bodies return JSON errors", async (t) 
   assert.deepEqual(store.listDecisions(), []);
 });
 
+test("the goal completion route accepts requests with and without a JSON body", async (t) => {
+  const { client, store } = await fixture(t);
+  const lane = store.createLane({ slug: "releases", name: "Releases" });
+  const lanePath = `/v1/lanes/${lane.slug}`;
+  const completePath = `${lanePath}/goal/complete`;
+  const input = { laneId: lane.id, statement: "Ship the release", metricName: "Releases", metricCurrent: 1,
+    metricTarget: 2, weekStart: "2026-11-23" };
+  const goal = store.setGoal(input);
+
+  await assert.rejects(client.request("GET", completePath), { status: 404 });
+  await assert.rejects(client.request("POST", completePath, null), { status: 400 });
+  await assert.rejects(client.request("POST", completePath, { weekStart: "2026-02-30" }), { status: 400 });
+  const completed = await client.request<Goal>("POST", completePath, { weekStart: goal.weekStart, metricCurrent: 2 });
+  assert.ok(completed.completedAt);
+  assert.deepEqual(completed, { ...goal, completedAt: completed.completedAt, updatedAt: completed.completedAt, metricCurrent: 2 });
+  assert.deepEqual(await client.request("GET", lanePath), { ...lane, goal: completed });
+  await assert.rejects(client.request("POST", completePath), { status: 404 });
+
+  const replacement = store.setGoal({ ...input, statement: "Ship the next release" });
+  assert.deepEqual(await client.request("GET", lanePath), { ...lane, goal: replacement });
+  const closedReplacement = await client.request<Goal>("POST", completePath);
+  assert.ok(closedReplacement.completedAt);
+  assert.equal(closedReplacement.id, replacement.id);
+  assert.equal(closedReplacement.metricCurrent, replacement.metricCurrent);
+});
+
 test("registry, policy, friction, budget, agent, and run endpoints use the same stored records", async (t) => {
   const { client, store } = await fixture(t);
   const lane = await client.request<Lane>("POST", "/v1/lanes", { slug: "platform", name: "Platform" });
