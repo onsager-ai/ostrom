@@ -53,7 +53,7 @@ export function readPlatformHealth(store: PlatformStore, {
 }
 
 function runTime(run: Run): string {
-  return run.startedAt ?? run.completedAt ?? "";
+  return run.startedAt ?? run.completedAt ?? run.updatedAt;
 }
 
 export function evaluatePolicyAndHealth(store: PlatformStore, options: HealthOptions & { markStalled?: boolean }) {
@@ -67,13 +67,35 @@ export function evaluatePolicyAndHealth(store: PlatformStore, options: HealthOpt
   const events = [];
 
   if (enabled.has(failureRule)) {
+    const currentRuns: Run[] = [];
     const settledByAgent = new Map<string, Run[]>();
     for (const run of store.listRuns()) {
-      if (!liveStatuses.has(run.status)) {
-        const settled = settledByAgent.get(run.agentId) ?? [];
-        settled.push(run);
-        settledByAgent.set(run.agentId, settled);
+      if (liveStatuses.has(run.status)) {
+        currentRuns.push(run);
+      } else {
+        if (!settledByAgent.has(run.agentId)) settledByAgent.set(run.agentId, []);
+        settledByAgent.get(run.agentId)!.push(run);
       }
+    }
+    for (const agent of store.listAgents()) {
+      const settled = settledByAgent.get(agent.id);
+      if (!settled?.length) continue;
+      settled.sort((a, b) => runTime(a).localeCompare(runTime(b))
+        || (a.completedAt ?? "").localeCompare(b.completedAt ?? "") || a.id.localeCompare(b.id));
+      currentRuns.push(settled.at(-1)!);
+      const start = settled.findLastIndex((run) => run.status !== "failed") + 1;
+      const first = settled[start];
+      const second = settled[start + 1];
+      if (first === undefined || second === undefined) continue;
+      const key = `streak:${agent.id}:${second.id}`;
+      failureKeys.push(key);
+      const event = store.recordDedupedPolicyEvent({
+        ruleCode: failureRule, laneId: agent.laneId, summary: `${agent.label} failed two consecutive runs`,
+        detail: { agentId: agent.id, runIds: [first.id, second.id] },
+      }, key, now, true);
+      if (event !== null) events.push(event);
+    }
+    for (const run of currentRuns) {
       if (run.failureCount < 2) continue;
       const key = `run:${run.id}`;
       failureKeys.push(key);
@@ -83,30 +105,6 @@ export function evaluatePolicyAndHealth(store: PlatformStore, options: HealthOpt
         detail: { runId: run.id, agentId: run.agentId, failureCount: run.failureCount },
       }, key, now, true);
       if (event !== null) events.push(event);
-    }
-    for (const agent of store.listAgents()) {
-      const settled = settledByAgent.get(agent.id) ?? [];
-      settled.sort((a, b) => runTime(a).localeCompare(runTime(b))
-        || (a.completedAt ?? "").localeCompare(b.completedAt ?? "") || a.id.localeCompare(b.id));
-      let firstFailure: Run | undefined;
-      let streakLength = 0;
-      for (const run of settled) {
-        if (run.status !== "failed") {
-          firstFailure = undefined;
-          streakLength = 0;
-          continue;
-        }
-        firstFailure ??= run;
-        streakLength++;
-        if (streakLength !== 2) continue;
-        const key = `streak:${agent.id}:${run.id}`;
-        failureKeys.push(key);
-        const event = store.recordDedupedPolicyEvent({
-          ruleCode: failureRule, laneId: agent.laneId, summary: `${agent.label} failed two consecutive runs`,
-          detail: { agentId: agent.id, runIds: [firstFailure.id, run.id] },
-        }, key, now, true);
-        if (event !== null) events.push(event);
-      }
     }
   }
 
@@ -128,7 +126,7 @@ export function evaluatePolicyAndHealth(store: PlatformStore, options: HealthOpt
   for (const pr of store.listGitHubPrChecks()) {
     const name = `${pr.repository}#${pr.number}`;
     const target = targets.get(name);
-    if (target === undefined || pr.rollupState === "closed") continue;
+    if (target === undefined || pr.isDraft || pr.rollupState === "closed" || pr.rollupState === "success") continue;
     const key = `github:${name}`;
     const detail = { ...pr };
     const streakKey = `${key}:${pr.failureStreak}`;

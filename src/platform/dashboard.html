@@ -67,7 +67,7 @@
     text-decoration: none;
     cursor: pointer;
   }
-  button:hover, .button:hover, .t3-link:hover, .lane-row:hover { background: var(--subtle); }
+  button:hover, .button:hover, .t3-link:hover, .row-link:hover { background: var(--subtle); }
   button:disabled { color: var(--muted); cursor: default; }
   :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
   .seg { display: flex; }
@@ -89,6 +89,7 @@
     padding: 6px 12px;
   }
   .row + .row, .row + details, .row + .more, details > .row { border-top: 1px solid var(--border); }
+  .lane-row + .lane-row, .lane-toggle { border-top: 1px solid var(--border); }
   .row-title { font-weight: 650; }
   .row-detail { margin-top: 2px; }
   .board-recommendation {
@@ -110,10 +111,23 @@
   .pill-warn { color: var(--warn); background: var(--warn-bg); }
   .pill-err { color: var(--err); background: var(--err-bg); }
   .t3-link { color: var(--focus); white-space: nowrap; }
-  .lane-row { position: relative; min-height: 44px; border-radius: 8px; }
-  .lane-hit { position: absolute; inset: 0; padding: 0; border-color: transparent; background: transparent; }
-  .lane-hit:hover { background: transparent; }
-  .lane-row .t3-link { position: relative; z-index: 1; }
+  .row-link { min-height: 44px; color: inherit; text-decoration: none; border-radius: 7px; }
+  .row-arrow { color: var(--focus); }
+  .lane-row { display: grid; }
+  .lane-row > .row { grid-area: 1 / 1; min-height: 44px; padding-right: 74px; }
+  .lane-row > .row-link { padding-right: 12px; }
+  .lane-row .row-arrow { margin-left: 62px; }
+  .lane-details {
+    grid-area: 1 / 1;
+    place-self: center end;
+    z-index: 1;
+    margin-right: 8px;
+    min-height: 32px;
+    padding-inline: 6px;
+    color: var(--focus);
+  }
+  .row-link + .lane-details { margin-right: 29px; }
+  .lane-toggle { padding: 4px 12px; }
   .more { padding: 3px 12px; color: var(--focus); }
   .empty { display: block; padding-block: 8px; }
   .error { margin-top: 10px; color: var(--err); }
@@ -139,7 +153,7 @@
   @media (max-width: 520px) {
     .topbar { align-items: flex-start; gap: 5px 10px; }
     .live-status { order: 1; flex-basis: 100%; }
-    .row { grid-template-columns: 1fr; }
+    .row:not(.row-link) { grid-template-columns: 1fr; }
     .row-actions { justify-content: flex-start; }
   }
 </style>
@@ -249,18 +263,20 @@
     return lanesBySlug.get(basename) ?? lanesBySlug.get(aliases[basename]);
   }
   function alertLane(alert, ctx) {
-    return ctx.lanesById.get(alert.laneId) ?? repositoryLane(alert.detail?.repository, ctx);
+    const agentId = alert.detail?.agentId;
+    return ctx.lanesById.get(alert.laneId)
+      ?? (agentId ? [...ctx.lanesById.values()].find((lane) => lane.ownerAgentId === agentId) : undefined)
+      ?? repositoryLane(alert.detail?.repository, ctx);
   }
   function alertThreadUrl(alert, ctx) {
-    const { agentsById, hostsById, lanesById } = ctx;
+    const { agentsById, hostsById } = ctx;
     return agentThreadUrl(agentsById.get(alert.detail?.agentId), hostsById)
       ?? threadUrlFromEvidence(alert.detail ?? {}, ctx)
-      ?? laneThreadUrl(lanesById.get(alert.laneId), agentsById, hostsById)
-      ?? laneThreadUrl(repositoryLane(alert.detail?.repository, ctx), agentsById, hostsById);
+      ?? laneThreadUrl(alertLane(alert, ctx), agentsById, hostsById);
   }
-  function t3Link(href) {
+  function t3Link(href, text = "Open in T3 ↗", className = "t3-link") {
     if (!href?.startsWith("https://")) return null;
-    const link = element("a", "Open in T3 ↗", "t3-link");
+    const link = element("a", text, className);
     link.href = href;
     link.target = "_blank";
     link.rel = "noopener noreferrer";
@@ -292,14 +308,20 @@
   }
 
   const pill = (label, tone = "") => element("span", label, tone ? `pill pill-${tone}` : "pill");
-  function row(title, detail, { tags = [], actions = [], compact = false } = {}) {
-    const node = element("div", "", "row");
+  function row(title, detail, { tags = [], actions = [], compact = false, href } = {}) {
+    const link = t3Link(href, "", "row row-link");
+    const node = link ?? element("div", "", "row");
     const main = element("div");
     const heading = element("div", "", "row-heading");
     heading.append(element("span", title, "row-title"), ...tags);
     main.append(heading);
     if (detail) main.append(element("p", detail, compact ? "row-detail board-recommendation" : "row-detail"));
     node.append(main);
+    if (link) {
+      const arrow = element("span", "↗", "row-arrow");
+      arrow.setAttribute("aria-hidden", "true");
+      link.append(arrow);
+    }
     const controls = actions.filter(Boolean);
     if (controls.length) {
       const side = element("div", "", "row-actions");
@@ -336,14 +358,14 @@
     const tags = [pill(urgencyLabel[decision.urgency], { incident: "err", blocking_today: "warn" }[decision.urgency])];
     const lane = ctx.lanesById.get(decision.laneId);
     if (lane) tags.push(pill(lane.name));
-    return row(decision.title, decision.recommendation, { tags, compact, actions: [t3Link(decisionThreadUrl(decision, ctx))] });
+    const href = decisionThreadUrl(decision, ctx);
+    return row(decision.title, decision.recommendation, compact ? { tags, compact, href } : { tags, actions: [t3Link(href)] });
   }
-  function alertRow(alert, ctx) {
+  function alertRow(alert, ctx, compact) {
     const severity = policySeverity(alert);
-    return row(alert.summary, "", {
-      tags: [pill(severity === "err" ? "Critical" : "Warning", severity), timestamp(alert.createdAt)],
-      actions: [t3Link(alertThreadUrl(alert, ctx))],
-    });
+    const tags = [pill(severity === "err" ? "Critical" : "Warning", severity), timestamp(alert.createdAt)];
+    const href = alertThreadUrl(alert, ctx);
+    return row(alert.summary, "", compact ? { tags, href } : { tags, actions: [t3Link(href)] });
   }
   function topRows(items, buildRow, label) {
     const nodes = items.slice(0, 3).map(buildRow);
@@ -356,32 +378,40 @@
     if (typeof item === "string") return firstText(item);
     return firstText(item?.title, item?.summary, item?.text, item?.nextStep, item?.next);
   }
-  function laneSummary(lane, manager, decisions, alerts) {
+  function laneSummary(lane, ctx) {
+    const manager = ctx.agentsById.get(lane.ownerAgentId);
+    const decisions = ctx.decisionsByLane.get(lane.id) ?? [];
+    const alerts = ctx.alertsByLane.get(lane.id) ?? [];
     const plan = lane.goal?.weeklyPlan;
     const first = Array.isArray(plan) ? plan[0] : plan;
-    const status = decisions.length || alerts.some((alert) => policySeverity(alert) === "err") ? "blocked" : lane.status;
-    const next = firstText(first?.nextStep, first?.next, Array.isArray(plan) ? planItem(first) : null)
-      ?? (lane.status === "paused" ? "Paused" : manager ? `Manager ${manager.status}` : "No next step recorded");
+    const managerStatus = !manager || manager.status === "active" ? "active" : manager.status === "waiting" ? "waiting" : "idle";
+    const status = decisions.length || alerts.length ? "blocked" : lane.status === "paused" ? "paused" : managerStatus;
+    const next = firstText(first?.nextStep, first?.next, Array.isArray(plan) ? planItem(first) : null);
     const blockers = Array.isArray(first?.blockers) ? first.blockers : [first?.blockers];
-    const blocker = firstText(first?.blocker, ...blockers.map(planItem)) ?? decisions[0]?.title ?? alerts[0]?.summary ?? "None";
+    const blocker = firstText(planItem(first?.blocker), ...blockers.map(planItem), decisions[0]?.title, alerts[0]?.summary);
     return { status, next, blocker };
   }
-  const statePill = (status) => pill(status, { active: "ok", blocked: "err", paused: "warn" }[status]);
+  function summarizeLaneLine2({ next, blocker }) {
+    return [next && `Next: ${next}`, blocker && `Blocker: ${blocker}`].filter(Boolean).join(" · ");
+  }
+  const statePill = (status) => pill(status, { active: "ok", blocked: "err", paused: "warn", waiting: "warn" }[status]);
   function laneRow(lane, ctx) {
-    const summary = laneSummary(lane, ctx.agentsById.get(lane.ownerAgentId),
-      ctx.decisionsByLane.get(lane.id) ?? [], ctx.alertsByLane.get(lane.id) ?? []);
+    const summary = laneSummary(lane, ctx);
     const tags = [statePill(summary.status)];
     if (lane.goal?.statement) tags.push(element("span", lane.goal.statement, "row-detail"));
-    const node = row(lane.name, `Next: ${summary.next} · Blocker: ${summary.blocker}`, {
-      tags, actions: [t3Link(laneThreadUrl(lane, ctx.agentsById, ctx.hostsById))],
-    });
-    node.classList.add("lane-row");
-    const button = element("button", "", "lane-hit");
+    const href = laneThreadUrl(lane, ctx.agentsById, ctx.hostsById);
+    const node = element("div", "", "lane-row");
+    const main = row(lane.name, summarizeLaneLine2(summary), { tags, href });
+    const button = element("button", "Details", "lane-details");
     button.type = "button";
-    button.setAttribute("aria-label", `View ${lane.name}`);
-    button.dataset.focusKey = lane.id;
-    button.onclick = () => { location.hash = `lane/${encodeURIComponent(lane.slug)}`; };
-    node.append(button);
+    button.setAttribute("aria-label", `Details for ${lane.name}`);
+    button.dataset.focusKey = `lane:${lane.id}`;
+    button.onclick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      location.hash = `lane/${encodeURIComponent(lane.slug)}`;
+    };
+    node.append(main, button);
     return node;
   }
 
@@ -406,11 +436,50 @@
     node.append(element("h2", "Spend"), track, element("span", readout, "row-detail"));
     return node;
   }
+  function partitionBoardLanes(lanes, ctx) {
+    const activeLaneIds = new Set();
+    const activeAgentIds = new Set();
+    for (const run of [...ctx.health.activeRuns, ...ctx.health.stalledRuns]) {
+      activeLaneIds.add(run.laneId);
+      activeLaneIds.add(ctx.agentsById.get(run.agentId)?.laneId);
+      activeAgentIds.add(run.agentId);
+    }
+    const visible = [];
+    const hidden = [];
+    for (const lane of lanes) {
+      const managerStatus = ctx.agentsById.get(lane.ownerAgentId)?.status;
+      const summary = laneSummary(lane, ctx);
+      const busy = lane.status !== "paused" && (managerStatus === "active" || managerStatus === "waiting"
+        || activeLaneIds.has(lane.id) || (lane.ownerAgentId != null && activeAgentIds.has(lane.ownerAgentId)));
+      (busy || summary.status === "blocked" || summary.blocker ? visible : hidden).push(lane);
+    }
+    return { visible, hidden };
+  }
+  let showAllLanes = false;
   function laneBoard(ctx) {
+    const { visible, hidden } = partitionBoardLanes(ctx.lanes, ctx);
+    const lanes = (showAllLanes ? ctx.lanes : visible).map((lane) => laneRow(lane, ctx));
+    if (!showAllLanes && !visible.length && hidden.length) {
+      lanes.push(element("p", "All lanes are idle with no blockers", "empty"));
+    }
+    if (hidden.length) {
+      const toggle = element("button", showAllLanes ? "Hide idle lanes"
+        : visible.length ? `Show all lanes (${hidden.length} hidden)` : `Show all lanes (${hidden.length})`);
+      toggle.type = "button";
+      toggle.dataset.focusKey = "toggle-lanes";
+      toggle.setAttribute("aria-expanded", String(showAllLanes));
+      toggle.onclick = () => {
+        showAllLanes = !showAllLanes;
+        renderView();
+      };
+      const controls = element("div", "", "lane-toggle");
+      controls.append(toggle);
+      lanes.push(controls);
+    }
     return [
       section("Waiting on you", topRows(ctx.decisions, (item) => decisionRow(item, ctx, true), "waiting on you"), "Nothing waiting on you"),
-      section("Alerts", topRows(ctx.alerts, (item) => alertRow(item, ctx), "alerts"), "No active alerts"),
-      section("Lanes", ctx.lanes.map((lane) => laneRow(lane, ctx)), "No lanes seeded yet on this host."),
+      section("Alerts", topRows(ctx.alerts, (item) => alertRow(item, ctx, true), "alerts"), "No active alerts"),
+      section("Lanes", lanes, "No lanes seeded yet on this host."),
       spendMeter(ctx.health),
     ];
   }
@@ -427,7 +496,8 @@
     } else {
       panel.append(element("p", "No weekly goal"));
     }
-    panel.append(element("p", `Next: ${summary.next}`), element("p", `Blocker: ${summary.blocker}`));
+    if (summary.next) panel.append(element("p", `Next: ${summary.next}`));
+    if (summary.blocker) panel.append(element("p", `Blocker: ${summary.blocker}`));
     const plan = goal?.weeklyPlan;
     const items = Array.isArray(plan) ? plan : plan?.items ?? plan?.steps ?? plan?.tasks;
     if (Array.isArray(items) && items.length) {
@@ -478,11 +548,12 @@
     });
   }
 
+  const githubPrKey = ({ repository, number }) => `${repository.toLowerCase()}#${number}`;
   function githubPrs(checks, linked) {
-    const byKey = new Map(checks.map((check) => [`${check.repository.toLowerCase()}#${check.number}`, check]));
+    const byKey = new Map(checks.map((check) => [githubPrKey(check), check]));
     for (const pr of linked) {
       if (pr.prHost.toLowerCase() !== "github.com") continue;
-      const key = `${pr.repository.toLowerCase()}#${pr.number}`;
+      const key = githubPrKey(pr);
       const check = byKey.get(key);
       byKey.set(key, {
         ...pr, ...check, title: pr.title ?? check?.title,
@@ -494,29 +565,33 @@
   function partitionGithubPrs(prs) {
     const rank = { failure: 0, error: 0, pending: 1, unchecked: 2, success: 3 };
     return {
-      open: prs.filter((pr) => pr.rollupState !== "closed").sort((a, b) =>
+      open: prs.filter((pr) => pr.rollupState !== "closed" && !pr.isDraft).sort((a, b) =>
         rank[a.rollupState] - rank[b.rollupState] || a.repository.localeCompare(b.repository) || a.number - b.number),
-      closed: prs.filter((pr) => pr.rollupState === "closed"),
+      folded: prs.filter((pr) => pr.rollupState === "closed" || pr.isDraft),
     };
   }
-  const closedPrsOpen = new Map();
+  const prDisclosureOpen = new Map();
   function prRows(prs, viewKey) {
-    const { open, closed } = partitionGithubPrs(prs);
+    const { open, folded } = partitionGithubPrs(prs);
     const tones = { success: "ok", failure: "err", error: "err", pending: "warn" };
     const prRow = (pr) => {
-      const tags = [pill(pr.rollupState, tones[pr.rollupState])];
+      const tags = [pill(pr.rollupState, pr.isDraft ? "" : tones[pr.rollupState])];
+      if (pr.isDraft) tags.unshift(pill("draft"));
       if (pr.lastCheckedAt) tags.push(timestamp(pr.lastCheckedAt, relativeTime, "checked "));
       const checks = pr.totalChecks == null ? "" : `${pr.failedChecks}/${pr.totalChecks} checks failed`;
       return row(`${pr.repository} #${pr.number}${pr.title ? " · " + pr.title : ""}`, checks, { tags });
     };
     const nodes = open.map(prRow);
-    if (closed.length) {
+    if (folded.length) {
       const disclosure = element("details");
       disclosure.dataset.prKey = viewKey;
-      disclosure.open = closedPrsOpen.get(viewKey) ?? false;
-      const summary = element("summary", `Closed PRs (${closed.length})`);
+      disclosure.open = prDisclosureOpen.get(viewKey) ?? false;
+      const hasDraft = folded.some((pr) => pr.isDraft && pr.rollupState !== "closed");
+      const hasClosed = folded.some((pr) => pr.rollupState === "closed");
+      const label = hasDraft ? hasClosed ? "Closed and draft PRs" : "Draft PRs" : "Closed PRs";
+      const summary = element("summary", `${label} (${folded.length})`);
       summary.dataset.focusKey = `prs:${viewKey}`;
-      disclosure.append(summary, ...closed.map(prRow));
+      disclosure.append(summary, ...folded.map(prRow));
       nodes.push(disclosure);
     }
     return nodes;
@@ -541,7 +616,7 @@
     const manager = ctx.agentsById.get(lane.ownerAgentId);
     const decisions = ctx.decisionsByLane.get(lane.id) ?? [];
     const alerts = ctx.alertsByLane.get(lane.id) ?? [];
-    const summary = laneSummary(lane, manager, decisions, alerts);
+    const summary = laneSummary(lane, ctx);
     const heading = element("div", "", "detail-heading");
     heading.append(element("h1", lane.name), statePill(summary.status));
     const link = t3Link(laneThreadUrl(lane, ctx.agentsById, ctx.hostsById));
@@ -592,9 +667,16 @@
   function context({ digest, health, friction, linkedPrs }) {
     const lanes = [...digest.sections.lanes].sort((a, b) => a.priorityRank - b.priorityRank || a.slug.localeCompare(b.slug));
     const decisions = sortOwnerDecisions(health.pendingOwnerDecisions);
-    const alerts = sortAlerts(health.policyAlerts);
+    const prs = githubPrs(health.githubPrs, linkedPrs);
+    const draftByPr = new Map(prs.map((pr) => [githubPrKey(pr), pr.isDraft]));
+    const alerts = sortAlerts(health.policyAlerts.filter(({ ruleCode, detail }) => {
+      if (ruleCode !== "pr_green_ci" && ruleCode !== "two_failure_stop") return true;
+      const isDraft = typeof detail?.repository === "string" && Number.isInteger(detail.number)
+        ? draftByPr.get(githubPrKey(detail)) : undefined;
+      return !(isDraft ?? detail?.isDraft);
+    }));
     const ctx = {
-      health, friction, lanes, decisions, alerts, prs: githubPrs(health.githubPrs, linkedPrs),
+      health, friction, lanes, decisions, alerts, prs,
       lanesById: new Map(lanes.map((lane) => [lane.id, lane])),
       lanesBySlug: new Map(lanes.map((lane) => [lane.slug.toLowerCase(), lane])),
       agentsById: new Map(health.agents.map((agent) => [agent.id, agent])),
@@ -614,7 +696,7 @@
     if (!currentContext) return;
     const view = byId("view");
     const disclosure = view.querySelector("details[data-pr-key]");
-    if (disclosure) closedPrsOpen.set(disclosure.dataset.prKey, disclosure.open);
+    if (disclosure) prDisclosureOpen.set(disclosure.dataset.prKey, disclosure.open);
     const focusKey = document.activeElement?.dataset.focusKey;
     const slug = /^lane\/(.+)$/.exec(route)?.[1];
     const nodes = system ? systemView(currentContext)

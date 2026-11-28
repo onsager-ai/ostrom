@@ -12,20 +12,41 @@ test("PR CI reads the exact head, counts the latest checks and statuses, and wai
   const paths: string[] = [];
   const observation = await readGitHubPr("org/repo", 42, async (path) => {
     paths.push(path);
-    if (path.endsWith("/pulls/42")) return { state: "open", head: { sha } };
+    if (path.endsWith("/pulls/42")) return { state: "open", draft: true, head: { sha } };
     if (path.includes("/check-runs")) return { total_count: 2, check_runs: [
       { status: "completed", conclusion: "timed_out" },
       { status: "completed", conclusion: "neutral" },
     ] };
     return { statuses: [{ state: "pending" }, { state: "error" }] };
   });
-  assert.deepEqual(observation, { headSha: sha, rollupState: "pending", totalChecks: 4, failedChecks: 2 });
+  assert.deepEqual(observation, { headSha: sha, isDraft: true, rollupState: "pending", totalChecks: 4, failedChecks: 2 });
   assert.deepEqual(paths, [
     "repos/org/repo/pulls/42",
     `repos/org/repo/commits/${sha}/check-runs?filter=latest&per_page=100&page=1`,
     `repos/org/repo/commits/${sha}/status?per_page=100&page=1`,
   ]);
+  assert.deepEqual(await readGitHubPr("org/repo", 42, async () => ({ state: "closed", head: { sha } })),
+    { headSha: sha, isDraft: false, rollupState: "closed", totalChecks: 0, failedChecks: 0 });
   await assert.rejects(readGitHubPr("org/..", 42, async () => assert.fail("unsafe route")), /invalid GitHub PR/);
+});
+
+test("poll retains GitHub draft state across check and metadata errors", async (t) => {
+  const store = PlatformStore.open(":memory:", { now: () => now });
+  t.after(() => store.close());
+  store.upsertT3HostState({ hostId: "east", label: "East", mcpUrl: "https://t3.example/mcp",
+    originNamespace: null, connectionState: "connected" });
+  store.recordT3PrWake({ hostId: "east", repository: "org/repo", threadId: "thread", prHost: "github.com", number: 42,
+    outcome: "check", summary: "Checking", occurredAt: now, watchEnded: false });
+  for (const draft of [true, false]) {
+    await pollGitHubPrs(store, async (path) => {
+      if (path.endsWith("/pulls/42")) return { state: "open", draft, head: { sha } };
+      throw new Error("check data unavailable");
+    });
+    assert.equal(store.listGitHubPrChecks()[0]?.rollupState, "error");
+    assert.equal(store.listGitHubPrChecks()[0]?.isDraft, draft);
+    await pollGitHubPrs(store, async () => { throw new Error("PR metadata unavailable"); });
+    assert.equal(store.listGitHubPrChecks()[0]?.isDraft, draft);
+  }
 });
 
 test("pages checks within a fixed limit", async () => {

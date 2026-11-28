@@ -851,20 +851,21 @@ export class PlatformStore {
       .map((row) => ({ ...row, questions: decode(row.questions) }));
   }
 
-  listGitHubPrTargets(): { repository: string; number: number; watching: boolean }[] {
-    return this.all<{ repository: string; number: number; watching: number }>(`SELECT lower(repository) AS repository,
-      number, max(watching) AS watching FROM t3_thread_pr WHERE lower(pr_host) = 'github.com'
+  listGitHubPrTargets(): { repository: string; number: number; watching: boolean; isDraft: boolean }[] {
+    return this.all<{ repository: string; number: number; watching: number; isDraft: number | null }>(`SELECT lower(repository) AS repository,
+      number, max(watching) AS watching, max(is_draft) AS isDraft FROM t3_thread_pr WHERE lower(pr_host) = 'github.com'
       AND (state = 'open' OR (state IS NULL AND watching = 1))
       GROUP BY lower(repository), number ORDER BY lower(repository), number`)
-      .map((row) => ({ ...row, watching: row.watching === 1 }));
+      .map((row) => ({ ...row, watching: row.watching === 1, isDraft: row.isDraft === 1 }));
   }
 
   listGitHubPrChecks(): GitHubPrCheck[] {
-    return this.all<GitHubPrCheck>(`SELECT repository, number, head_sha AS headSha, rollup_state AS rollupState,
+    return this.all<Omit<GitHubPrCheck, "isDraft"> & { isDraft: number }>(`SELECT repository, number,
+      head_sha AS headSha, is_draft AS isDraft, rollup_state AS rollupState,
       total_checks AS totalChecks, failed_checks AS failedChecks, consecutive_failures AS consecutiveFailures,
       failure_streak AS failureStreak,
       last_checked_at AS lastCheckedAt, last_error AS lastError, updated_at AS updatedAt
-      FROM github_pr_check ORDER BY repository, number`);
+      FROM github_pr_check ORDER BY repository, number`).map((row) => ({ ...row, isDraft: row.isDraft === 1 }));
   }
 
   recordGitHubPrCheck(repository: string, number: number, check: GitHubPrObservation): void {
@@ -880,15 +881,17 @@ export class PlatformStore {
         heads.add(check.headSha);
       }
       const now = this.now();
-      this.db.prepare(`INSERT INTO github_pr_check (repository, number, head_sha, rollup_state, total_checks,
+      this.db.prepare(`INSERT INTO github_pr_check (repository, number, head_sha, is_draft, rollup_state, total_checks,
         failed_checks, consecutive_failures, failure_streak, failing_heads_json, last_checked_at, last_error, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (repository, number) DO UPDATE SET
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (repository, number) DO UPDATE SET
         head_sha = coalesce(excluded.head_sha, github_pr_check.head_sha), rollup_state = excluded.rollup_state,
+        is_draft = CASE WHEN excluded.head_sha IS NULL AND github_pr_check.head_sha IS NOT NULL
+          THEN github_pr_check.is_draft ELSE excluded.is_draft END,
         total_checks = excluded.total_checks, failed_checks = excluded.failed_checks,
         consecutive_failures = excluded.consecutive_failures, failure_streak = excluded.failure_streak,
         failing_heads_json = excluded.failing_heads_json,
         last_checked_at = excluded.last_checked_at, last_error = excluded.last_error, updated_at = excluded.updated_at`)
-        .run(repository, number, check.headSha, check.rollupState, check.totalChecks, check.failedChecks,
+        .run(repository, number, check.headSha, Number(check.isDraft), check.rollupState, check.totalChecks, check.failedChecks,
           heads.size, streak, JSON.stringify([...heads]), now, check.rollupState === "error" ? "GitHub PR checks unavailable" : null, now);
     });
   }

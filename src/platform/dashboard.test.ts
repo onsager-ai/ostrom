@@ -53,6 +53,7 @@ test("serves the loopback page and proxies authenticated GETs only", async () =>
         "default-src 'none'; connect-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'");
       assert.doesNotMatch(page.body, /<(?:link|img)\b|<script\b[^>]*\bsrc\s*=/i);
       assert.doesNotMatch(page.body, /\binnerHTML\b/);
+      assert.doesNotMatch(page.body, /https?:\/\/[\w.-]+\.[a-z]{2,}|\/home\//i);
       const fontSizes = [...page.body.matchAll(/\bfont-size:\s*([^;}]*)/g)];
       assert(fontSizes.length > 0);
       for (const [, size] of fontSizes) {
@@ -319,7 +320,7 @@ test("Lane Board caps exceptions, keeps lane summaries current, and preserves dr
   runInNewContext(String.raw`
     function mockElement(tag) {
       return {
-        tag, dataset: {}, children: [], open: false, classList: { add() {} },
+        tag, dataset: {}, children: [], open: false,
         append(...nodes) { this.children.push(...nodes); },
         replaceChildren(...nodes) { this.children = nodes; },
         querySelector() { return descendants(this).find((node) => node.tag === "details"); },
@@ -356,8 +357,10 @@ test("Lane Board caps exceptions, keeps lane summaries current, and preserves dr
       metricTarget: 1, approvedDecisionId: "approval", weeklyPlan: {
         nextStep: "Review patch", next: "Alternative", blockers: ["Get test data"], items: ["Review patch", "Ship patch"],
       } };
-    const lane = { id: "release", slug: "crawlab", name: "Release", status: "active", priorityRank: 1, goal };
-    const idleLane = { id: "idle", slug: "idle", name: "Quiet Lane", status: "paused", priorityRank: 5 };
+    const lane = { id: "release", slug: "crawlab", name: "Release", status: "active", ownerAgentId: "release-manager", priorityRank: 1, goal };
+    const idleLane = { id: "idle", slug: "idle", name: "Quiet Lane", status: "active", ownerAgentId: "idle-manager", priorityRank: 5 };
+    const pausedLane = { id: "paused", slug: "paused", name: "Paused Lane", status: "paused",
+      ownerAgentId: "paused-manager", priorityRank: 6 };
     const decision = (title, urgency, day, laneId) => ({
       title, urgency, createdAt: "2026-11-" + day + "T00:00:00Z", laneId, recommendation: "Proceed",
     });
@@ -373,57 +376,110 @@ test("Lane Board caps exceptions, keeps lane summaries current, and preserves dr
       alert("CI warning", "pr_green_ci", 29), laneAlert,
       alert("Routing exception", "authority_routing", 25), alert("Budget exceeded", "budget_exceeded", 23),
       alert("Budget warning", "budget_cap", 30, { level: "warning" }),
+      alert("Draft CI failed", "pr_green_ci", 29, { repository: "Org/Idle", number: 6, isDraft: false }),
     ];
     const pr = (number, rollupState) => ({ repository: "org/crawlab-pro", number, rollupState });
-    const prChecks = [pr(1, "success"), pr(2, "pending"), pr(3, "error"), pr(4, "closed")];
+    const prChecks = [pr(1, "success"), pr(2, "pending"), pr(3, "error"), pr(4, "closed"),
+      { repository: "org/idle", number: 6, isDraft: true, rollupState: "failure" },
+      { ...pr(7, "failure"), isDraft: true }];
     const linkedPrs = [
       { repository: "org/crawlab-pro", number: 5, prHost: "github.com", state: "merged", title: "Merged work" },
-      { repository: "org/idle", number: 6, prHost: "github.com", state: "open", title: "New work" },
+      { repository: "org/idle", number: 6, prHost: "github.com", state: "open", isDraft: false, title: "New work" },
     ];
-    const health = { pendingOwnerDecisions: decisions, policyAlerts: alerts, hosts: [], agents: [],
+    const host = { hostId: "east", webUrl: "https://t3.example", environmentId: "env" };
+    const manager = { id: lane.ownerAgentId, label: "Release Manager", hostId: host.hostId, externalRef: "env/thread", status: "active" };
+    const idleManager = { ...manager, id: idleLane.ownerAgentId, status: "idle" };
+    const health = { pendingOwnerDecisions: decisions, policyAlerts: alerts, hosts: [host], agents: [manager, idleManager],
       activeRuns: [], stalledRuns: [], waits: [], githubPrs: prChecks, budgets: [], spend: { status: "unavailable" } };
-    currentContext = context({ digest: { sections: { lanes: [idleLane, lane] } }, health, friction: [], linkedPrs });
+    const boardData = { digest: { sections: { lanes: [idleLane, lane, pausedLane] } }, health, friction: [], linkedPrs };
+    currentContext = context(boardData);
     const view = byId("view");
     renderView();
     const [waiting, flagged, lanes, spend] = view.children;
-    const titles = (panel) => panel.children[1].children.filter((node) => node.className === "row")
+    const titles = (panel) => panel.children[1].children.filter((node) => node.className?.split(" ").includes("row"))
       .map((node) => node.firstChild.firstChild.firstChild.textContent);
+    const laneRows = (panel) => panel.children[1].children.filter((node) => node.className === "lane-row");
+    const laneNames = (panel) => laneRows(panel).map((node) => node.firstChild.firstChild.firstChild.firstChild.textContent);
     assert.deepEqual(titles(waiting), ["Incident newest", "Incident older", "Block today"]);
     assert.equal(waiting.children[1].children[3].textContent, "View all 4 waiting on you →");
     assert.equal(waiting.children[1].children[3].href, "#system");
     assert.deepEqual(titles(flagged), ["Routing exception", "CI failed twice", "Budget exceeded"]);
     assert.equal(flagged.children[1].children[3].textContent, "View all 5 alerts →");
-    assert.deepEqual(titles(lanes), ["Release", "Quiet Lane"]);
+    assert.deepEqual(laneNames(lanes), ["Release"]);
     assert.match(textIn(lanes), /Release blocked Ship the release Next: Review patch · Blocker: Get test data/);
-    assert.match(textIn(lanes), /Quiet Lane paused Next: Paused · Blocker: None/);
+    assert.match(textIn(lanes), /Show all lanes \(2 hidden\)/);
+    assert.doesNotMatch(textIn(view), /Open in T3|Draft CI failed/);
+    for (const link of [waiting.children[1].children[1], flagged.children[1].children[1], laneRows(lanes)[0].firstChild]) {
+      assert.equal(link.tag, "a");
+      assert.match(link.className, /\brow-link\b/);
+      assert.equal(link.href, "https://t3.example/threads/env/thread");
+      assert.equal(link.target, "_blank");
+      assert.equal(link.rel, "noopener noreferrer");
+      assert.equal(link.children[1].textContent, "↗");
+    }
+    const toggle = (panel) => panel.children[1].children.at(-1).firstChild;
+    toggle(lanes).onclick();
+    currentContext = context(boardData);
+    renderView();
+    const expanded = view.children[2];
+    assert.deepEqual(laneNames(expanded), ["Release", "Quiet Lane", "Paused Lane"]);
+    assert.equal(toggle(expanded).textContent, "Hide idle lanes");
+    assert.equal(toggle(expanded)["aria-expanded"], "true");
+    assert.match(textIn(expanded), /Quiet Lane idle.*Paused Lane paused/);
+    assert.equal(laneRows(expanded)[1].firstChild.firstChild.children.length, 1);
+    toggle(expanded).onclick();
+    assert.deepEqual(laneNames(view.children[2]), ["Release"]);
     assert.match(textIn(spend), /Unavailable · Semon not enabled on this host/);
     assert.match(textIn(spendMeter({ spend: { status: "available", preferredUsd: 4.5 }, budgets: [] })), /USD 4.5 estimated/);
     assert.match(textIn(spendMeter({ spend: health.spend, budgets: [{ enabled: true, scopeKind: "team",
       period: "monthly", capUsd: 12, spend: { status: "available", preferredUsd: 4.5 } }] })), /USD 4.5 \/ 12 monthly/);
     assert.equal(byId("owner-digest").hidden, true);
     assert.equal(descendants(view).some((node) => node.textContent === "Hosts"), false);
-    const manager = { status: "waiting" };
     const withoutPlan = { ...lane, goal: null };
-    assert.deepEqual(laneSummary(withoutPlan, manager, [decisions[1]], [laneAlert]),
-      { status: "blocked", next: "Manager waiting", blocker: "Incident older" });
-    assert.deepEqual(laneSummary(withoutPlan, null, [], [laneAlert]),
-      { status: "blocked", next: "No next step recorded", blocker: "CI failed twice" });
-    assert.deepEqual(laneSummary(withoutPlan, null, [], [alerts[4]]),
-      { status: "active", next: "No next step recorded", blocker: "Budget warning" });
-    assert.deepEqual(laneSummary({ ...lane, goal: { weeklyPlan: [{ next: "Test", blocker: "Fixtures" }] } }, null, [], []),
-      { status: "active", next: "Test", blocker: "Fixtures" });
-    assert.equal(laneSummary({ ...lane, goal: { weeklyPlan: ["Test"] } }, null, [], []).next, "Test");
+    assert.equal(summarizeLaneLine2(laneSummary(withoutPlan, currentContext)), "Blocker: Incident older");
+    assert.equal(summarizeLaneLine2(laneSummary(idleLane, currentContext)), "");
+    assert.equal(summarizeLaneLine2(laneSummary(pausedLane, currentContext)), "");
+    const cleanContext = { ...currentContext, decisionsByLane: new Map(), alertsByLane: new Map() };
+    const planSummary = (weeklyPlan) => summarizeLaneLine2(laneSummary({ ...lane, goal: { weeklyPlan } }, cleanContext));
+    assert.equal(planSummary([{ next: "Test", blocker: "Fixtures" }]), "Next: Test · Blocker: Fixtures");
+    assert.equal(planSummary(["Test"]), "Next: Test");
+    assert.equal(planSummary(null), "");
 
-    const laneButton = descendants(lanes).find((item) => item.tag === "button");
-    assert.equal(laneButton["aria-label"], "View Release");
-    laneButton.onclick();
+    const waitingLane = { ...idleLane, id: "waiting", slug: "waiting", ownerAgentId: "waiting-manager" };
+    const stalledLane = { ...idleLane, id: "stalled", slug: "stalled", ownerAgentId: null };
+    const unownedLane = { id: "unowned", slug: "unowned", status: "active", priorityRank: 7 };
+    const blockedLane = { ...idleLane, id: "blocked", slug: "blocked", ownerAgentId: "blocked-manager" };
+    const planLane = { ...pausedLane, id: "plan", slug: "plan", goal: { weeklyPlan: { blocker: "Need a fixture" } } };
+    const listing = [withoutPlan, idleLane, pausedLane, waitingLane, stalledLane, blockedLane, planLane, unownedLane];
+    const partitionContext = context({ ...boardData, digest: { sections: { lanes: listing } }, health: {
+      ...health, pendingOwnerDecisions: [],
+      policyAlerts: [alert("Manager failed twice", "two_failure_stop", 29, { agentId: "blocked-manager" })],
+      agents: [...health.agents, { ...manager, id: "waiting-manager", status: "waiting" },
+        { ...idleManager, id: "blocked-manager" }, { ...manager, id: pausedLane.ownerAgentId }],
+      activeRuns: [{ id: "paused-run", agentId: pausedLane.ownerAgentId, laneId: pausedLane.id }],
+      stalledRuns: [{ id: "stalled-run", laneId: stalledLane.id }],
+    } });
+    const partitioned = partitionBoardLanes(listing, partitionContext);
+    assert.deepEqual(partitioned.visible.map((item) => item.id), [lane.id, waitingLane.id, stalledLane.id, blockedLane.id, planLane.id]);
+    assert.deepEqual(partitioned.hidden.map((item) => item.id), [idleLane.id, pausedLane.id, unownedLane.id]);
+    assert.equal(laneSummary(waitingLane, partitionContext).status, "waiting");
+    assert.equal(laneSummary(blockedLane, partitionContext).status, "blocked");
+    assert.equal(summarizeLaneLine2(laneSummary(blockedLane, partitionContext)), "Blocker: Manager failed twice");
+
+    const laneButton = laneRows(view.children[2])[0].children[1];
+    assert.equal(laneButton.textContent, "Details");
+    assert.equal(laneButton["aria-label"], "Details for Release");
+    let prevented = false;
+    let stopped = false;
+    laneButton.onclick({ preventDefault() { prevented = true; }, stopPropagation() { stopped = true; } });
+    assert(prevented && stopped);
     assert.equal(location.hash, "#lane/crawlab");
     navigate();
     assert.match(textIn(view), /Goal & Weekly Plan Ship the release Releases · unknown\/1 Week of 2026-11-23 · Approved/);
     assert.match(textIn(view), /Ship patch/);
     assert.match(textIn(view), /CI failed twice/);
     assert.doesNotMatch(textIn(view), /org\/idle/);
-    assert.match(textIn(view), /#3.*#2.*#1.*Closed PRs \(2\)/);
+    assert.match(textIn(view), /#3.*#2.*#1.*Closed and draft PRs \(3\).*#7 draft failure/);
     const laneDisclosure = view.querySelector();
     laneDisclosure.open = true;
     renderView();
@@ -434,20 +490,23 @@ test("Lane Board caps exceptions, keeps lane summaries current, and preserves dr
     assert.equal(byId("owner-digest").hidden, false);
     assert.match(textIn(view), /Incident newest.*Incident older.*Block today.*Digest request/);
     assert.match(textIn(view), /CI warning/);
-    assert.match(textIn(view), /org\/idle #6/);
+    assert.match(textIn(view), /Closed and draft PRs \(4\).*org\/idle #6 · New work draft failure/);
     location.hash = "#lane/crawlab";
     navigate();
     assert.equal(view.querySelector().open, true);
     location.hash = "";
     navigate();
     assert.equal(byId("owner-digest").hidden, true);
+    currentContext = context({ ...boardData, digest: { sections: { lanes: [idleLane, pausedLane] } } });
+    renderView();
+    assert.match(textIn(view.children[2]), /All lanes are idle with no blockers Show all lanes \(2\)/);
     currentContext = context({ digest: { sections: { lanes: [] } }, health: {
       ...health, pendingOwnerDecisions: [], policyAlerts: [],
     }, friction: [], linkedPrs });
     renderView();
     assert.match(textIn(view), /Nothing waiting on you Alerts No active alerts/);
   `, {
-    assert,
+    assert, URL,
     location: {
       fragment: "",
       get hash() { return this.fragment; },

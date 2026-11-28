@@ -307,6 +307,11 @@ const migrations = [
       db.exec("ALTER TABLE t3_host_state ADD COLUMN web_url TEXT");
     }
   },
+  (db: DatabaseSync) => {
+    if (!db.prepare("PRAGMA table_info(github_pr_check)").all().some(({ name }) => name === "is_draft")) {
+      db.exec("ALTER TABLE github_pr_check ADD COLUMN is_draft INTEGER NOT NULL DEFAULT 0");
+    }
+  },
 ];
 
 // Read the version with the writer lock held so simultaneous opens cannot apply the same migration.
