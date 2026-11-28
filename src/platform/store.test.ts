@@ -51,7 +51,7 @@ test("the host URL migration preserves existing rows and later URL updates", (t)
   const original = store.upsertT3HostState(host);
   assert.equal(original.webUrl, null);
   db.exec(`ALTER TABLE t3_host_state DROP COLUMN web_url;
-    DELETE FROM platform_schema_version WHERE version >= (SELECT max(version) - 1 FROM platform_schema_version)`);
+    DELETE FROM platform_schema_version WHERE version >= (SELECT max(version) - 2 FROM platform_schema_version)`);
   const upgraded = PlatformStore.open(path);
   const webUrl = "https://t3-east.example";
   try {
@@ -76,7 +76,7 @@ test("the PR draft migration preserves existing checks and persists draft change
   store.recordGitHubPrCheck("org/repo", 7, check);
   const before = store.listGitHubPrChecks();
   db.exec(`ALTER TABLE github_pr_check DROP COLUMN is_draft;
-    DELETE FROM platform_schema_version WHERE version = (SELECT max(version) FROM platform_schema_version)`);
+    DELETE FROM platform_schema_version WHERE version >= (SELECT max(version) - 1 FROM platform_schema_version)`);
   const upgraded = PlatformStore.open(path);
   try {
     assert.deepEqual(upgraded.listGitHubPrChecks(), before);
@@ -86,7 +86,7 @@ test("the PR draft migration preserves existing checks and persists draft change
   } finally {
     upgraded.close();
   }
-  db.exec("DELETE FROM platform_schema_version WHERE version = (SELECT max(version) FROM platform_schema_version)");
+  db.exec("DELETE FROM platform_schema_version WHERE version >= (SELECT max(version) - 1 FROM platform_schema_version)");
   const reopened = PlatformStore.open(path);
   try {
     assert.equal(reopened.listGitHubPrChecks()[0]?.isDraft, true);
@@ -94,6 +94,23 @@ test("the PR draft migration preserves existing checks and persists draft change
     assert.equal(reopened.listGitHubPrChecks()[0]?.isDraft, false);
   } finally {
     reopened.close();
+  }
+});
+
+test("the goal stale policy migration seeds existing databases", (t) => {
+  const { store, db, path } = disk(t);
+  db.exec(`DELETE FROM policy_rule WHERE code = 'goal_stale';
+    DELETE FROM platform_schema_version WHERE version = (SELECT max(version) FROM platform_schema_version)`);
+  const upgraded = PlatformStore.open(path);
+  try {
+    const rule = upgraded.listPolicyRules().find(({ code }) => code === "goal_stale");
+    assert.equal(rule?.id, "goal_stale");
+    assert.equal(rule?.sourceRef, "team-policy.md §3");
+    assert.equal(rule?.mode, "observe");
+    assert.deepEqual(rule?.params, { staleHours: 24 });
+    assert.equal(rule?.enabled, true);
+  } finally {
+    upgraded.close();
   }
 });
 
@@ -220,7 +237,7 @@ test("raw SQLite rejects mutation of decided fields and replacement or mutation 
   const reopened = PlatformStore.open(path);
   t.after(() => reopened.close());
   assert.equal(reopened.getDecision(original.id)?.status, "superseded");
-  assert.equal(reopened.listPolicyRules().length, 6);
+  assert.equal(reopened.listPolicyRules().length, 7);
 });
 
 test("a failed event insert rolls back decision creation and answer", (t) => {
@@ -299,8 +316,9 @@ test("seeded policy rules observe, and the friction count uses UTC days and owne
   const store = memory(t, () => now);
   const rules = store.listPolicyRules();
   assert.deepEqual(rules.map(({ code }) => code), [
-    "authority_routing", "budget_cap", "host_limits", "pr_green_ci", "registered_automation_only", "two_failure_stop",
+    "authority_routing", "budget_cap", "goal_stale", "host_limits", "pr_green_ci", "registered_automation_only", "two_failure_stop",
   ]);
+  assert.deepEqual(rules.find(({ code }) => code === "goal_stale")?.params, { staleHours: 24 });
   assert.ok(rules.every((rule) => rule.mode === "observe" && rule.enabled && (rule.sourceRef.startsWith("team-policy.md") || rule.code === "budget_cap")));
   const policyEvent = store.recordPolicyEvent({ ruleCode: "host_limits", summary: "Thermal gate reached", detail: { code: 75 } });
   assert.deepEqual(store.listPolicyEvents({ ruleCode: "host_limits" }), [policyEvent]);

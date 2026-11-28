@@ -43,6 +43,7 @@ test("all four MCP results project only the allowed status fields", async () => 
   const privateGoal = { ...goal, statement: `Contact ${lane.ownerAgentId} about ${decision.evidence.account}` };
   const alerts = [
     { ruleCode: "pr_green_ci", summary: "Private alert body", detail: decision.evidence },
+    { ruleCode: "goal_stale", summary: "A lane goal is stale", detail: { laneSlug: "releases", staleHours: 24 } },
     { ruleCode: "private-custom-rule", summary: "More private alert text" },
   ];
   const health = {
@@ -126,7 +127,7 @@ test("all four MCP results project only the allowed status fields", async () => 
     }
     const summary = await call("status_summary");
     assert.deepEqual(summary, {
-      pendingOwnerDecisions: 1, activeRuns: 1, stalledRuns: 0, openWaits: 1, openPolicyAlerts: 2,
+      pendingOwnerDecisions: 1, activeRuns: 1, stalledRuns: 0, openWaits: 1, openPolicyAlerts: 3,
       trackedAgents: 1, connectedHosts: 1, totalHosts: 1, spendStatus: "available", generatedAt: summary.generatedAt,
     });
     assert.ok(Date.parse(summary.generatedAt) <= Date.now());
@@ -153,6 +154,7 @@ test("all four MCP results project only the allowed status fields", async () => 
     assert.match(latest.markdown, /Approve the release/);
     assert.match(latest.markdown, /Ship three releases/);
     assert.ok(latest.markdown.includes("pr\\_green\\_ci · 1"));
+    assert.ok(latest.markdown.includes("goal\\_stale · 1"));
     assert.equal((await call("read_latest_digest")).window, "01:00Z");
     assert.deepEqual(new Set(calls), new Set([...routes.keys()].map((path) => `GET ${path}`)));
   } finally {

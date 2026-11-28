@@ -312,6 +312,11 @@ const migrations = [
       db.exec("ALTER TABLE github_pr_check ADD COLUMN is_draft INTEGER NOT NULL DEFAULT 0");
     }
   },
+  (db: DatabaseSync) => {
+    db.exec(`INSERT OR IGNORE INTO policy_rule (id, code, source_ref, mode, params_json, enabled, updated_at)
+      VALUES ('goal_stale', 'goal_stale', 'team-policy.md §3', 'observe', '{"staleHours":24}', 1,
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`);
+  },
 ];
 
 // Read the version with the writer lock held so simultaneous opens cannot apply the same migration.

@@ -358,6 +358,7 @@ test("Lane Board caps exceptions, keeps lane summaries current, and preserves dr
         nextStep: "Review patch", next: "Alternative", blockers: ["Get test data"], items: ["Review patch", "Ship patch"],
       } };
     const lane = { id: "release", slug: "crawlab", name: "Release", status: "active", ownerAgentId: "release-manager", priorityRank: 1, goal };
+    const staleLane = { id: "stale", slug: "stale", name: "Stale Lane", status: "active", ownerAgentId: "stale-manager", priorityRank: 2 };
     const idleLane = { id: "idle", slug: "idle", name: "Quiet Lane", status: "active", ownerAgentId: "idle-manager", priorityRank: 5 };
     const pausedLane = { id: "paused", slug: "paused", name: "Paused Lane", status: "paused",
       ownerAgentId: "paused-manager", priorityRank: 6 };
@@ -374,6 +375,7 @@ test("Lane Board caps exceptions, keeps lane summaries current, and preserves dr
     const laneAlert = alert("CI failed twice", "two_failure_stop", 24, { repository: "org/crawlab-pro" });
     const alerts = [
       alert("CI warning", "pr_green_ci", 29), laneAlert,
+      { ...alert("Stale Lane goal stale (no progress for 24h+)", "goal_stale", 28), laneId: staleLane.id },
       alert("Routing exception", "authority_routing", 25), alert("Budget exceeded", "budget_exceeded", 23),
       alert("Budget warning", "budget_cap", 30, { level: "warning" }),
       alert("Draft CI failed", "pr_green_ci", 29, { repository: "Org/Idle", number: 6, isDraft: false }),
@@ -388,10 +390,11 @@ test("Lane Board caps exceptions, keeps lane summaries current, and preserves dr
     ];
     const host = { hostId: "east", webUrl: "https://t3.example", environmentId: "env" };
     const manager = { id: lane.ownerAgentId, label: "Release Manager", hostId: host.hostId, externalRef: "env/thread", status: "active" };
+    const staleManager = { ...manager, id: staleLane.ownerAgentId, status: "idle" };
     const idleManager = { ...manager, id: idleLane.ownerAgentId, status: "idle" };
-    const health = { pendingOwnerDecisions: decisions, policyAlerts: alerts, hosts: [host], agents: [manager, idleManager],
+    const health = { pendingOwnerDecisions: decisions, policyAlerts: alerts, hosts: [host], agents: [manager, staleManager, idleManager],
       activeRuns: [], stalledRuns: [], waits: [], githubPrs: prChecks, budgets: [], spend: { status: "unavailable" } };
-    const boardData = { digest: { sections: { lanes: [idleLane, lane, pausedLane] } }, health, friction: [], linkedPrs };
+    const boardData = { digest: { sections: { lanes: [idleLane, lane, staleLane, pausedLane] } }, health, friction: [], linkedPrs };
     currentContext = context(boardData);
     const view = byId("view");
     renderView();
@@ -404,9 +407,10 @@ test("Lane Board caps exceptions, keeps lane summaries current, and preserves dr
     assert.equal(waiting.children[1].children[3].textContent, "View all 4 waiting on you →");
     assert.equal(waiting.children[1].children[3].href, "#system");
     assert.deepEqual(titles(flagged), ["Routing exception", "CI failed twice", "Budget exceeded"]);
-    assert.equal(flagged.children[1].children[3].textContent, "View all 5 alerts →");
-    assert.deepEqual(laneNames(lanes), ["Release"]);
+    assert.equal(flagged.children[1].children[3].textContent, "View all 6 alerts →");
+    assert.deepEqual(laneNames(lanes), ["Release", "Stale Lane"]);
     assert.match(textIn(lanes), /Release blocked Ship the release Next: Review patch · Blocker: Get test data/);
+    assert.match(textIn(lanes), /Stale Lane blocked Blocker: Stale Lane goal stale \(no progress for 24h\+\)/);
     assert.match(textIn(lanes), /Show all lanes \(2 hidden\)/);
     assert.doesNotMatch(textIn(view), /Open in T3|Draft CI failed/);
     for (const link of [waiting.children[1].children[1], flagged.children[1].children[1], laneRows(lanes)[0].firstChild]) {
@@ -417,18 +421,29 @@ test("Lane Board caps exceptions, keeps lane summaries current, and preserves dr
       assert.equal(link.rel, "noopener noreferrer");
       assert.equal(link.children[1].textContent, "↗");
     }
+    location.hash = "#system";
+    renderView();
+    const systemAlertRows = view.children[3].children[1].children;
+    const goalAlertRow = systemAlertRows.find((node) => textIn(node).includes("Stale Lane goal stale"));
+    assert.ok(goalAlertRow);
+    const goalAlertLink = goalAlertRow.children[1].children[0];
+    assert.equal(goalAlertLink.tag, "a");
+    assert.equal(goalAlertLink.href, "https://t3.example/threads/env/thread");
+    assert.equal(goalAlertRow.children[0].children[0].children[1].textContent, "Warning");
+    location.hash = "";
+    renderView();
     const toggle = (panel) => panel.children[1].children.at(-1).firstChild;
     toggle(lanes).onclick();
     currentContext = context(boardData);
     renderView();
     const expanded = view.children[2];
-    assert.deepEqual(laneNames(expanded), ["Release", "Quiet Lane", "Paused Lane"]);
+    assert.deepEqual(laneNames(expanded), ["Release", "Stale Lane", "Quiet Lane", "Paused Lane"]);
     assert.equal(toggle(expanded).textContent, "Hide idle lanes");
     assert.equal(toggle(expanded)["aria-expanded"], "true");
     assert.match(textIn(expanded), /Quiet Lane idle.*Paused Lane paused/);
-    assert.equal(laneRows(expanded)[1].firstChild.firstChild.children.length, 1);
+    assert.equal(laneRows(expanded)[2].firstChild.firstChild.children.length, 1);
     toggle(expanded).onclick();
-    assert.deepEqual(laneNames(view.children[2]), ["Release"]);
+    assert.deepEqual(laneNames(view.children[2]), ["Release", "Stale Lane"]);
     assert.match(textIn(spend), /Unavailable · Semon not enabled on this host/);
     assert.match(textIn(spendMeter({ spend: { status: "available", preferredUsd: 4.5 }, budgets: [] })), /USD 4.5 estimated/);
     assert.match(textIn(spendMeter({ spend: health.spend, budgets: [{ enabled: true, scopeKind: "team",
