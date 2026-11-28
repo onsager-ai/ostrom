@@ -129,17 +129,25 @@ export function evaluatePolicyAndHealth(store: PlatformStore, options: HealthOpt
   const targets = new Map(store.listGitHubPrTargets().map((pr) => [`${pr.repository}#${pr.number}`, pr]));
   const lanes = store.listLanes();
   const laneBySlug = new Map(lanes.map((lane) => [lane.slug.toLocaleLowerCase(), lane]));
-  const laneAliases: Record<string, string> = {
-    "agent-workbench": "awb", "crawlab-pro": "crawlab", "crawlab-docs": "crawlab",
-  };
+  const laneAliases = new Map<string, string>([
+    ["agent-workbench", "awb"], ["crawlab-pro", "crawlab"], ["crawlab-docs", "crawlab"],
+  ]);
   const threadLane = new Map<string, string>();
   const agents = store.listAgents();
   for (const pr of store.listT3ThreadPrs()) {
-    const agent = agents.find((candidate) => candidate.hostId === pr.hostId
-      && candidate.externalRef.endsWith(`/${pr.threadId}`));
-    if (agent?.laneId !== null && agent?.laneId !== undefined) {
-      threadLane.set(`${pr.repository.toLocaleLowerCase()}#${pr.number}`, agent.laneId);
-    }
+    if (pr.prHost.toLocaleLowerCase() !== "github.com") continue;
+    const prKey = `${pr.repository.toLocaleLowerCase()}#${pr.number}`;
+    if (threadLane.has(prKey)) continue;
+    const agent = agents.find((candidate) => {
+      const slash = candidate.externalRef.indexOf("/");
+      return candidate.hostId === pr.hostId && slash >= 0
+        && candidate.externalRef.slice(slash + 1) === pr.threadId;
+    });
+    if (agent === undefined) continue;
+    const lane = agent.laneId === null
+      ? lanes.find((candidate) => candidate.ownerAgentId === agent.id)
+      : lanes.find((candidate) => candidate.id === agent.laneId);
+    if (lane !== undefined) threadLane.set(prKey, lane.id);
   }
   for (const pr of store.listGitHubPrChecks()) {
     const name = `${pr.repository}#${pr.number}`;
@@ -148,7 +156,7 @@ export function evaluatePolicyAndHealth(store: PlatformStore, options: HealthOpt
     const key = `github:${name}`;
     const repositoryName = pr.repository.split("/").at(-1)?.toLocaleLowerCase() ?? "";
     const lane = laneBySlug.get(repositoryName)
-      ?? laneBySlug.get(laneAliases[repositoryName] ?? "")
+      ?? laneBySlug.get(laneAliases.get(repositoryName) ?? "")
       ?? lanes.find((candidate) => candidate.id === threadLane.get(`${pr.repository.toLocaleLowerCase()}#${pr.number}`));
     const detail = { ...pr, laneSlug: lane?.slug ?? null };
     const cause = pr.rollupState === "error"
@@ -160,11 +168,13 @@ export function evaluatePolicyAndHealth(store: PlatformStore, options: HealthOpt
       && (target.watching || store.hasOpenPolicyEvent(failureRule, streakKey));
     if (twoFailureStop) {
       failureKeys.push(streakKey);
-      const event = store.recordDedupedPolicyEvent({
-        ruleCode: failureRule, laneId: lane?.id ?? null,
-        summary: `${prefix}${name}: ${cause} (${pr.consecutiveFailures} consecutive heads)`, detail,
-      }, streakKey, now, true);
-      if (event !== null) events.push(event);
+      if (pr.rollupState === "failure") {
+        const event = store.recordDedupedPolicyEvent({
+          ruleCode: failureRule, laneId: lane?.id ?? null,
+          summary: `${prefix}${name}: ${cause} (${pr.consecutiveFailures} consecutive heads)`, detail,
+        }, streakKey, now, true);
+        if (event !== null) events.push(event);
+      }
     }
     if (!twoFailureStop && enabled.has(ciRule) && (
       pr.rollupState === "failure" || pr.rollupState === "error"

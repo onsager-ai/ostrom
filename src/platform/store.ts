@@ -1175,17 +1175,17 @@ export class PlatformStore {
 
   recordDedupedPolicyEvent(input: RecordPolicyEventInput, key: string, at: string, friction = false): PolicyEvent | null {
     return this.transaction(() => {
+      const laneId = input.laneId ?? null;
+      const detailJson = encode(input.detail ?? null, "detail");
       const row = this.get<PolicyEventRow>(`INSERT INTO policy_event
         (id, rule_code, lane_id, summary, detail_json, created_at, dedupe_key) VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (rule_code, dedupe_key) WHERE resolved_at IS NULL AND dedupe_key IS NOT NULL DO NOTHING
-        RETURNING ${policyEventColumns}`, newId("pol"), input.ruleCode, input.laneId ?? null, input.summary,
-      encode(input.detail ?? null, "detail"), at, key);
+        RETURNING ${policyEventColumns}`, newId("pol"), input.ruleCode, laneId, input.summary, detailJson, at, key);
       if (row === null) {
         this.db.prepare(`UPDATE policy_event SET lane_id = ?, summary = ?, detail_json = ?
           WHERE rule_code = ? AND dedupe_key = ? AND resolved_at IS NULL
             AND (lane_id IS NOT ? OR summary IS NOT ? OR detail_json IS NOT ?)`)
-          .run(input.laneId ?? null, input.summary, encode(input.detail ?? null, "detail"),
-            input.ruleCode, key, input.laneId ?? null, input.summary, encode(input.detail ?? null, "detail"));
+          .run(laneId, input.summary, detailJson, input.ruleCode, key, laneId, input.summary, detailJson);
         return null;
       }
       if (friction) this.db.prepare(`INSERT INTO friction_entry (id, kind, summary, status, lane_id, rule_code, created_at)
