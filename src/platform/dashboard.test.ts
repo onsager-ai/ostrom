@@ -666,26 +666,17 @@ test("the loopback page removes the token fragment and retains authorization dur
 test("the preview follows the system theme and contains no write controls or outbound T3 links", async () => {
   const html = await readFile(new URL("./dashboard-v2.html", import.meta.url), "utf8");
   assert.match(html, /color-scheme:\s*light dark/);
-  for (const style of ["a", "b"]) assert.match(html, new RegExp(String.raw`:root\[data-style="${style}"\] \{[^}]*--accent: light-dark\(`));
+  assert.match(html, /:root \{[^}]*--accent: light-dark\(#3e5bd8, #7b93ff\)/);
+  assert.doesNotMatch(html, /data-style|\?style=/);
   assert.doesNotMatch(html, /t3-thread:\/\/|\.ts\.net\/threads\/|Open in T3/i);
   assert.doesNotMatch(html, /theme-toggle|data-theme|<form\b|type=["']submit|\binnerHTML\b/i);
   assert.doesNotMatch(html, /\bStalled\b/);
-  assert.match(html, /Stall signal: unavailable \(awaiting Semon #788\)/);
-  assert.match(html, /\.tile p\s*\{[^}]*-webkit-line-clamp:\s*2\b[^}]*overflow:\s*hidden/);
+  assert.match(html, /Stall: unavailable \(Semon #788\)/);
+  assert.doesNotMatch(html, /\.tile p\b/);
+  assert.match(html, /\.tile strong \{[^}]*white-space: nowrap; text-overflow: ellipsis/);
   assert.match(html, /\.tabbar\s*\{[^}]*position:\s*fixed;[^}]*inset:\s*auto 0 0/);
   assert.match(html, /main\s*\{[^}]*calc\(72px \+ env\(safe-area-inset-bottom\)\)/);
   assert.match(html, /\.card-head \+ \.settled-prs \{ border-top: 0 \}/);
-});
-
-test("the preview picks its visual style from the ?style= query before first paint", async () => {
-  const html = await readFile(new URL("./dashboard-v2.html", import.meta.url), "utf8");
-  const script = /<\/style>\s*<script>([\s\S]*?)<\/script>\s*<\/head>/.exec(html)?.[1];
-  assert(script);
-  for (const [search, style] of [["?style=a", "a"], ["?style=b", "b"], ["", "a"], ["?style=c", "a"], ["?style=B", "a"]]) {
-    const document = { documentElement: { dataset: {} as Record<string, string> } };
-    runInNewContext(script, { document, location: { search }, URLSearchParams });
-    assert.equal(document.documentElement.dataset.style, style, search);
-  }
 });
 
 const previewDom = `
@@ -777,17 +768,16 @@ test("preview overview summarizes UTC activity, prioritizes goals, and renders S
       friction: [{ summary: "Repeated approval request" }] }, testingNow);
 
     const summary = summaryTiles(ctx);
-    assert.match(summary.textContent, /Shipped today1 PR · 1 goalPR 7 · Reviewed release/);
-    assert.match(summary.textContent, /At risk1 alertRisk lane #10/);
-    assert.match(summary.textContent, /Needs you1 decisionWaiting lane/);
+    assert.equal(summary.textContent, "Shipped today1 PR · 1 goalAt risk1 alertNeeds you1 ask");
+    assert.deepEqual(summary.children.map(({ title }) => title), ["PR 7 · Reviewed release", "Risk lane #10", "Waiting lane"]);
     assert.equal(summary.children[2].href, "#decisions");
     const emptySummary = summaryTiles({ ...ctx, activity: activityByDay([], [], testingNow), alerts: [], decisions: [] });
-    assert.match(emptySummary.textContent, /None recorded yet today/);
-    assert.match(emptySummary.textContent, /0 alertsAll clear/);
+    assert.match(emptySummary.textContent, /0 alerts/);
+    assert.deepEqual(emptySummary.children.map(({ title }) => title), ["None recorded yet today", "All clear", "No pending decisions"]);
 
     assert.equal(ctx.lanes.map(({ lane }) => lane.id).join(","), "waiting,risk,ongoing,old");
     const laneText = goalsCard(ctx, true).textContent;
-    assert.match(laneText, /Waiting on owner.*Risk laneAt risk.*OngoingActive3\/8Nov 29.*Prior weekNo goal/);
+    assert.match(laneText, /Waiting laneWaiting on owner.*Risk laneAt risk.*OngoingActive3\/811-29.*Prior weekNo goal/);
     assert.doesNotMatch(laneText, /99\/99/);
     assert.equal(overview({ ...ctx, decisions: [] }).flatMap(descendants).filter((node) => node.href === "#lane/ongoing").length, 2);
 
@@ -805,12 +795,12 @@ test("preview overview summarizes UTC activity, prioritizes goals, and renders S
     assert.match(missingCost.textContent, /UnknownTodayUnavailableThis weekUnavailableMonth est\.Unavailable/);
 
     const fleet = fleetCard(ctx);
-    assert.match(fleet.textContent, /1 active1 waiting1 recent idle1 offline/);
+    assert.match(fleet.textContent, /1 active1 waiting1 idle1 offline/);
     assert.match(fleet.textContent, /Codex · gpt-6.2-solRunning5m/);
-    assert.match(fleet.textContent, /Gemini · gemini-newestWaiting for approval/);
-    assert.match(fleet.textContent, /Input runWaiting for input/);
-    assert.match(fleet.textContent, /Legacy runStatus unavailable/);
-    assert.match(fleet.textContent, /Stall signal: unavailable \(awaiting Semon #788\)/);
+    assert.match(fleet.textContent, /Gemini · gemini-newestNeeds approval/);
+    assert.match(fleet.textContent, /Input runNeeds input/);
+    assert.match(fleet.textContent, /Legacy runUnknown/);
+    assert.match(fleet.textContent, /Stall: unavailable \(Semon #788\)/);
     assert.doesNotMatch(fleet.textContent, /stalled|gpt-superseded-run|gemini-4-neon/i);
     assert.equal(descendants(fleet).filter((node) => node.className === "run-row").length, 4);
 
@@ -913,7 +903,7 @@ test("preview lane directory filters stored goals and links to the in-Ostrom lan
     const visibleLanes = () => descendants(view).filter((node) => node.className === "lane-row");
     const button = (label) => descendants(view).find((node) => node.tag === "button" && node.textContent === label);
     assert.equal(visibleLanes().map((row) => row.href).join(","), "#lane/prod,#lane/ops,#lane/docs,#lane/paused,#lane/archive");
-    assert.match(visibleLanes()[0].textContent, /ProductActiveShip the releaseDone 2\/3Due Nov 30›/);
+    assert.match(visibleLanes()[0].textContent, /ProductActiveShip the releaseDone 2\/3Due 11-30›/);
     assert(descendants(visibleLanes()[0]).some((node) => node.attrs["aria-label"] === "PRs: 2/3"));
     for (const [name, slug] of [["At risk", "ops"], ["Waiting", "docs"], ["Active", "prod"], ["Paused", "paused"]]) {
       button(name).onclick();
@@ -966,12 +956,12 @@ test("preview lane detail renders the six sections and uses only safe GitHub PR 
     assert(navItems.filter(({ key }) => key === "lanes").every(({ link }) => link.attrs["aria-current"] === "page"));
     assert.equal(descendants(view).filter((node) => node.tag === "h2").map((node) => node.textContent).join("|"),
       "Current Goal & Next Step|Recent PRs & Merges|Running Workers|Lane Spend|Decisions & Blockers|Activity Timeline");
-    assert.match(view.textContent, /At riskProduct.*Publish an updateDone 1\/2Due Nov 30Next: Review the draft/);
+    assert.match(view.textContent, /At riskProduct.*Publish an updateDone 1\/2Due 11-30Next: Review the draft/);
     assert.match(view.textContent, /Goal History · 1Cut the previous releaseWeek of 2026-11-16 · Releases 1\/1Completed/);
     assert.match(view.textContent, /Recent PRs & Merges#7 Update 7org\/product · 1\/25 checks failed · 2 consecutive headsFailing›#5 Update 5org\/product · re-runningPending›/);
     assert.match(view.textContent, /#4 Update 4org\/product · Checks passedPassing›/);
     assert.match(view.textContent, /Merged & closed · 6.*mergedMerged/);
-    assert.match(view.textContent, /No active runs on ProductStall signal: unavailable \(awaiting Semon #788\)/);
+    assert.match(view.textContent, /No active runs on ProductStall: unavailable \(Semon #788\)/);
     assert.match(view.textContent, /No data yet · awaiting per-lane Semon rollup/);
     assert.match(view.textContent, /Approve the release\?RecommendedApproveOptionsDeferBlocks RolloutRead-only · Answer in chat/);
     assert.match(view.textContent, /Goal completed · Cut the previous release2026-11-22 11:30:00 UTC/);
@@ -998,7 +988,7 @@ test("preview lane detail renders the six sections and uses only safe GitHub PR 
     render();
     assert(descendants(view).find((node) => node.className === "goal-history").open);
     assert.match(view.textContent, /LanesAt riskCodex · gpt-6\.2-solProduct/);
-    assert.match(view.textContent, /ManagerCodex · gpt-6\.2-solRunning5mWorkerGemini · gemini-4-neonWaiting for input/);
+    assert.match(view.textContent, /ManagerCodex · gpt-6\.2-solRunning5mWorkerGemini · gemini-4-neonNeeds input/);
     assert.match(view.textContent, /Lane Spend\$12\.50Coverage: partialThis week · Semon · USD/);
     detail.activeRuns = [...detail.activeRuns, ...detail.activeRuns, ...detail.activeRuns];
     render();
@@ -1224,9 +1214,9 @@ test("preview executive report displays platform records, rollup coverage and th
     const score = descendants(view).filter((node) => node.className === "matrix-row report-score");
     assert.equal(score.length, 12);
     assert.equal(score[0].href, "#lane/lane-8");
-    assert.match(score[0].textContent, /Lane 8WaitingPlan lane-8—Dec 1/);
+    assert.match(score[0].textContent, /Lane 8WaitingPlan lane-8—12-01/);
     assert.equal(score[1].href, "#lane/lane-9");
-    assert.match(score[1].textContent, /Lane 9At riskShip two updates2\/4Nov 30/);
+    assert.match(score[1].textContent, /Lane 9At riskShip two updates2\/411-30/);
     assert(descendants(score[1]).some((node) => node.attrs["aria-label"] === "Releases: 2/4"));
     assert.match(score.at(-1).textContent, /Lane 11Paused/);
     assert.match(view.textContent, /Weekly ScorecardWeek of Nov 23LaneDoneDue/);
@@ -1234,7 +1224,7 @@ test("preview executive report displays platform records, rollup coverage and th
     assert.match(panel("card report-spend").textContent, /Spend & Harness FrictionPartialToday\$17\.50This week\$51\.00Month est\.\$173\.21/);
     assert.match(view.textContent, /\$51\.00 \/ \$50\.00 · weekly capCap reached/);
     assert.match(view.textContent, /By-model & by-lane breakdown: No data yet \(awaiting Semon rollup\)/);
-    assert.match(view.textContent, /Stall signal: unavailable \(awaiting Semon #788\)/);
+    assert.match(view.textContent, /Stall: unavailable \(Semon #788\)/);
     assert.equal(get("report-friction").children.length, 5);
     assert.match(get("report-friction").textContent, /policy break1h 0m agoFriction 0/);
     button("Show all 6 open friction items").onclick();
@@ -1265,6 +1255,8 @@ test("preview executive report displays platform records, rollup coverage and th
       render();
       assert.equal(view.children.at(-1).open, true);
       assert.match(view.textContent, /Shipped024hDecisions0none waitingSpend—TodayUnavailable/);
+      assert.match(reportVerdict(reportWindows.weekly, reportDigest.generatedAt, [], [{ laneId: null }], {}).textContent,
+        /Decisions1team-level/);
       for (const empty of ["No owner decisions waiting", "No merged PRs or completed goals recorded in this window yet",
         "No team budget configured", "No open friction items"]) assert(view.textContent.includes(empty));
       ctx.spend.daily = rollup(null, "unknown");
