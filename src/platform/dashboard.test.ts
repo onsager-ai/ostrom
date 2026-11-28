@@ -761,7 +761,7 @@ test("preview overview summarizes UTC activity, prioritizes goals, and renders S
         { id: "future", status: "offline", lastSeenAt: "2026-11-28T13:00:31Z" },
       ],
       activeRuns: [
-        { id: "0", agentId: "active", model: "openai/older", status: "waiting_input", startedAt: "2026-11-28T12:54:00Z" },
+        { id: "0", agentId: "active", model: "openai/gpt-superseded-run", status: "waiting_input", startedAt: "2026-11-28T12:54:00Z" },
         { id: "1", agentId: "active", model: "openai/gpt-6.2-sol", status: "running", startedAt: "2026-11-28T12:55:00Z" },
         { id: "2", agentId: "waiting", model: "google/gemini-4-neon", status: "waiting_approval", updatedAt: "2026-11-28T12:57:00Z" },
         { id: "2-a", agentId: "waiting", model: "google/gemini-newest", status: "waiting_approval", updatedAt: "2026-11-28T12:57:00Z" },
@@ -811,7 +811,7 @@ test("preview overview summarizes UTC activity, prioritizes goals, and renders S
     assert.match(fleet.textContent, /Input runWaiting for input/);
     assert.match(fleet.textContent, /Legacy runStatus unavailable/);
     assert.match(fleet.textContent, /Stall signal: unavailable \(awaiting Semon #788\)/);
-    assert.doesNotMatch(fleet.textContent, /stalled|older|gemini-4-neon/i);
+    assert.doesNotMatch(fleet.textContent, /stalled|gpt-superseded-run|gemini-4-neon/i);
     assert.equal(descendants(fleet).filter((node) => node.className === "run-row").length, 4);
 
     const throughputPanel = throughputCard(ctx);
