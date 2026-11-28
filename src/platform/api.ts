@@ -112,6 +112,13 @@ export async function dispatchPlatformRequest(
     if (get) return ok(store.listLanes());
     if (post) return created(store.createLane(await body<CreateLaneInput>()));
   }
+  if (get && route === "/v1/goals") {
+    const slug = query.get("lane");
+    if (slug === null) return ok(store.listGoals());
+    const entry = store.getLaneBySlug(slug);
+    if (entry === null) throw new PlatformNotFoundError(`lane ${slug} not found`);
+    return ok(store.listGoals(entry.id));
+  }
   if (get && route === "/v1/goals/audit") {
     const slug = query.get("lane");
     if (slug === null) return ok(store.listGoalAuditEvents());

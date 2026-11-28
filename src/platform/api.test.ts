@@ -162,6 +162,24 @@ test("the goal completion route accepts requests with and without a JSON body", 
   assert.equal(closedReplacement.metricCurrent, replacement.metricCurrent);
 });
 
+test("the goal list returns completed history and filters by lane slug", async (t) => {
+  const { store, client } = await fixture(t);
+  const product = store.createLane({ slug: "product", name: "Product" });
+  const docs = store.createLane({ slug: "docs", name: "Docs" });
+  store.createLane({ slug: "empty", name: "Empty" });
+  const input = { statement: "Ship", metricName: "Releases", metricTarget: 1, weekStart: "2026-11-23" };
+  assert.deepEqual(await client.request("GET", "/v1/goals"), []);
+
+  const older = store.setGoal({ ...input, laneId: docs.id, weekStart: "2026-11-16" });
+  store.setGoal({ ...input, laneId: product.id });
+  const completed = store.completeGoal(product.id, { metricCurrent: 1 });
+  assert.deepEqual(await client.request("GET", "/v1/goals"), [completed, older]);
+  assert.deepEqual(await client.request("GET", "/v1/goals?lane=product"), [completed]);
+  assert.deepEqual(await client.request("GET", "/v1/goals?lane=docs"), [older]);
+  assert.deepEqual(await client.request("GET", "/v1/goals?lane=empty"), []);
+  await assert.rejects(client.request("GET", "/v1/goals?lane=unknown"), { status: 404 });
+});
+
 test("the owner goal route enforces lane ownership and exposes a filterable audit log", async (t) => {
   const { client, store } = await fixture(t);
   const owner = store.upsertAgent({ id: "manager", role: "manager", connectorKind: "t3", hostId: "east",

@@ -47,6 +47,8 @@ test("serves the loopback page and proxies authenticated GETs only", async () =>
       const headers = { authorization: "Bearer " + token };
       const page = await read(url, "/");
       assert.equal(page.status, 200);
+      assert.equal(page.body, await readFile(new URL("./dashboard.html", import.meta.url), "utf8"));
+      assert.equal((await read(url, "/dashboard.html")).body, page.body);
       assert.equal(page.headers["cache-control"], "no-store");
       assert.equal(page.headers["referrer-policy"], "no-referrer");
       assert.equal(page.headers["content-security-policy"],
@@ -64,6 +66,18 @@ test("serves the loopback page and proxies authenticated GETs only", async () =>
       for (const theme of ["auto", "light", "dark"]) assert(page.body.includes(`data-theme="${theme}"`));
       assert(!page.body.includes("<script>invalid()</script>"));
 
+      const previewHtml = await readFile(new URL("./dashboard-v2.html", import.meta.url), "utf8");
+      for (const path of ["/preview", "/preview/"]) {
+        const preview = await read(url, path);
+        assert.equal(preview.status, 200);
+        assert.equal(preview.body, previewHtml);
+        for (const header of ["content-type", "content-security-policy", "cache-control", "referrer-policy", "x-content-type-options"]) {
+          assert.equal(preview.headers[header], page.headers[header]);
+        }
+        assert.equal((await read(url, path, { origin: "https://foreign.example" })).status, 403);
+        assert.equal((await read(url, path, {}, "POST")).status, 405);
+      }
+
       assert.equal((await read(url, "/v1/hosts")).status, 401);
       assert.equal((await read(url, "/v1/unknown")).status, 401);
       assert.equal((await read(url, "/v1/hosts", { authorization: "Bearer " + "0".repeat(64) })).status, 401);
@@ -76,7 +90,7 @@ test("serves the loopback page and proxies authenticated GETs only", async () =>
       assert.equal((await read(url, "/", {}, "HEAD")).status, 405);
       assert.equal((await read(url, "/v1/budgets", headers, "PUT")).status, 405);
       assert.equal((await read(url, "/v1/lanes/platform", headers, "PUT")).status, 405);
-      for (const path of ["/v1/budgets", "/v1/github/prs", "/v1/spend/summary"]) {
+      for (const path of ["/v1/budgets", "/v1/github/prs", "/v1/spend/summary", "/v1/goals"]) {
         assert.equal((await read(url, path, headers)).status, 200);
       }
       const hosts = await read(url, "/v1/hosts", { ...headers, origin: url.origin });
@@ -161,13 +175,21 @@ test("public dashboard accepts Cloudflare Access alone without a bearer token", 
   assert.match(dashboard.url, /^http:\/\/127\.0\.0\.1:\d+\/$/);
   const url = new URL(dashboard.url);
   const headers = { host: "dashboard.example", "cf-access-jwt-assertion": assertion };
-  for (const path of ["/", "/v1/hosts"]) {
+  for (const path of ["/", "/preview", "/preview/", "/v1/hosts"]) {
     assert.equal((await read(url, path, { host: headers.host })).status, 403);
     assert.equal((await read(url, path, { ...headers, "cf-access-jwt-assertion": "invalid" })).status, 403);
   }
   const page = await read(url, "/", headers);
   assert.equal(page.status, 200);
   assert.match(page.body, /<html lang="en" data-auth="proxy">/);
+  for (const path of ["/preview", "/preview/"]) {
+    const preview = await read(url, path, headers);
+    assert.equal(preview.status, 200);
+    assert.match(preview.body, /<html lang="en" data-auth="proxy">/);
+    assert.match(preview.body, /<title>Ostrom Preview<\/title>/);
+    assert.equal((await read(url, path, { ...headers, host: url.host })).status, 403);
+    assert.equal((await read(url, path, headers, "POST")).status, 405);
+  }
   const hosts = await read(url, "/v1/hosts", headers);
   assert.equal(hosts.status, 200);
   assert.deepEqual(JSON.parse(hosts.body), []);
@@ -196,7 +218,7 @@ test("public dashboard enforces proxy headers and keeps the bearer token out of 
   assert.equal(tunnel.status, 405);
   assert.equal(tunnel.headers.allow, "GET");
   assert.equal((await read(url, "dashboard.example:443", { host: url.host }, "CONNECT")).status, 403);
-  for (const path of ["/", "/dashboard.html", "/v1/hosts", "/unknown"]) {
+  for (const path of ["/", "/dashboard.html", "/preview", "/preview/", "/v1/hosts", "/unknown"]) {
     assert.equal((await read(url, path, { host: proxyHeaders.host })).status, 401);
     assert.equal((await read(url, path, { ...proxyHeaders, authorization: `Bearer ${"0".repeat(64)}` })).status, 401);
   }
@@ -208,6 +230,13 @@ test("public dashboard enforces proxy headers and keeps the bearer token out of 
   assert.match(page.body, /<html lang="en" data-auth="proxy">/);
   assert(!page.body.includes(dashboardToken));
   assert.equal((await read(url, "/dashboard.html", proxyHeaders)).body, page.body);
+  for (const path of ["/preview", "/preview/"]) {
+    const preview = await read(url, path, proxyHeaders);
+    assert.equal(preview.status, 200);
+    assert.match(preview.body, /<html lang="en" data-auth="proxy">/);
+    assert.match(preview.body, /<title>Ostrom Preview<\/title>/);
+    assert(!preview.body.includes(dashboardToken));
+  }
 
   const script = /<script type="module">([\s\S]*?)<\/script>/.exec(page.body)?.[1];
   assert(script);
@@ -311,8 +340,8 @@ test("public dashboard verifies Access JWTs and refreshes its key cache at a bou
   assert.equal(fetchCount, 4);
 });
 
-async function dashboardScript(): Promise<string> {
-  const html = await readFile(new URL("./dashboard.html", import.meta.url), "utf8");
+async function dashboardScript(file = "./dashboard.html"): Promise<string> {
+  const html = await readFile(new URL(file, import.meta.url), "utf8");
   const script = /<script type="module">([\s\S]*?)<\/script>/.exec(html)?.[1];
   assert(script);
   return script;
@@ -624,4 +653,193 @@ test("the loopback page removes the token fragment and retains authorization dur
   location.hash = "#lane/crawlab";
   browser.navigate();
   assert.equal(location.hash, "#lane/crawlab");
+});
+
+test("the preview follows the system theme and contains no write controls or outbound T3 links", async () => {
+  const html = await readFile(new URL("./dashboard-v2.html", import.meta.url), "utf8");
+  assert.match(html, /color-scheme:\s*light dark/);
+  assert.match(html, /light-dark\(#4f46e5, #818cf8\)/);
+  assert.doesNotMatch(html, /t3-thread:\/\/|\.ts\.net\/threads\/|Open in T3/i);
+  assert.doesNotMatch(html, /theme-toggle|data-theme|<form\b|type=["']submit|\binnerHTML\b/i);
+  assert.doesNotMatch(html, /\bStalled\b/);
+  assert.match(html, /Stall signal: unavailable \(awaiting Semon #788\)/);
+});
+
+const previewDom = `
+  function mockElement(tag) {
+    return {
+      tag, children: [], dataset: {}, attrs: {}, style: { setProperty() {} },
+      append(...children) { this.children.push(...children); },
+      replaceChildren(...children) { this.children = children; },
+      get firstChild() { return this.children[0]; },
+      get textContent() { return (this.text ?? "") + this.children.map((child) => child.textContent).join(""); },
+      set textContent(value) { this.text = String(value); this.children = []; },
+      setAttribute(key, value) { this.attrs[key] = String(value); },
+      removeAttribute(key) { delete this.attrs[key]; },
+      querySelector() { return null; },
+    };
+  }
+  function descendants(node) {
+    return [node, ...node.children.flatMap(descendants)];
+  }
+  const nodes = new Map();
+  const document = {
+    documentElement: { dataset: {} },
+    createElement: mockElement,
+    createElementNS: (_, name) => mockElement(name),
+    getElementById(id) {
+      if (!nodes.has(id)) nodes.set(id, mockElement("div"));
+      return nodes.get(id);
+    },
+    querySelectorAll() { return []; },
+  };
+  const location = { hash: "#overview" };
+  const window = { addEventListener() {} };
+  const testingNow = Date.parse("2026-11-28T13:00:00Z");
+`;
+
+test("preview overview summarizes UTC activity, prioritizes goals, and renders Semon rollups and recent fleet health", async () => {
+  const script = await dashboardScript("./dashboard-v2.html");
+  runInNewContext(String.raw`${previewDom}
+    ${script}
+    const lanes = [
+      { id: "ongoing", name: "Ongoing", status: "active", priorityRank: 1 },
+      { id: "waiting", name: "Waiting lane", status: "active", priorityRank: 2 },
+      { id: "risk", name: "Risk lane", status: "active", priorityRank: 3 },
+      { id: "old", name: "Prior week", status: "active", priorityRank: 4 },
+    ];
+    const weekStart = "2026-11-23";
+    const goals = [
+      { laneId: "ongoing", weekStart, metricCurrent: 3, metricTarget: 8, metricName: "Items", weeklyPlan: { targetDate: "2026-11-29" } },
+      { laneId: "waiting", weekStart, metricCurrent: 1, metricTarget: 4, metricName: "Checks" },
+      { laneId: "risk", weekStart, metricCurrent: 0, metricTarget: 1, metricName: "Releases" },
+      { laneId: "old", weekStart: "2026-11-16", metricCurrent: 99, metricTarget: 99, statement: "Reviewed release", completedAt: "2026-11-28T03:00:00Z" },
+      { laneId: "old", weekStart: "2026-11-16", statement: "Other goal", completedAt: "2026-11-23T03:00:00Z" },
+    ];
+    function pr(number, lastWakeAt, state = "merged") {
+      return { prHost: "github.com", repository: "org/project", number, lastWakeAt, state, title: "PR " + number };
+    }
+    const linkedPrs = [
+      pr(7, "2026-11-28T08:00:00Z"), pr(7, "2026-11-28T09:00:00Z"), pr(3, "2026-11-22T00:00:00Z"),
+      pr(1, "2026-11-21T23:59:59Z"), pr(2, "not a date"), pr(4, "2026-11-28T14:00:00Z"),
+      pr(9, "2026-11-28T11:00:00Z", "open"),
+    ];
+    const risk = { laneId: "risk", summary: "Checks failing", detail: { repository: "org/project", number: 10 } };
+    const health = {
+      pendingOwnerDecisions: [{ laneId: "waiting" }], policyAlerts: [risk], budgets: [],
+      agents: [
+        { id: "active", status: "active", label: "Running agent" },
+        { id: "waiting", status: "waiting", label: "Waiting agent", lastSeenAt: "2026-11-20T09:00:00Z" },
+        { id: "recent", status: "idle", lastSeenAt: "2026-11-27T13:00:00Z" },
+        { id: "old", status: "idle", lastSeenAt: "2026-11-27T12:59:59Z" },
+        { id: "offline", status: "offline", lastSeenAt: "2026-11-28T09:00:00Z" },
+      ],
+      activeRuns: [
+        { id: "1", agentId: "active", model: "openai/gpt-6.2-sol", status: "running", startedAt: "2026-11-28T12:55:00Z" },
+        { id: "2", agentId: "waiting", model: "google/gemini-4-neon", status: "waiting_approval" },
+        { id: "3", externalRunRef: "Input run", status: "waiting_input" },
+        { id: "4", externalRunRef: "Legacy run", status: "stalled" },
+      ],
+      stalledRuns: [{ id: "1" }, { id: "4" }],
+    };
+    const rollup = (preferredUsd, coverage = "complete") =>
+      ({ status: "available", preferredUsd, coverage, observedAt: "2026-11-28T12:00:00Z" });
+    const spend = { daily: rollup(17.5), weekly: rollup(51, "partial"), monthly: rollup(173.21) };
+    ctx = context({ digest: { sections: { lanes } }, health, goals, linkedPrs, spend,
+      friction: [{ summary: "Repeated approval request" }] }, testingNow);
+
+    const summary = summaryTiles(ctx);
+    assert.match(summary.textContent, /Shipped today1 PR · 1 goalPR 7 · Reviewed release/);
+    assert.match(summary.textContent, /At risk1 alertRisk lane #10/);
+    assert.match(summary.textContent, /Needs you1 decisionWaiting lane/);
+    assert.equal(summary.children[2].href, "#decisions");
+    const emptySummary = summaryTiles({ ...ctx, activity: activityByDay([], [], testingNow), alerts: [], decisions: [] });
+    assert.match(emptySummary.textContent, /None recorded yet today/);
+    assert.match(emptySummary.textContent, /0 alertsAll clear/);
+
+    assert.equal(ctx.lanes.map(({ lane }) => lane.id).join(","), "waiting,risk,ongoing,old");
+    const laneText = goalsCard(ctx, true).textContent;
+    assert.match(laneText, /Waiting on owner.*Risk laneAt risk.*OngoingActive3\/8Nov 29.*Prior weekNo goal/);
+    assert.doesNotMatch(laneText, /99\/99/);
+
+    const cost = spendCard(ctx);
+    assert.match(cost.textContent, /PartialToday\$17\.50This week\$51\.00Month est\.\$173\.21/);
+    assert.match(cost.textContent, /No team budget configured/);
+    assert.match(cost.textContent, /By-model & by-lane breakdown: No data yet/);
+    assert(!descendants(cost).some((node) => node.className?.includes("meter")));
+    health.budgets.push({ enabled: true, scopeKind: "team", period: "weekly", capUsd: 90, warnPct: 80, spendSource: "semon" });
+    assert(descendants(spendCard(ctx)).some((node) => node.className?.includes("meter")));
+    const missingCost = spendCard({ health, spend: {
+      daily: { status: "available", preferredUsd: 30, coverage: "complete" },
+      weekly: rollup(null), monthly: { status: "unavailable", preferredUsd: 17 },
+    } });
+    assert.match(missingCost.textContent, /UnknownTodayUnavailableThis weekUnavailableMonth est\.Unavailable/);
+
+    const fleet = fleetCard(ctx);
+    assert.match(fleet.textContent, /1 active1 waiting1 recent idle1 offline/);
+    assert.match(fleet.textContent, /Codex · gpt-6.2-solRunning5m/);
+    assert.match(fleet.textContent, /Gemini · gemini-4-neonWaiting for approval/);
+    assert.match(fleet.textContent, /Input runWaiting for input/);
+    assert.match(fleet.textContent, /Legacy runStatus unavailable/);
+    assert.match(fleet.textContent, /Stall signal: unavailable \(awaiting Semon #788\)/);
+    assert.doesNotMatch(fleet.textContent, /stalled/i);
+
+    const throughputPanel = throughputCard(ctx);
+    const chart = descendants(throughputPanel).find((node) => node.tag === "svg" && node.attrs.role === "img");
+    assert(chart);
+    assert.equal(descendants(chart).filter((node) => node.tag === "rect").length, 2);
+    assert.equal(descendants(chart).filter((node) => node.tag === "circle").length, 2);
+    assert.match(chart.attrs["aria-label"], /Nov 22: 1 PR merged, 0 goals completed/);
+    assert.match(chart.attrs["aria-label"], /Nov 28: 1 PR merged, 1 goal completed/);
+    assert.match(throughputPanel.textContent, /2 PRs merged2 goals completed/);
+    assert.match(throughputPanel.textContent, /1 open frictionRepeated approval request/);
+    assert.equal(throughput(activityByDay([], [], testingNow)).textContent, "No data yet");
+  `, { assert });
+});
+
+test("preview decisions filter by real due dates and blockers and render read-only GitHub PR links", async () => {
+  const script = await dashboardScript("./dashboard-v2.html");
+  runInNewContext(String.raw`${previewDom}
+    ${script}
+    const decisions = [
+      { id: "approval", laneId: "product", title: "Approve <review>?", urgency: "blocking_today",
+        recommendation: "Approve", options: ["Approve", { label: "Request changes" }, "Defer"], evidence: {
+          due: "2026-11-28T17:00:00Z", blocks: ["Release", "Docs"],
+          prs: ["https://github.com/org/project/pull/31", "http://github.com/org/project/pull/32",
+            "https://github.com@other.example/org/project/pull/33", "https://github.com/org/project/issues/34",
+            "javascript:alert(1)", "https://user@github.com/org/project/pull/35"],
+        } },
+      { id: "later", laneId: null, title: "Discuss later", urgency: "digest", recommendation: "Review next week",
+        evidence: { due: "2026-12-02", blocks: [] }, options: null },
+      { id: "overdue", laneId: "product", title: "Renew account", urgency: "digest", recommendation: "Renew",
+        evidence: { due: "2026-11-27" }, options: [] },
+    ];
+    ctx = { now: testingNow, decisions, laneNames: new Map([["product", "Product"]]), lanes: [] };
+    location.hash = "#decisions";
+    render();
+    const view = byId("view");
+    const filter = (label) => descendants(view).find((node) => node.tag === "button" && node.textContent === label);
+    const articles = () => descendants(view).filter((node) => node.tag === "article");
+    assert(filter("All (3)"));
+    assert.equal(articles().length, 3);
+    const [approval, later, overdue] = articles();
+    assert.match(approval.textContent, /ProductDue.*Blocking todayApprove <review>\?/);
+    assert.match(approval.textContent, /RecommendedApproveOptionsRequest changesDeferBlocks Release · Docs/);
+    assert.match(approval.textContent, /Read-only · Answer in chat/);
+    const links = descendants(approval).filter((node) => node.tag === "a");
+    assert.equal(links.length, 1);
+    assert.equal(links[0].href, "https://github.com/org/project/pull/31");
+    assert.equal(links[0].rel, "noopener noreferrer");
+    assert(descendants(approval).some((node) => node.className === "tag warn" && node.textContent.startsWith("Due")));
+    assert(descendants(overdue).some((node) => node.className === "tag bad" && node.textContent.startsWith("Overdue")));
+    assert(!articles().flatMap(descendants).some((node) => ["form", "button", "input"].includes(node.tag)));
+    assert.match(later.textContent, /TeamDue Dec 2DigestDiscuss later/);
+
+    filter("Due soon").onclick();
+    assert.equal(articles().map((node) => descendants(node).find((item) => item.tag === "h2").textContent).join(","),
+      "Approve <review>?,Renew account");
+    filter("Blocking").onclick();
+    assert.equal(articles().length, 1);
+    assert.match(articles()[0].textContent, /Approve <review>\?/);
+  `, { assert, URL });
 });
