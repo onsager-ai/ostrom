@@ -11,8 +11,6 @@ import type { AgentStatus, JsonValue, RunStatus, T3HostState } from "./types.ts"
 const milestones = ["thread.run_settled", "thread.needs_input", "thread.input_resolved", "pr.watch_wake"] as const;
 const filter = { includeSubagentChildren: true };
 const pageSize = 50;
-const threadLimit = 200;
-const listPageLimit = 20;
 const concurrency = 3;
 const runLimit = 10;
 const detailPageLimit = 10;
@@ -25,6 +23,8 @@ interface ReconcileOptions {
   anchors?: ReadonlyMap<T3MilestoneName, string | null>;
   resetCursors?: boolean;
   activeOnly?: boolean;
+  threadLimit?: number;
+  listPageLimit?: number;
 }
 
 interface ThreadContext {
@@ -191,7 +191,7 @@ function contextFor(store: PlatformStore, host: PlatformT3Host, environmentId: s
 
 export async function reconcileT3HostOnce(client: T3McpClient, store: PlatformStore,
   host: PlatformT3Host, opts: ReconcileOptions = {}): Promise<T3HostState> {
-  const { signal } = opts;
+  const { signal, threadLimit = 500, listPageLimit = 40 } = opts;
   const environment = await client.readEnvironment({}, rpcSignal(signal));
   const context = contextFor(store, host, environment.environmentId);
   const listed = new Map<string, T3ThreadListItem>();
@@ -206,18 +206,25 @@ export async function reconcileT3HostOnce(client: T3McpClient, store: PlatformSt
     if (cursor === null) break;
   }
 
+  const knownAgents = new Map(store.listAgents().filter((agent) => agent.hostId === host.id).map((agent) => [agent.id, agent]));
   const previousWaits = new Set(store.listOpenT3Waits(host.id).map((wait) => wait.threadId));
-  const previousActive = new Set(store.listAgents().filter((agent) =>
-    agent.hostId === host.id && (agent.status === "active" || agent.status === "waiting")).map((agent) => agent.id));
+  const previousActive = new Set([...knownAgents.values()].filter((agent) =>
+    agent.status === "active" || agent.status === "waiting").map((agent) => agent.id));
   const watched = new Set(store.listT3ThreadPrs(host.id).filter((pr) => pr.watching).map((pr) => pr.threadId));
   const previousLatest = store.listT3LatestRunRefs(host.id);
   const idFor = (threadId: string) => agentId(host.id, environment.environmentId, threadId);
   const active = (thread: T3ThreadListItem) => isRunning(thread.status) || thread.status === "waiting";
   const changed = (thread: T3ThreadListItem) => thread.latestRunId != null
     && previousLatest.get(idFor(thread.threadId)) !== thread.latestRunId;
-  const needsDetail = (thread: T3ThreadListItem) => !thread.settled || active(thread)
-    || previousWaits.has(thread.threadId) || watched.has(thread.threadId)
-    || previousActive.has(idFor(thread.threadId)) || changed(thread);
+  const needsDetail = (thread: T3ThreadListItem) => {
+    const id = idFor(thread.threadId);
+    if (active(thread) || previousActive.has(id) || previousWaits.has(thread.threadId) || watched.has(thread.threadId)
+      || changed(thread) || ("pendingRequestCount" in thread && typeof thread.pendingRequestCount === "number"
+        && thread.pendingRequestCount > 0)) return true;
+    const known = knownAgents.get(id);
+    if (known === undefined || known.status === "offline") return !thread.settled || thread.latestRunId != null;
+    return known.lastSeenAt !== thread.updatedAt;
+  };
   const candidates = [...listed.values()].filter(needsDetail).sort((a, b) =>
     Number(active(b)) - Number(active(a)) || Number(changed(b)) - Number(changed(a))
     || b.updatedAt.localeCompare(a.updatedAt) || a.threadId.localeCompare(b.threadId));
